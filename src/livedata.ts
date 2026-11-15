@@ -18,7 +18,7 @@
 import { join } from "node:path";
 import { ROUTER } from "./router.ts";
 import type { TierRow } from "./ui.ts";
-import { appendSwap, type SwapRow } from "./history.ts";
+import { appendSwap, rampClass, type SwapRow, type TurnMetrics } from "./history.ts";
 import type { LaneMoe } from "./moe.ts";
 import { writeJson } from "./core.ts";
 
@@ -29,6 +29,8 @@ export interface MetricsRequest {
 	prompt_n?: number;
 	/** The current engine's own decode rate; older payloads carry per-token `durations` instead. */
 	decode_tok_s?: number;
+	/** Prompt-processing tok/s, the serve log's own `pp`; older payloads report only `prompt_ms`. */
+	pp?: number;
 	/** Prompt tokens reused from the conversation cache (the stable-prefix win). */
 	hit_rate?: number;
 	reused?: number;
@@ -85,6 +87,53 @@ export function rateFromRequest(r: MetricsRequest | undefined): number | undefin
 	perToken.sort((a, b) => a - b);
 	const med = perToken[Math.floor(perToken.length / 2)];
 	return med > 0 ? 1 / med : undefined;
+}
+
+/** Time to first token, seconds: the engine's own field, else the measured `durations[0]` = TTFT. */
+function ttftOf(r: MetricsRequest | undefined): number | undefined {
+	if (!r) return undefined;
+	if (typeof r.ttft_s === "number" && r.ttft_s > 0) return r.ttft_s;
+	const d = Array.isArray(r.durations) ? r.durations[0] : undefined;
+	return typeof d === "number" && d > 0 ? d : undefined;
+}
+
+/** Prompt-processing tok/s: the engine's `pp` (the serve log's `pp=111459`), else prompt tokens
+ *  over the prefill window — `prompt_ms` when reported, TTFT as the bound. Measured basis: a
+ *  106k-token prompt prefills in 3.5 s (1,499 tok/s), the same prompt at an 82% hit in 0.5 s. */
+function promptRateOf(r: MetricsRequest | undefined): number | undefined {
+	if (!r) return undefined;
+	if (typeof r.pp === "number" && r.pp > 0) return r.pp;
+	const n = typeof r.prompt_tokens === "number" ? r.prompt_tokens : r.prompt_n;
+	if (typeof n !== "number" || n <= 0) return undefined;
+	const secs = typeof r.prompt_ms === "number" && r.prompt_ms > 0 ? r.prompt_ms / 1000 : ttftOf(r);
+	return secs !== undefined && secs > 0 ? n / secs : undefined;
+}
+
+/**
+ * The four per-turn numbers the telemetry record needs (Y18), read off the newest /metrics
+ * request record. Each field is MISSING when the engine did not report it, and a closed router
+ * yields an empty object: `turnRecordOrNull` then writes no line, so the ledger has no zeros.
+ */
+export function turnMetricsFrom(requests: MetricsRequest[] | undefined): TurnMetrics {
+	const reqs = requests ?? [];
+	const last = reqs[reqs.length - 1];
+	const out: TurnMetrics = {};
+	const pp = promptRateOf(last);
+	if (pp !== undefined) out.pp = Math.round(pp);
+	const tg = rateFromRequest(last);
+	if (tg !== undefined) out.tg = Math.round(tg);
+	const ttft = ttftOf(last);
+	if (ttft !== undefined) out.ttft = Math.round(ttft * 1000) / 1000;
+	const withHit = reqs.filter((r) => typeof r.hit_rate === "number");
+	const hit = withHit[withHit.length - 1];
+	if (hit) out.kv_hit_pct = Math.round((hit.hit_rate ?? 0) * 1000) / 10;
+	return out;
+}
+
+/** The live read of the same numbers: one `/metrics` request, fields undefined when unreachable. */
+export async function fetchTurnMetrics(): Promise<TurnMetrics> {
+	const m = await fetchJson<Record<string, any>>(`${ROUTER}/metrics`);
+	return turnMetricsFrom(Array.isArray(m?.requests) ? (m.requests as MetricsRequest[]) : undefined);
 }
 
 /** Pull the fields the overlay shows out of the /metrics + /health payloads. */
@@ -194,12 +243,18 @@ export function startSwapWatch(to: string, moe?: LaneMoe): SwapWatchHandle {
 			const big = reqs.filter((r) => r.prompt_n >= 500);
 			const first = rateFromRequest(big.length > 0 ? big[0] : reqs[0]);
 			const steady = rateFromRequest(reqs[reqs.length - 1]);
+			// A start that placed from a saved MoE placement map is warm BY CONSTRUCTION (moe.ts
+			// samples the profile's existence BEFORE the swap); the rate alone cannot tell a warm
+			// start from a lane that simply has not decoded anything long enough yet.
+			const mapRestored = moe?.state === "live" && moe.profile_exists === true;
 			const row: SwapRow = {
 				from,
 				to: toLane,
 				elapsed_s,
 				first_tg: first ?? 0,
 				steady_tg: steady ?? 0,
+				elapsed_ms: Math.round(elapsed_s * 1000),
+				ramp: rampClass(first, mapRestored),
 				percent_path: percentPath.slice(0, 60),
 				...(moe ? { moe } : {}),
 				at: new Date().toISOString(),

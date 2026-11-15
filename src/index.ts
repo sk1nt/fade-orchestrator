@@ -14,7 +14,7 @@
  *   /lanes                             live router census: both entries + health
  */
 import { unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { CODE_LANE, PROVIDER, ROUTER, THINK_LANE, THINKING, listLanes, loadLane } from "./router.ts";
@@ -26,7 +26,7 @@ import {
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, adaptiveRounds, normalizeRun, pushRejection, runGate,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, runGate, synthesizeCodingDone, tagCheckpoint,
 	STATUS_KEY,
 	TERMINAL,
 	briefings,
@@ -38,18 +38,38 @@ import {
 	type RunState,
 	type Task,
 } from "./core.ts";
-import { OVERLAY_WIDGET_KEY, openOverlay, pill, type OverlayData } from "./ui.ts";
-import { actCode, actHalt, actReset, actSkip, actVerify } from "./keymap.ts";
-import { readSwaps } from "./history.ts";
+import { OVERLAY_WIDGET_KEY, openOverlay, pill, pillCompact, type OverlayData } from "./ui.ts";
+import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keymap.ts";
+import { appendTurn, readSwaps, turnRecordOrNull } from "./history.ts";
 import { laneMoe, moeRows } from "./moe.ts";
 import { handoverText } from "./core.ts";
-import { coldHot, fetchMetrics, laneBestRate, persistMetrics, startSwapWatch, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
+import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, startSwapWatch, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
 
 // The overlay key. Ctrl+O is the app's "toggle tool output" binding on this host (measured in
 // the keybindings table: app.tools.expand defaultKeys ctrl+o) — the operator asked for Ctrl+O,
 // so it is the default and the takeover is disclosed; set FADE_ORCHESTRATE_KEY to keep the
 // built-in (e.g. "ctrl+g").
 const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "ctrl+o";
+
+// Y15: the mutating tools, by NAME. The verifier sandbox is a denylist, not an allowlist, so a
+// host tool this file has never seen cannot slip a write past it. `task` is on the list because a
+// subagent the verifier spawns can edit — delegating the write is exactly what the sandbox forbids.
+const MUTATING_TOOLS: Record<string, true> = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true, task: true };
+
+/**
+ * Delegated (subagent) session detector. A subagent loads this extension in the SAME cwd, so an
+ * unguarded `session_start` adopts the operator's run into the worker's session and drives the
+ * router from a session that does not own it. `PI_SESSION_FILE` separates the two shapes with no
+ * configuration: the operator's jsonl sits directly under the project dir; a delegated one is
+ * nested inside a parent-session dir named by the timestamp stamp and filed by agent id.
+ */
+const MAIN_SESSION_DIR = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_/;
+const isDelegatedSession = (): boolean => {
+	const f = process.env.PI_SESSION_FILE ?? "";
+	if (f === "") return false;
+	const parent = basename(dirname(f));
+	return MAIN_SESSION_DIR.test(parent) && !f.endsWith(`${parent}.jsonl`);
+};
 
 export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let run: RunState | undefined;
@@ -59,6 +79,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let metrics: MetricsSnapshot | undefined;
 	let laneBest = 0;
 	let metricsTimer: NodeJS.Timeout | undefined;
+	let turnSeq = 0;
+	let turnPhase: string | undefined;
+	let turnSwapMs = 0;
+	/** The active-tool set captured when the verifier sandbox closed; restored when the code lane loads. */
+	let verifierTools: string[] | undefined;
 
 	const refreshMetrics = async (): Promise<void> => {
 		const s = await fetchMetrics();
@@ -90,6 +115,43 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		return `${ch.label} ${Math.round(ch.rate)}t/s`;
 	};
 
+	// Y18: one durable JSONL line per turn, built ONLY from numbers the router reported —
+	// `turnRecordOrNull` returns undefined without a numeric pp AND tg, so a closed router appends
+	// nothing and the ledger never carries a fabricated zero.
+	const recordTurn = async (outcome: string): Promise<void> => {
+		if (!run || !runDir) return;
+		const m = await fetchTurnMetrics();
+		const rec = turnRecordOrNull(m, {
+			run_id: run.run_id,
+			turn: ++turnSeq,
+			round: run.round,
+			swap_ms: turnSwapMs,
+			round_outcome: outcome,
+			...(turnPhase !== undefined ? { phase: turnPhase } : {}),
+		});
+		turnPhase = undefined;
+		turnSwapMs = 0;
+		if (rec) appendTurn(runDir, rec);
+	};
+
+	// Y15: the thinking lane plans, inspects and runs; it never edits. setActiveTools removes the
+	// mutating tools on entry to the verifier lane and restores the captured set when the code lane
+	// loads; `tool_call` below is the enforcement layer for anything that still tries.
+	const applyToolPolicy = async (lane: string): Promise<void> => {
+		const active = pi.getActiveTools();
+		if (lane === THINK_LANE) {
+			verifierTools = active;
+			const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true);
+			if (!readOnly.includes("fade_phase")) readOnly.push("fade_phase");
+			if (readOnly.length !== active.length) await pi.setActiveTools(readOnly);
+			return;
+		}
+		if (verifierTools && verifierTools.length > 0) {
+			if (verifierTools.some((t) => !active.includes(t))) await pi.setActiveTools(verifierTools);
+			verifierTools = undefined;
+		}
+	};
+
 	// Measured on this host: registerTool() puts fade_phase in the registry (/tools lists it) but
 	// NOT in the active set the model is offered, so every phase briefing must activate it first.
 	const ensurePhaseTool = async (): Promise<void> => {
@@ -112,7 +174,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// ONE footer pill — the multi-line task dump above the editor is retired. The detail
 		// view is the overlay (Ctrl+O / `/orchestrate overlay`); the transcript stays clean
 		// during long coding runs, which is the whole point of running the loop visibly.
-		ctx.ui.setStatus(STATUS_KEY, pill(run, pillSuffix()));
+		const suffix = pillSuffix();
+		// The host truncates the status row at the terminal width (`footer.js`: `truncateToWidth`),
+		// so the FULL lane name is the default and the 2-character tag is only the narrow-terminal
+		// fallback — the operator's placement order is that the pill reads like the model identifier
+		// on the row above, which is itself longer than this line.
+		const cols = typeof process.stdout.columns === "number" ? process.stdout.columns : undefined;
+		ctx.ui.setStatus(STATUS_KEY, cols !== undefined && cols < 72 ? pillCompact(run, suffix) : pill(run, suffix));
 		ctx.ui.setWidget(STATUS_KEY, undefined);
 	};
 
@@ -159,10 +227,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
 			return;
 		}
-		if (from && runDir && from !== lane) void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
+		if (from && runDir && from !== lane) {
+			turnSwapMs += Math.round(loaded.elapsed_s * 1000);
+			void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
+		}
 		if (run) run.lane = lane;
 		persist();
 		paint(ctx);
+		await applyToolPolicy(lane);
 		setTimeout(async () => {
 			await ensurePhaseTool();
 			const text =
@@ -198,11 +270,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const data: OverlayData = { run, swaps: readSwaps(runDir), tiers, critique: lastCritique() };
 			await openOverlay(ctx, data, (key) => {
 				if (!run) return;
-				const dir = key === "s" ? actSkip(run) : key === "v" ? actVerify(run) : key === "r" ? actReset(run) : key === "c" ? actCode(run) : key === "h" ? actHalt(run) : undefined;
+				const dir =
+					key === "s" ? actSkip(run) : key === "v" ? actVerify(run) : key === "r" ? actReset(run) : key === "p" ? actPause(run) : key === "c" ? actCode(run) : key === "h" ? actHalt(run) : undefined;
 				if (!dir) return;
 				persist();
 				paint(ctx);
 				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+				// [p]/[c] resumed a paused loop: pay the lane load that pausing deferred.
+				if (!run.paused && pending) {
+					const deferred = pending;
+					pending = undefined;
+					void switchLane(deferred.lane, ctx);
+				}
 				if (dir.next) void switchLane(dir.next, ctx);
 			}, process.env.FADE_ORCHESTRATE_HEADLESS === "1");
 		} catch (e) {
@@ -349,6 +428,21 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// the router swap to the entry the QUEUED requests name (the 21:55-21:58 ping-pong).
 			// `agent_end` is the single load site, after the turn is closed.
 			const applied = applyPhase(params.phase, payload);
+			turnPhase = params.phase;
+			// Y1: an accepted phase is the end of the protocol streak. `round`/`max_rounds` are
+			// untouched here — a lane that reports never owes the round budget anything.
+			classifyTurnEnd(run, true);
+			let checkpointNote = "";
+			if (params.phase === "verification_done" && applied.nextState === "complete") {
+				// Y16: tag the tree at the moment each task was accepted, namespaced per run.
+				// `run` is a mutable `let`, so the closure below loses the guard's narrowing.
+				const st: RunState = run;
+				const tags = st.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st.repo, st, t.id));
+				const ok = tags.filter((t) => t.ok).map((t) => t.tag);
+				if (ok.length > 0) checkpointNote = `; checkpoints ${ok.join(", ")}`;
+				const refused = tags.filter((t) => !t.ok);
+				if (refused.length > 0) checkpointNote += `; checkpoint FAILED ${refused.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+			}
 			// T4 pre-swap gate: on coding_done, before paying the verifier swap (13-25 s pack
 			// load), run the plan's own checks on the code lane. Red keeps the coding lane
 			// resident (loadLane on the resident entry costs 0 s), records the rejection, and
@@ -377,8 +471,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			settledNotified = false;
 			ctx.abort();
 			return {
-				content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
-				details: { phase: params.phase, state: applied.nextState, next_lane: pending?.lane ?? null },
+				content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${checkpointNote}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
+				details: { phase: params.phase, state: applied.nextState, next_lane: pending?.lane ?? null, checkpoints: run.checkpoints ?? {} },
 			};
 		},
 	});
@@ -405,7 +499,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | code | halt | stop [--clear]`,
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
 			const raw = args.trim();
 			const first = raw.split(/\s+/)[0] ?? "";
@@ -438,16 +532,31 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify("orchestrate: condensed handover sent", "info");
 				return;
 			}
-			if (first === "skip" || first === "verify" || first === "reset" || first === "halt" || first === "code") {
+			if (first === "skip" || first === "verify" || first === "reset" || first === "pause" || first === "halt" || first === "code") {
 				if (!run) {
 					ctx.ui.notify("orchestrate: no run active", "info");
 					return;
 				}
 				const dir =
-					first === "skip" ? actSkip(run, raw.split(/\s+/)[1]) : first === "verify" ? actVerify(run) : first === "reset" ? actReset(run) : first === "halt" ? actHalt(run) : actCode(run);
+					first === "skip"
+						? actSkip(run, raw.split(/\s+/)[1])
+						: first === "verify"
+							? actVerify(run)
+							: first === "reset"
+								? actReset(run)
+								: first === "pause"
+									? actPause(run, raw.split(/\s+/).slice(1).join(" ") || undefined)
+									: first === "halt"
+										? actHalt(run)
+										: actCode(run);
 				persist();
 				paint(ctx);
 				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+				if (!run.paused && pending) {
+					const deferred = pending;
+					pending = undefined;
+					await switchLane(deferred.lane, ctx);
+				}
 				if (dir.next) await switchLane(dir.next, ctx);
 				return;
 			}
@@ -470,6 +579,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					} catch {}
 					run = undefined;
 				}
+				return;
+			}
+			if (isDelegatedSession()) {
+				// A worker session never STARTS a run: the run is the operator's, in this same cwd.
+				ctx.ui.notify("orchestrate: this is a delegated (subagent) session — the run belongs to the session that started it, so /orchestrate <goal> is refused here", "warning");
 				return;
 			}
 			if (run && TERMINAL[run.state] !== true) {
@@ -546,6 +660,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A delegated session NEVER adopts the run. The loop, its nudges, its lane loads and its
+		// ledger belong to the session that owns the run. Measured cost of the old adoption (basalt
+		// serve log 2026-11-15 04:16:13-04:20:14, two subagent spin-ups): `swap flash-next ->
+		// deepseek` (18.0 s / 19.8 s, 129.5 GiB each) followed immediately by `swap deepseek ->
+		// flash-next` (16.1 s, 52.2 GiB) with ZERO tokens served on the verifier — 70.1 s and four
+		// loads, while the read-only refusals landed on the workers' own edits.
+		if (isDelegatedSession()) return;
 		await ensurePhaseTool();
 		const repo = ctx.cwd;
 		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
@@ -580,20 +701,113 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		pending = undefined;
 		if (!next) {
 			paint(ctx);
-			if (TERMINAL[run.state] === true && !settledNotified) {
-				settledNotified = true;
-				ctx.ui.notify(briefings.final(run), "info");
-			} else if (TERMINAL[run.state] !== true) {
-				ctx.ui.notify(`orchestrate: turn ended without a fade_phase call; ${run.state} did not advance (round ${run.round})`, "warning");
+			if (TERMINAL[run.state] === true) {
+				if (!settledNotified) {
+					settledNotified = true;
+					ctx.ui.notify(briefings.final(run), "info");
+				}
+				void recordTurn(run.state);
+				return;
 			}
+			if (run.paused === true) {
+				ctx.ui.notify(`orchestrate: paused at round ${run.round} — no nudge sent, no lane loaded; [p] resumes`, "info");
+				void recordTurn("paused");
+				return;
+			}
+			// Tier-1 protocol gate (Y1). A turn that ends with no accepted fade_phase is PROTOCOL
+			// debt: `round`/`max_rounds` never move, and while the offending lane is the resident
+			// one a nudge costs nothing (no swap). Three tiers, counted in `stall_count`.
+			const tier = classifyTurnEnd(run, false);
+			if (tier === "nudge") {
+				pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT})`);
+				persist();
+				paint(ctx);
+				ctx.ui.notify(`orchestrate: protocol nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT} — round ${run.round} unspent, no swap paid`, "warning");
+				await ensurePhaseTool();
+				pi.sendUserMessage(briefings.nudge(run));
+				void recordTurn("nudge");
+				return;
+			}
+			if (tier === "synthesize" && (run.state === "coding" || run.state === "repair")) {
+				// Tier-2: the result is built from what the machine can prove — the plan's own
+				// checks (exit codes) and git. A RED gate keeps the coder lane resident, exactly
+				// like the tool's pre-swap gate: the swap is paid only for a green tree.
+				const gate = run.checks.length > 0 ? runGate(run.checks, run.repo) : undefined;
+				if (gate) run.gate_last = gate;
+				if (gate && !gate.passed) {
+					const failing = gate.results.filter((r) => !r.ok);
+					pushRejection(run, "task", `synthesized round refused: pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
+					persist();
+					paint(ctx);
+					pending = { lane: CODE_LANE, phase: "gate" };
+					settledNotified = false;
+					await ensurePhaseTool();
+					pi.sendUserMessage(briefings.gate(run));
+					void recordTurn("gate_red");
+					return;
+				}
+				const syn = synthesizeCodingDone(run, run.repo);
+				pushRejection(run, "protocol", `coding_done SYNTHESIZED from git status/diff + gate exit codes after ${run.stall_count} phase-less turns`);
+				const applied = applyPhase("coding_done", { done: syn.done });
+				persist();
+				paint(ctx);
+				ctx.ui.notify(`orchestrate: coding_done synthesized from git + gate (round ${run.round}); the verifier swap is paid once`, "warning");
+				void recordTurn("synthesized");
+				settledNotified = false;
+				await switchLane(applied.next, ctx);
+				return;
+			}
+			if (tier === "stall") {
+				// Tier-3 circuit breaker: halt cleanly, ZERO lane loads, state + diagnostic durable.
+				const stalledFrom = run.state;
+				run.state = "stalled_protocol_error";
+				run.paused = true;
+				run.reason = `${run.protocol_retries ?? 0} turn(s) ended with no fade_phase call from state ${stalledFrom}`;
+				pushRejection(run, "protocol", `circuit breaker: ${run.reason}`);
+				persist();
+				paint(ctx);
+				ctx.ui.notify(briefings.stalled(run), "error");
+				void recordTurn("stalled_protocol_error");
+				return;
+			}
+			// A phase-less turn in a state git cannot speak for (planning, verifying): nudge harder,
+			// with the schemas attached, and never spend a round.
+			pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (tier ${tier})`);
+			persist();
+			paint(ctx);
+			await ensurePhaseTool();
+			pi.sendUserMessage(`${briefings.nudge(run)}\n${SCHEMA_HINT}`);
+			void recordTurn("nudge");
 			return;
 		}
+		if (run.paused === true) {
+			// [p] between rounds: the lane load is DEFERRED, not dropped — resuming pays it.
+			pending = next;
+			paint(ctx);
+			ctx.ui.notify(`orchestrate: paused — the ${next.lane} load is deferred until [p]/[c] resumes`, "info");
+			void recordTurn("paused");
+			return;
+		}
+		classifyTurnEnd(run, true);
+		void recordTurn(turnPhase ?? next.phase);
 		// THE SINGLE LOAD SITE, at the turn boundary: the previous turn is closed, so nothing is
 		// queued at the router naming the lane we are leaving — that queue is what flipped the
 		// lane back 0-2 s after every swap (the 21:55-21:58 ping-pong). `loadLane` settles an
 		// in-flight swap and refuses to reload the resident entry, so a round that wants the
 		// lane already resident pays 0 s.
 		await switchLane(next.lane, ctx);
+	});
+
+	// Y15 enforcement: the verifier lane is read-only. An edit/write/apply_patch/task attempted
+	// while the thinking lane holds the run is refused with the rule named, so the fix is
+	// DELEGATED back to the coder instead of silently applied by the verifier.
+	pi.on("tool_call", (event: { toolName?: string }) => {
+		if (!run || run.lane !== THINK_LANE) return undefined;
+		const name = event.toolName ?? "";
+		if (MUTATING_TOOLS[name] !== true) return undefined;
+		pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);
+		persist();
+		return { block: true, reason: `fade_orchestrate: the verifier lane is read-only — ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

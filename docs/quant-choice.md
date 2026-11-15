@@ -1,8 +1,8 @@
 # Why the thinking lane pins IQ1_M, not IQ2_XXS
 
 The plugin's default plan/verify lane is `deepseek` → **`DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt`**
-(265.9 GiB). The same router also serves **`UD-IQ2_XXS`** (285.5 GiB) under a second alias, and both
-entries carry **byte-identical settings** (`kv fp8`, `max-context 1048576`, `draft-experts 32`,
+(265.9 GiB). It was measured against **`UD-IQ2_XXS`** (285.5 GiB) served under a second alias, and both
+entries carried **byte-identical settings** (`kv fp8`, `max-context 1048576`, `draft-experts 32`,
 `spec 3`, `pool-workers 8`, `ram-reserve-mib 8192`, `vram-reserve-mib 2048`, `gpu 0,1`) — only the
 pack path differs, so the numbers below are the pack's effect, not a config's.
 
@@ -89,15 +89,22 @@ curl -s localhost:18014/metrics | jq '.engine | {quant, expert_slots, spill}'
 # resident pack + progress
 curl -s localhost:18014/health | jq '{loaded, loading, percent}'
 
-# switch packs (clients wait through the swap; no restart)
-curl -s -XPOST -H 'content-type: application/json' -d '{"model":"deepseek-q1"}' localhost:18014/v1/load
+# switch packs (clients wait through the swap; no restart) — name the alias you mapped
+curl -s -XPOST -H 'content-type: application/json' -d '{"model":"<alias>"}' localhost:18014/v1/load
 
 # one timed answer: timings.* are the engine's numbers
 curl -s -XPOST -H 'content-type: application/json' \
-  -d '{"model":"deepseek-q1","temperature":0,"max_tokens":100,
+  -d '{"model":"<alias>","temperature":0,"max_tokens":100,
        "messages":[{"role":"user","content":"Explain in two sentences why a parquet footer allows skipping page decodes."}]}' \
   localhost:18014/v1/chat/completions | jq '{tok_s: .timings.predicted_per_second, prompt_tok_s: .timings.prompt_per_second, wall: .timings}'
 ```
 
 Measured receipts and the longer write-ups live with the host project that produced them; the numbers
 above are the ones this package's README and overlay quote.
+
+## Outcome on the measuring host
+
+The decision was taken from the numbers above: the second alias was **dropped** and the lane serves
+the pinned IQ1_M pack under `deepseek` alone. What is kept is the verification (sha256 + a working
+load), this method and the benchmark receipts — a re-measure is `deepseek-q1`-style alias work, not a
+re-download, and the pack still sits on disk if the accuracy/throughput tradeoff ever changes.

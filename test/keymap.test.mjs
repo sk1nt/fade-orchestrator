@@ -1,11 +1,11 @@
 /**
- * keymap unit tests: the overlay's s/v/r/c/h semantics, exercised headlessly. The TUI keystroke
+ * keymap unit tests: the overlay's s/v/r/p/c/h semantics, exercised headlessly. The TUI keystroke
  * path and the `/orchestrate` command path both call these functions, so this is the whole
  * action surface minus the terminal plumbing.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { actCode, actHalt, actReset, actSkip, actVerify } from "../.test-build/keymap.mjs";
+import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "../.test-build/keymap.mjs";
 
 const mkRun = (over = {}) => ({
 	key: "fade.omp_orchestrate.run.v1",
@@ -86,4 +86,38 @@ test("code resumes a stopped run onto the code lane; a complete run is refused",
 	const done = mkRun({ state: "complete" });
 	const d2 = actCode(done);
 	assert.equal(d2.next, undefined);
+});
+
+test("pause parks the loop as a FLAG, never a state: [p] pauses, [p] resumes, note lands on the run", () => {
+	const run = mkRun();
+	const p = actPause(run, "hand-editing the fixture");
+	assert.equal(p.nextState, "coding");
+	assert.equal(p.next, undefined);
+	assert.equal(run.paused, true);
+	assert.equal(run.state, "coding");
+	assert.equal(run.operator_note, "hand-editing the fixture");
+	assert.match(p.note, /paused \(round 3/);
+	const r = actPause(run);
+	assert.equal(run.paused, false);
+	assert.match(run.operator_note, /resumed at round 3/);
+});
+
+test("code clears the pause flag: [c] is an explicit keep-going", () => {
+	const run = mkRun({ state: "coding" });
+	actPause(run);
+	const d = actCode(run);
+	assert.equal(run.paused, false);
+	assert.equal(d.nextState, "coding");
+});
+
+test("reset grows the round budget by 3 up to the cap and names it", () => {
+	const run = mkRun({ max_rounds: 3 });
+	const d = actReset(run);
+	assert.equal(run.round, 1);
+	assert.equal(run.max_rounds, 6);
+	assert.match(d.note, /budget \+3 → 6 rounds/);
+	const capped = mkRun();
+	const d2 = actReset(capped);
+	assert.equal(capped.max_rounds, 6);
+	assert.match(d2.note, /budget already at the 6-round cap/);
 });

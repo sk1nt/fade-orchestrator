@@ -9,8 +9,9 @@
 // It seeds <repo>/var/omp-orchestrate/{ACTIVE.json,state.json} with a deterministic run, drives
 // the command surface with the router pointed at a CLOSED port (the pill must render without
 // touching the network, and metrics fetches must degrade to no suffix), and asserts:
-//   1. the pill: one setStatus `⚡ fn:code · R1/6 · T3/6 · [Ctrl+O]` (short lane tag + short
-//      state tag: the footer is one shared row, and `flash-next` plus the rest overflowed it),
+//   1. the pill: one setStatus `⚡ flash-next:code · R1/6 · T3/6 · [Ctrl+O]` — the FULL lane name,
+//      because the host renders extension statuses on the footer's own full-width row, directly
+//      under the stats row whose right side carries the model identifier (operator order 2026-11-15),
 //   2. the multi-line dump is GONE: no setWidget frame carries lines under the status key,
 //   3. the overlay: full untruncated objectives + swap-history section + tier labels + key legend,
 //   4. skip: state.json records T4 passed with a manual-skip note,
@@ -100,13 +101,16 @@ for (const line of `${run.stdout ?? ""}`.split("\n")) {
   if (f.type === "available_commands_update") commands = (f.commands ?? f.commandsUpdate ?? []).map((c) => (typeof c === "string" ? c : c.name));
 }
 
-const pill = ui.find((u) => u.method === "setStatus" && String(u.statusText ?? "").startsWith("⚡ fn:code · R1/6 · T3/6 · [Ctrl+O]"));
-// The footer is one shared row: a 10-character model name overflowed it. Assert the pill is
-// SHORT (the tag is derived from the lane, not hardcoded) and that no full model name leaks in.
+const pill = ui.find((u) => u.method === "setStatus" && String(u.statusText ?? "").startsWith("⚡ flash-next:code · R1/6 · T3/6 · [Ctrl+O]"));
+// Operator placement order (2026-11-15): the pill carries the FULL lane name. The benchmark for
+// "it fits" is the model identifier on the row above it (`deepseek-v4.1-flash …`), which is itself
+// ~20 characters of model name plus the token stats, so a ~45-character pill sits under it.
 const pillText = String(pill?.statusText ?? "");
+const MODEL_ID_ROW_CHARS = 20; // the model-name part of the row above, at minimum
 const pillCaps = [
-  ["pill carries the short lane tag, not the model name", pill !== undefined && !pillText.includes("flash-next")],
-  ["pill stays one line under 48 chars", pillText.length > 0 && pillText.length < 48],
+  ["pill carries the FULL lane name, not a 2-char tag", pill !== undefined && pillText.includes("flash-next:code")],
+  ["pill fits under the model-identifier row", pillText.length > 0 && pillText.length < MODEL_ID_ROW_CHARS + 30],
+  ["a clean run advertises no protocol stall", !pillText.includes("protocol")],
 ];
 const dump = ui.filter((u) => u.method === "setWidget" && (u.key ?? u.widgetKey) === "fade" && Array.isArray(u.widgetLines ?? u.lines));
 const overlay = ui.filter((u) => u.method === "setWidget" && (u.key === "fade-overlay" || u.widgetKey === "fade-overlay")).map((u) => u.widgetLines ?? u.lines ?? []);
@@ -126,6 +130,7 @@ const checks = [
   ["overlay shows tiers", overlayLines.some((l) => l.includes("memory / engine tiers"))],
   ["overlay shows last critique", overlayLines.some((l) => l.includes("verifier critique: T2 acceptance under-specified"))],
   ["overlay key legend", overlayLines.some((l) => l.includes("[s] skip task"))],
+  ["overlay offers the pause key", overlayLines.some((l) => l.includes("[p] pause/resume"))],
   ["overlay shows tier", overlayLines.some((l) => l.includes("tier M"))],
   ["overlay shows rejections", overlayLines.some((l) => l.includes("round 1 [verification] T2: T2 acceptance under-specified"))],
   ["skip notified", notifySkip.length >= 1],

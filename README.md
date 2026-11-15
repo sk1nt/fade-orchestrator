@@ -35,6 +35,27 @@ two lane entries are configuration, nothing here is host-specific.
 - **Pre-swap gate.** `coding_done` runs every planned check on the code lane *before* the
   verifier swap is paid. Red keeps the coding lane resident (0 s), records a rejection, and sends
   the failing output back as the next briefing.
+
+- **Protocol gate, three tiers.** A turn that ends with no `fade_phase` call is *protocol debt*,
+  not a coding round: **T1** nudge in place (`pi.sendUserMessage`, counters `protocol_retries` /
+  `stall_count` — the round budget and the lane swap are untouched, a nudge is free); **T2** after
+  two missed nudges the round is **synthesized** from what the machine can prove — `git status
+  --porcelain`, `git diff --stat` and the deterministic gate's exit codes — and a RED gate keeps
+  the coder resident with zero loads; **T3** the third miss trips the circuit breaker
+  (`state: stalled_protocol_error`, paused, ZERO lane loads) and the notify/overlay carry the
+  actionable diagnostic: what was seen, what is RED, the git state, and the acts
+  (`/orchestrate pause`, `/orchestrate code`, `/orchestrate stop`).
+- **Verifier sandbox.** While the thinking lane holds the run, the mutating tools
+  (`edit`, `write`, `apply_patch`, `multiedit`, `notebook_edit`, `task`) are removed from the
+  active set — a denylist, so a host tool this extension has never seen cannot slip a write past
+  it — and the `tool_call` guard blocks them with the rule named, delegating the fix to the coder.
+- **Checkpoints.** Every task the verifier accepts leaves `omp-ckpt/<run_id>/T<n>-passed` in the
+  repo, namespaced per run so two runs on one tree never collide; the tag prints in the overlay.
+- **Delegated sessions are inert.** A subagent shares the cwd, so an unguarded `session_start`
+  adopts the operator's run and drives the router from a session that does not own it (measured:
+  70.1 s of pack swap and 181.7 GiB loaded across two spin-ups, zero verifier tokens).
+  `PI_SESSION_FILE` identifies the delegated shape (nested inside a stamped parent-session dir);
+  such a session adopts nothing, nudges nothing, loads nothing and cannot start a run.
 - **Phase contract with teeth.** `fade_phase` validates the payload exactly (phase per state,
   allowed keys, task schema, dependency order) and refuses with the rule named. From the second
   refused payload the exact JSON schemas ride back in the tool error (schema auto-repair), and
@@ -43,9 +64,15 @@ two lane entries are configuration, nothing here is host-specific.
 - **Adaptive round budget.** Planning size sets the reserve: 2 tasks → 3 rounds, 4 → 4, 6 → 5.
   Swaps are the unit of cost; a small plan must not reserve six.
 - **Swap history.** Every swap the orchestrator drives is timed (`/health` percent samples,
-  first-completion and steady decode tok/s from `/metrics`) into `var/omp-orchestrate/swap_history.json`.
-  Cold vs hot is visible in the status pill: the measured deepseek ramp reads ~91 tok/s against a
-  ~130 steady (cold), flash-next runs 480–647 (hot).
+  first-completion and steady decode tok/s from `/metrics`) into `var/omp-orchestrate/swap_history.json`,
+  with `elapsed_ms` and a ramp class — `cold_ramp` / `hot_steady` / `map_restored` (threshold 120
+  tok/s: the measured deepseek ramp reads ~91 against a ~130 steady, flash-next runs 480–647) —
+  rendered in the overlay as `MoE: Cold Ramp` / `MoE: Hot Steady State (130 tok/s)` /
+  `MoE Map: Restored`.
+- **Turn ledger.** `var/omp-orchestrate/metrics.jsonl` takes one line per turn
+  (`{ts, run_id, turn, round, phase?, pp, tg, ttft, kv_hit_pct, swap_ms, round_outcome}`), built
+  **only** from numbers the router reported: with no `pp`+`tg` available the line is not written —
+  the ledger never carries a fabricated zero.
 
 ## Install
 
@@ -71,22 +98,30 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 ## Surface
 
 - `/orchestrate [--rounds N] <goal>` — start a run (preflights the router: think lane must load).
-- `/orchestrate status | overlay | skip [Tn] | verify | reset | code | halt | stop [--clear]`
+- `/orchestrate status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`
 - `/lanes` — live router census (both entries' status + `/health`).
-- `Ctrl+O` — the overlay: untruncated task list with acceptances and results, swap-latency
-  history, engine/memory tiers (quant, expert slots, spill, decode tok/s), the last verifier
-  critique, recent rejections. Keys: `s` skip task, `v` verify now, `r` reset round, `c` code,
-  `h` halt, `esc` close.
-- Status pill (one footer line): `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O] · hot 130t/s`
-  — the lane is a 2-character tag (`flash-next` → `fn`, `deepseek` → `de`) and the state a short
-  one (`plan`, `code`, `ver`, `fix`, `done`, `fail`, `stop`, `stall`), because the footer is a
-  shared row and the full model name overflowed it. `/orchestrate status` and the overlay always
-  print the full lane name.
-  The main pane stays clean during long coding runs — the detail view is the overlay.
+- `Ctrl+O` — the overlay: untruncated task list with acceptances and results (plus each task's
+  checkpoint tag), swap-latency history with the MoE ramp badge, engine/memory tiers (quant, expert
+  slots, spill, decode tok/s), the last verifier critique, recent rejections, the protocol counters
+  and — when the circuit breaker tripped — the stall diagnostic. Keys: `s` skip task, `v` verify
+  now, `r` reset round (+3 to the cap), `p` pause/resume, `c` code, `h` halt, `esc` close.
+- Status pill (one footer line): `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O] · hot 130t/s`,
+  with `· protocol <n>/3` while the Tier-1 counter runs and `· paused` while the loop is parked.
+  The **full lane name** is the default (operator order 2026-11-15: put the status where the model
+  identifier is — "it should fit fine"): the host renders extension statuses on the footer's own
+  full-width row (`getExtensionStatuses()`, `footer.js`), immediately under the stats row whose
+  right side carries the model identifier, and that identifier is longer than this pill. The
+  2-character tag (`flash-next` → `fn`, `deepseek` → `de`) with the short state (`plan`, `code`,
+  `ver`, `fix`, `done`, `fail`, `stop`, `stall`) is the **narrow-terminal fallback** only
+  (`cols < 72`), where the host truncates the row with `…`. `/orchestrate status` and the overlay
+  always print the full lane name. The main pane stays clean during long coding runs.
 
-State lives in `<cwd>/var/omp-orchestrate/`: `ACTIVE.json`, `state.json` (schema v2:
-rejection history, tier, schema retries, gate result), `swap_history.json`, `metrics_state.json`.
-v1 files are migrated on resume.
+State lives in `<cwd>/var/omp-orchestrate/`: `ACTIVE.json`, `state.json` (schema v2: rejection
+history by kind — `verification` / `schema` / `task` / `protocol` — tier, schema retries, gate
+result, protocol counters, `paused` + `operator_note`, synthesized-phase marker, checkpoint tags),
+`swap_history.json`, `metrics_state.json`, `metrics.jsonl`. v1 files are migrated on resume, and
+every write is `.tmp` → `fsync` → rename → `fsync` of the directory, so a `kill -9` mid-write
+leaves the previous phase parseable.
 
 ## Optimal MoE loading (last known placement between turns)
 
@@ -119,8 +154,9 @@ The overlay then shows `MoE <lane>: live · 2.4 h old · warm start`. Three stat
 
 ## Why the thinking lane pins `IQ1_M` (not `IQ2_XXS`)
 
-The same router can serve both DeepSeek packs under two aliases; this package defaults the
-plan/verify lane to the **IQ1_M** pack because it stays resident where IQ2_XXS spills. Measured on
+Both DeepSeek packs can be served under two aliases; this package defaults the plan/verify lane to
+the **IQ1_M** pack because it stays resident where IQ2_XXS spills. On the host that measured this,
+the second alias was retired after the decision — the numbers, method and receipts are what is kept. Measured on
 one host (122 GiB RAM, 2 × 32.6 GiB VRAM, identical settings both sides):
 
 | | expert slots | spill | decode (warm) | wall, short answer |
@@ -134,8 +170,9 @@ choice is throughput, not knowledge. The overlay makes it visible: the **expert 
 the engine's own `spill`, and `spill.experts > 0` is the signal that the pack is served from disk.
 Full numbers, method and the reproduce-anywhere commands: [`docs/quant-choice.md`](docs/quant-choice.md).
 
-An IQ2 alias is still worth keeping: swaps are `POST /v1/load {"model":"<alias>"}` and clients wait
-through them, so an A/B is one request, never a restart.
+An alias costs nothing *while you are deciding*: swaps are `POST /v1/load {"model":"<alias>"}` and
+clients wait through them, so an A/B is one request, never a restart. Once decided, drop the alias —
+the verified pack, the numbers and the receipts are the record, and the served mapping is the answer.
 
 ## Fast handover (getting a fresh lane on topic)
 

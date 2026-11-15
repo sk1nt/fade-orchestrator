@@ -1,10 +1,18 @@
 /**
  * The compact pill and the Ctrl+O overlay.
  *
- * Main pane: ONE status line — `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O]`
- * (2-char lane tag + short state tag: the footer is a shared row) — and NOTHING multi-line above
- * the editor while a run is live (the monolith painted a 6+ line task dump there; during long
- * coding runs that dump ate the transcript).
+ * Main pane: ONE status line in the footer block, carrying the FULL lane name —
+ * `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O]` — and NOTHING multi-line
+ * above the editor while a run is live (the monolith painted a 6+ line task dump there; during
+ * long coding runs that dump ate the transcript).
+ *
+ * Footer placement (operator order 2026-11-15: "put this text up where DeepSeek-v4.1 … is, it
+ * should fit fine"): the built-in footer renders `pwd`, then the stats row whose RIGHT side is
+ * the model identifier, then ONE line of extension statuses (`footer.js`: `getExtensionStatuses()`
+ * joined and truncated to the terminal width). `ctx.ui.setStatus` writes that extension line — it
+ * is the footer row the extension owns, immediately under the model identifier, and it is full
+ * terminal width, so the FULL lane name goes there and the 2-character tag survives only as the
+ * narrow-terminal fallback (`pillCompact`).
  *
  * Overlay: `ctx.ui.custom(..., {overlay:true})` with keyboard focus. Keys: s skip, v verify,
  * r reset, h halt, c code, esc/q close. Outside interactive mode (RPC/print, `ctx.hasUI` false)
@@ -29,19 +37,32 @@ export interface OverlayData {
 
 export const OVERLAY_WIDGET_KEY = "fade-overlay";
 
-/** One line, built for the footer: lane, round, task tally, the key that opens the overlay. */
+/**
+ * The footer status line: lane, state, round, task tally, the overlay key, the protocol-stall
+ * badge when the Tier-1 gate is counting, and the tok/s suffix last.
+ */
 export function pill(run: RunState, suffix?: string): string {
+	return renderPill(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix);
+}
+
+/** Narrow-terminal fallback: 2-character lane tag, short state (`⚡ de:code · R1/6 …`). */
+export function pillCompact(run: RunState, suffix?: string): string {
+	return renderPill(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix);
+}
+
+function renderPill(tag: string, run: RunState, suffix?: string): string {
 	const total = run.tasks.length;
 	const passed = run.tasks.filter((t) => t.status === "passed").length;
-	const st = statusTag(run);
-	return `⚡ ${st} · R${run.round}/${run.max_rounds} · T${passed}/${total} · [Ctrl+O]${suffix ? ` · ${suffix}` : ""}`;
+	const stall = (run.stall_count ?? 0) > 0 ? ` · protocol ${run.stall_count}/3` : "";
+	const paused = run.paused === true ? " · paused" : "";
+	return `⚡ ${tag} · R${run.round}/${run.max_rounds} · T${passed}/${total} · [Ctrl+O]${stall}${paused}${suffix ? ` · ${suffix}` : ""}`;
 }
 
 /**
- * Short lane name for the footer: "flash-next" -> "fn", "flash-ornith" -> "fo", "deepseek" -> "de".
- * The pill is one line in a shared terminal row, so a 10-character model name plus round, tally,
- * the key hint and the tok/s suffix overflowed it; 2 characters keep the whole line readable and
- * still unambiguous (`/orchestrate status` and the overlay print the FULL name, always).
+ * Short lane name, used only by `pillCompact`/`statusTagCompact`: "flash-next" -> "fn",
+ * "deepseek" -> "de". The host truncates the status row at the terminal width, so on a narrow
+ * terminal the full lane name would be cut with "…" and the tally with it; the tag keeps the line
+ * readable there. `/orchestrate status` and the overlay print the FULL name, always.
  */
 export function laneTag(lane: string): string {
 	const m = /^(.*?)-(.*?)(?:-|$)/.exec(lane);
@@ -49,22 +70,30 @@ export function laneTag(lane: string): string {
 	return lane.length > 4 ? lane.slice(0, 2) : lane;
 }
 
+/** The state machine's name in ≤5 characters; a stall must stay visible (Tier-1 gate). */
+const SHORT_STATE: Record<string, string> = {
+	planning: "plan",
+	coding: "code",
+	verifying: "ver",
+	repair: "fix",
+	complete: "done",
+	failed: "fail",
+	stopped: "stop",
+	stalled_protocol_error: "stall",
+};
+
 /**
- * Short state tag: the state machine's name, never the phase prose. A stalled protocol error is
- * the one state the pill must not hide (Tier-1 failure gate), so it stays readable as `stall`.
+ * The footer tag with the FULL lane name (`deepseek:code`) — the row has the room, and the model
+ * identifier above it is longer. An unknown future state passes through untruncated rather than
+ * being masked.
  */
 export function statusTag(run: RunState): string {
-	const short: Record<string, string> = {
-		planning: "plan",
-		coding: "code",
-		verifying: "ver",
-		repair: "fix",
-		complete: "done",
-		failed: "fail",
-		stopped: "stop",
-		stalled_protocol_error: "stall",
-	};
-	return `${laneTag(run.lane)}:${short[run.state] ?? run.state}`;
+	return `${run.lane}:${SHORT_STATE[run.state] ?? run.state}`;
+}
+
+/** The narrow-terminal tag (`de:code`). */
+export function statusTagCompact(run: RunState): string {
+	return `${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`;
 }
 
 /** The overlay body, untruncated: full objectives, acceptances, results, swap rows, tiers. */
@@ -73,6 +102,14 @@ export function overlayLines(d: OverlayData): string[] {
 	const out: string[] = [];
 	out.push(`fade-orchestrator ${run.run_id} · ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds}${run.tier ? ` · tier ${run.tier}` : ""}`);
 	out.push(`goal: ${run.goal}`);
+	if (run.paused === true) out.push(`paused: the loop is stopped for manual edits${run.operator_note ? ` · operator note: ${run.operator_note}` : ""}`);
+	if ((run.protocol_retries ?? 0) > 0) {
+		out.push(`protocol: ${run.protocol_retries} turn(s) ended without fade_phase · consecutive stalls ${run.stall_count ?? 0}/3${run.synthesized ? ` · auto-synthesized ${run.synthesized.phase} at round ${run.synthesized.round}` : ""}`);
+	}
+	if (run.state === "stalled_protocol_error") {
+		out.push(`PROTOCOL STALL (Tier-3 circuit breaker): the lane ended ${run.stall_count ?? 3} turns in a row without a fade_phase call, so the run is halted and NO lane was loaded.`);
+		out.push("  acts: [c] resume on the code lane · [r] reset the round · [p] pause for a manual edit · /orchestrate status reads state.json");
+	}
 	out.push("");
 	out.push("tasks (untruncated):");
 	const pool = run.repair_tasks.length > 0 ? run.repair_tasks : run.tasks;
@@ -82,13 +119,15 @@ export function overlayLines(d: OverlayData): string[] {
 		out.push(`      files: ${t.files.join(", ")} · deps: ${t.dependencies.length ? t.dependencies.join(",") : "-"} · round ${t.round}`);
 		out.push(`      acceptance: ${t.acceptance}`);
 		if (t.result) out.push(`      result: ${t.result}`);
+		if (run.checkpoints?.[t.id]) out.push(`      tag: ${run.checkpoints[t.id]}`);
 	}
 	out.push("");
 	out.push("basalt swap latency (newest first):");
 	if (d.swaps.length === 0) out.push("  (no swaps recorded yet)");
 	for (const s of d.swaps) {
 		const moe = s.moe ? (s.moe.state === "unsupported" ? " · MoE relearned" : s.moe.profile_exists ? " · MoE warm start" : " · MoE cold start") : "";
-		out.push(`  ${s.from} -> ${s.to}  ${s.elapsed_s.toFixed(1)} s · first tg ${Math.round(s.first_tg)} -> steady ${Math.round(s.steady_tg)}${moe} · ${s.at}`);
+		const ramp = s.ramp === "map_restored" ? " · MoE Map: Restored" : s.ramp === "hot_steady" ? ` · MoE: Hot Steady State (${Math.round(s.steady_tg)} tok/s)` : s.ramp === "cold_ramp" ? " · MoE: Cold Ramp" : "";
+		out.push(`  ${s.from} -> ${s.to}  ${s.elapsed_s.toFixed(1)} s · first tg ${Math.round(s.first_tg)} -> steady ${Math.round(s.steady_tg)}${ramp}${moe} · ${s.at}`);
 	}
 	out.push("");
 	out.push("memory / engine tiers:");
@@ -103,12 +142,12 @@ export function overlayLines(d: OverlayData): string[] {
 		for (const r of rej) out.push(`  round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
 	}
 	out.push("");
-	out.push("[s] skip task  [v] verify now  [r] reset round  [c] code  [h] halt  [esc] close");
+	out.push("[s] skip task  [v] verify now  [r] reset round  [p] pause/resume  [c] code  [h] halt  [esc] close");
 	return out;
 }
 
 /**
- * Open the overlay. `onAction` receives the key pressed (s/v/r/c/h) so the caller applies the
+ * Open the overlay. `onAction` receives the key pressed (s/v/r/p/c/h) so the caller applies the
  * keymap directive. In non-UI modes the lines go to a widget (visible in RPC frames) and no
  * action is awaited.
  */
@@ -151,6 +190,6 @@ class OverlayComponent {
 
 	handleInput(data: string): void {
 		if (data === "\x1b" || data === "q") return this.done("close");
-		if (data === "s" || data === "v" || data === "r" || data === "c" || data === "h") return this.done(data);
+		if (data === "s" || data === "v" || data === "r" || data === "p" || data === "c" || data === "h") return this.done(data);
 	}
 }

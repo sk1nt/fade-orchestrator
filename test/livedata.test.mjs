@@ -1,15 +1,15 @@
 /**
  * livedata + history unit tests: the pure readers behind the overlay (rates from /metrics
  * request durations, cold/hot against the lane baseline, tier rows) and the swap-history store
- * (append, newest-first order, cap). No network: fixtures are the measured /metrics shapes.
+ * (append, newest-first order, cap), the Y12 ramp class, and the Y18 per-turn JSONL ledger. No network: fixtures are the measured /metrics shapes.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { coldHot, laneBestRate, moeCacheRow, rateFromRequest, tiersFromMetrics } from "../.test-build/livedata.mjs";
-import { appendSwap, readSwaps } from "../.test-build/history.mjs";
+import { coldHot, laneBestRate, moeCacheRow, rateFromRequest, tiersFromMetrics, turnMetricsFrom } from "../.test-build/livedata.mjs";
+import { appendSwap, rampClass, readSwaps, appendTurn, readTurns, turnRecordOrNull } from "../.test-build/history.mjs";
 
 test("rateFromRequest: 1 / median(per-token seconds after TTFT)", () => {
 	assert.equal(rateFromRequest({ durations: [22.722, 0.01, 0.01, 0.02, 0.01, 0.01] }), 100);
@@ -153,4 +153,87 @@ test("the engine's decode_tok_s wins over per-token durations; the prefix-cache 
 	assert.match(row.value, /81\.5% hit over 2 req|82\.3/);
 	assert.match(row.value, /last 82\.3%/);
 	assert.equal(moeCacheRow([]).value, "no hit_rate reported");
+});
+
+test("rampClass: the measured 91 ramp is cold, 130 steady is hot, a restored MoE map wins", () => {
+	assert.equal(rampClass(91, false), "cold_ramp", "the measured deepseek promote window");
+	assert.equal(rampClass(130, false), "hot_steady", "its measured steady rate");
+	assert.equal(rampClass(91, true), "map_restored", "a start that placed from the saved map is warm by construction, whatever the rate reads");
+	assert.equal(rampClass(480, false), "hot_steady", "flash-next's measured floor (480-647)");
+	assert.equal(rampClass(undefined, false), "cold_ramp", "no rate is no evidence of a steady lane");
+	assert.equal(rampClass(91, false, 90), "hot_steady", "the steady line is an argument, not a magic number");
+});
+
+test("swap history: elapsed_ms and the Y12 ramp class survive the round trip", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-hist-"));
+	try {
+		appendSwap(dir, { from: "deepseek", to: "flash-next", elapsed_s: 14.2, elapsed_ms: 14200, ramp: rampClass(480, false), first_tg: 480, steady_tg: 647, percent_path: [12, 100], at: "2026-11-15T09:12:32Z" });
+		const rows = readSwaps(dir);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].elapsed_ms, 14200, "the row keeps the transition timer's own unit (measured 14.2 s)");
+		assert.equal(rows[0].ramp, "hot_steady");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+const ID = { run_id: "20261115T091232Z-rqtj", turn: 3, round: 1, phase: "coding_done", swap_ms: 14200, round_outcome: "accepted" };
+
+test("turnRecordOrNull: an unreachable router yields NO record, so metrics.jsonl is never created", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-turn-"));
+	try {
+		const dead = turnMetricsFrom(undefined); // exactly what fetchTurnMetrics() hands back on a closed router
+		assert.deepEqual(dead, {}, "missing numbers report as missing, never as 0");
+		assert.equal(turnRecordOrNull(dead, ID), undefined);
+		assert.equal(turnRecordOrNull(undefined, ID), undefined, "no /metrics at all is not a crash");
+		assert.equal(turnRecordOrNull({ tg: 130 }, ID), undefined, "tg without pp is not a record");
+		assert.equal(turnRecordOrNull({ pp: 1499 }, ID), undefined, "pp without tg is not a record");
+		// The caller appends only what turnRecordOrNull returned; it returned nothing, so nothing lands.
+		assert.equal(existsSync(join(dir, "metrics.jsonl")), false, "a no-record turn leaves no ledger behind");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("turnMetricsFrom: pp from prompt_ms, tg from durations, kv_hit_pct from the last hit_rate", () => {
+	assert.deepEqual(
+		turnMetricsFrom([
+			{ prompt_tokens: 106000, prompt_ms: 3500, ttft_s: 3.5, hit_rate: 0.449, reused: 509, durations: [3.5, 0.01, 0.01, 0.01] },
+			{ prompt_tokens: 2000, prompt_ms: 500, hit_rate: 0.823, reused: 1646, durations: [0.5, 0.002, 0.002, 0.002] },
+		]),
+		{ pp: 4000, tg: 500, ttft: 0.5, kv_hit_pct: 82.3 },
+	);
+	assert.deepEqual(turnMetricsFrom([{ pp: 1499, decode_tok_s: 130, ttft_s: 3.5, hit_rate: 0.823 }]), { pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3 }, "the engine's own pp/decode_tok_s win");
+	assert.deepEqual(turnMetricsFrom([]), {}, "an empty window reports nothing, inventing nothing");
+});
+
+test("turnRecordOrNull: the record carries the four numbers, and only the numbers it was given", () => {
+	const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3 }, { ...ID, ts: "2026-11-15T09:12:32Z" });
+	assert.deepEqual(rec, { ts: "2026-11-15T09:12:32Z", run_id: ID.run_id, turn: 3, round: 1, phase: "coding_done", pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3, swap_ms: 14200, round_outcome: "accepted" });
+	const sparse = turnRecordOrNull({ pp: 1499, tg: 480 }, { ...ID, phase: undefined });
+	assert.deepEqual(Object.keys(sparse).sort(), ["pp", "round", "round_outcome", "run_id", "swap_ms", "tg", "ts", "turn"], "no ttft/hit reported means no key, not a zero");
+});
+
+test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt line is skipped", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-turn-"));
+	const file = join(dir, "metrics.jsonl");
+	try {
+		const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 44.9 }, { ...ID, ts: "2026-11-15T09:12:32Z" });
+		assert.ok(rec);
+		appendTurn(dir, rec);
+		assert.equal(readFileSync(file, "utf8").split("\n").filter((l) => l !== "").length, 1, "EXACTLY one line");
+		assert.deepEqual(readTurns(dir, 10), [rec], "the record round-trips");
+		const next = { ...rec, turn: 4, tg: 480, swap_ms: 0 };
+		appendTurn(dir, next);
+		appendFileSync(file, "{not json\n");
+		appendFileSync(file, '{"ts":"2026-11-15T09:13:00Z"}\n');
+		const all = readTurns(dir, 10);
+		assert.equal(all.length, 2, "a hand-corrupted line and a numberless line are skipped, not fatal");
+		assert.deepEqual(readTurns(dir, 1), [next], "readTurns returns the LAST n");
+		appendTurn(join(dir, "sub"), rec);
+		assert.equal(readTurns(join(dir, "sub"), 5).length, 1, "appendTurn creates the dir");
+		assert.equal(readTurns(join(dir, "nope"), 5).length, 0, "no ledger yet is not a crash");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

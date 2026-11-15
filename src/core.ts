@@ -4,7 +4,7 @@
  * split) — the wording of every validation error is load-bearing: the model steers by it.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { CODE_LANE, THINK_LANE, msg } from "./router.ts";
 
@@ -18,20 +18,31 @@ export const TERMINAL: Record<string, true> = { complete: true, failed: true, st
 export const PHASE_FOR_STATE: Record<string, string> = { planning: "planning_done", coding: "coding_done", repair: "coding_done", verifying: "verification_done" };
 export const STATUS_KEY = "fade";
 
-/** One rejection: a phase the verifier bounced, a payload the schema refused, a task forced. */
+/**
+ * One rejection: a phase the verifier bounced, a payload the schema refused (Y2: a formatting
+ * slip, tracked as a COUNT, never a round and never a swap), a task forced, or a lane that ended
+ * a turn with no `fade_phase` call at all (the Tier-1 protocol debt, Y1).
+ */
 export interface Rejection {
 	round: number;
 	at: string;
-	kind: "verification" | "schema" | "task";
+	kind: "verification" | "schema" | "task" | "protocol";
 	task_id?: string;
 	reason: string;
 }
 export const MAX_REJECTIONS = 50;
 
-/** v1 state files carry none of the v2 fields; resume fills the defaults, never crashes. */
+/**
+ * v1/v2 state files are read by the SAME resume path: every field the protocol gate adds is
+ * defaulted here, guarded by a type test so a value already carried in the file is never
+ * clobbered. A pre-gate file resumes as a fresh, unpaused run with zero protocol debt.
+ */
 export function normalizeRun(st: RunState): RunState {
 	if (!Array.isArray(st.rejection_history)) st.rejection_history = [];
 	if (typeof st.schema_retries !== "number") st.schema_retries = 0;
+	if (typeof st.protocol_retries !== "number") st.protocol_retries = 0;
+	if (typeof st.stall_count !== "number") st.stall_count = 0;
+	if (typeof st.paused !== "boolean") st.paused = false;
 	return st;
 }
 
@@ -39,6 +50,47 @@ export function pushRejection(run: RunState, kind: Rejection["kind"], reason: st
 	if (!Array.isArray(run.rejection_history)) run.rejection_history = [];
 	run.rejection_history.push({ round: run.round, at: new Date().toISOString(), kind, reason, task_id });
 	if (run.rejection_history.length > MAX_REJECTIONS) run.rejection_history.splice(0, run.rejection_history.length - MAX_REJECTIONS);
+}
+
+/** Count of recorded rejections of one kind. The schema separator (Y2) is a COUNT, not a new list. */
+export function countRejections(run: RunState, kind: Rejection["kind"]): number {
+	return (run.rejection_history ?? []).filter((r) => r.kind === kind).length;
+}
+
+/**
+ * The Tier-1 protocol gate (Y1). A turn that ends without an accepted `fade_phase` payload is
+ * protocol debt, NOT a coding round: `round` and `max_rounds` are never touched here, so the
+ * round budget a plan reserved is not burned by a lane that stayed silent.
+ *  stall_count 1 -> "nudge"      re-brief the lane in VRAM (no swap, no round)
+ *  stall_count 2 -> "synthesize" build coding_done from git + gate exit codes (T2)
+ *  stall_count 3 -> "stall"      circuit breaker: state stalled_protocol_error, paused (T3)
+ * Any accepted phase clears the streak; `protocol_retries` keeps the cumulative count.
+ */
+export const STALL_SYNTHESIZE_AT = 2;
+export const STALL_HALT_AT = 3;
+export type TurnEnd = "phase" | "nudge" | "synthesize" | "stall";
+
+export function classifyTurnEnd(run: RunState, hadPhase: boolean): TurnEnd {
+	if (hadPhase) {
+		run.stall_count = 0;
+		return "phase";
+	}
+	run.protocol_retries = (run.protocol_retries ?? 0) + 1;
+	run.stall_count = (run.stall_count ?? 0) + 1;
+	if (run.stall_count >= STALL_HALT_AT) return "stall";
+	if (run.stall_count >= STALL_SYNTHESIZE_AT) return "synthesize";
+	return "nudge";
+}
+
+/** `git status --porcelain` verbatim (capped): the T2 synthesizer's evidence base. */
+export function porcelain(repo: string): string {
+	try {
+		const out = execFileSync("git", ["-C", repo, "status", "--porcelain"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
+		const head = `${out}`.replace(/\n+$/, "").split("\n").slice(0, 200).join("\n");
+		return head || "(working tree clean)";
+	} catch (e) {
+		return `(git status failed: ${msg(e)} in ${repo})`;
+	}
 }
 
 /**
@@ -88,6 +140,103 @@ export function diffStat(repo: string): string {
 		return tail || "(working tree clean)";
 	} catch (e) {
 		return `(git diff failed: ${msg(e)} in ${repo})`;
+	}
+}
+
+/** One `git status --porcelain` entry: the XY code and the live path (a rename's DESTINATION). */
+export interface PorcelainEntry {
+	status: string;
+	path: string;
+}
+
+/**
+ * Parse the porcelain lines. Only a real entry counts: the XY pair must be git's status alphabet
+ * followed by the space separator, so the sentinel lines `porcelain()` emits on a clean tree or a
+ * failed git call parse to ZERO entries — every task then reports `blocked`, naming that line.
+ */
+const XY = /^[ MADRCU?!][ MADRCU?!] /;
+
+export function porcelainEntries(text: string): PorcelainEntry[] {
+	const out: PorcelainEntry[] = [];
+	for (const line of text.split("\n")) {
+		if (!XY.test(line)) continue;
+		const status = line.slice(0, 2);
+		let path = line.slice(3);
+		const arrow = path.indexOf(" -> ");
+		if (arrow >= 0) path = path.slice(arrow + 4);
+		out.push({ status, path: path.replace(/^"|"$/g, "") });
+	}
+	return out;
+}
+
+/** Does a status entry touch one of a task's declared files? An untracked DIRECTORY (`new/`) counts. */
+function entryTouches(e: PorcelainEntry, files: string[]): boolean {
+	return files.some((f) => {
+		if (e.path === f) return true;
+		const entryDir = e.path.endsWith("/") ? e.path : `${e.path}/`;
+		const fileDir = f.endsWith("/") ? f : `${f}/`;
+		return f.startsWith(entryDir) || e.path.startsWith(fileDir);
+	});
+}
+
+/** The last pre-swap gate as one line: the verdict plus every deterministic tail. */
+export function gateSummary(run: RunState): string {
+	const g = run.gate_last;
+	if (!g) return "(no pre-swap gate recorded)";
+	const parts = g.results.map((r) => `${r.ok ? "ok" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
+	return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}: ${parts.join(" | ") || "no checks"}`;
+}
+
+export interface SynthesizedDone {
+	done: { id: string; status: string; result: string }[];
+	sources: { porcelain: string; diffStat: string; gate: string };
+}
+
+/**
+ * Tier-1 T2 (Y1): the coder lane ended a turn with no `fade_phase` call twice. The result is
+ * SYNTHESIZED from what the machine can prove — `git status --porcelain`, `git diff --stat` and
+ * the deterministic pre-swap gate exit codes — never from a model's word. A task whose declared
+ * files are absent from the porcelain output is `blocked`, naming the evidence that is missing;
+ * nothing here ever claims a result no source supports.
+ */
+export function synthesizeCodingDone(run: RunState, repo: string): SynthesizedDone {
+	const raw = porcelain(repo);
+	const entries = porcelainEntries(raw);
+	const stat = diffStat(repo);
+	const gate = gateSummary(run);
+	const tasks = run.tasks.length > 0 ? run.tasks : run.repair_tasks;
+	const done = tasks.map((t) => {
+		const hits = entries.filter((e) => entryTouches(e, t.files));
+		if (hits.length === 0) {
+			return { id: t.id, status: "blocked", result: `synthesize: no working-tree change matches ${JSON.stringify(t.files)} — git status --porcelain says [${raw.slice(0, 300)}]` };
+		}
+		const quoted = hits.slice(0, 8).map((e) => `${e.status} ${e.path}`).join(", ");
+		return { id: t.id, status: "passed", result: `synthesize: git status --porcelain shows ${hits.length} ${hits.length === 1 ? "entry" : "entries"} touching this task's declared files [${quoted}]` };
+	});
+	run.synthesized = { phase: "coding_done", round: run.round, at: new Date().toISOString() };
+	return { done, sources: { porcelain: raw, diffStat: stat, gate } };
+}
+
+/** Y16: tags are namespaced per run so a repair round never shadows an earlier run's checkpoint. */
+export function checkpointName(run: RunState, taskId: string): string {
+	return `omp-ckpt/${run.run_id}/${taskId}-passed`;
+}
+
+/**
+ * Checkpoint the tree at the moment a task passed (Y16). The orchestrator never commits, so the
+ * tag names the HEAD the task was accepted against; `git checkout -f <tag> -- .` plus
+ * `git clean -fd` against the pair restores the tree exactly. Re-tagging a re-passed task moves
+ * the tag forward (`-f`) instead of failing the phase.
+ */
+export function tagCheckpoint(repo: string, run: RunState, taskId: string): { tag: string; ok: boolean; error?: string } {
+	const tag = checkpointName(run, taskId);
+	try {
+		execFileSync("git", ["-C", repo, "tag", "-f", tag], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
+		if (typeof run.checkpoints !== "object" || run.checkpoints === null) run.checkpoints = {};
+		run.checkpoints[taskId] = tag;
+		return { tag, ok: true };
+	} catch (e) {
+		return { tag, ok: false, error: msg(e) };
 	}
 }
 
@@ -184,6 +333,18 @@ export interface RunState {
 	gate_last?: GateResult;
 	/** v2: plan-size tier from planning_done (S ≤2 tasks, M ≤4, L more). */
 	tier?: "S" | "M" | "L";
+	/** Y1: cumulative turns that ended with NO fade_phase call; the round budget never moves. */
+	protocol_retries?: number;
+	/** Y1: consecutive phase-less turns; 1 nudge, 2 synthesize, 3 stall. Reset by any accepted phase. */
+	stall_count?: number;
+	/** Y1 T3 / Y13: the loop is halted (circuit breaker) or operator-paused; nothing more is sent. */
+	paused?: boolean;
+	/** Y13: the operator's note, recorded by [s]/[p] and replayed in the handover. */
+	operator_note?: string;
+	/** Y1 T2: a coding_done the machine synthesized from git + gate exit codes, not from the lane. */
+	synthesized?: { phase: string; round: number; at: string };
+	/** Y16: task id -> the checkpoint tag naming the HEAD that task passed against. */
+	checkpoints?: Record<string, string>;
 }
 
 export function readJson<T>(path: string): T | undefined {
@@ -194,12 +355,35 @@ export function readJson<T>(path: string): T | undefined {
 	}
 }
 
-/** Temp + rename: a reader never sees a half-written record. */
+/**
+ * Durable write (Y5): temp + fsync + rename + fsync of the parent directory. A `kill -9` in the
+ * middle of a multi-hour run leaves `state.json` parsing as the PREVIOUS phase — a reader never
+ * sees a half-written record, and the rename itself survives the crash because the directory
+ * entry is flushed after it. Directory fsync is best-effort (platforms that refuse an `r` fd on
+ * a directory must not fail the phase).
+ */
 export function writeJson(path: string, value: unknown): void {
-	mkdirSync(join(path, ".."), { recursive: true });
+	const dir = join(path, "..");
+	mkdirSync(dir, { recursive: true });
 	const tmp = `${path}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+	const fd = openSync(tmp, "w");
+	try {
+		writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
 	renameSync(tmp, path);
+	try {
+		const dfd = openSync(dir, "r");
+		try {
+			fsyncSync(dfd);
+		} finally {
+			closeSync(dfd);
+		}
+	} catch {
+		/* the rename is already atomic; the directory flush is the durability we can add, not the record */
+	}
 }
 
 export function isRepoRelative(path: string): boolean {
@@ -292,6 +476,44 @@ export const briefings = {
 		if (run.state === "complete") return `Orchestrated run ${run.run_id} completed: verdict accepted after round ${run.round}. State and phase log: ${path}. Resident lane ${run.lane}; nothing is preloaded.`;
 		if (run.state === "failed") return `Orchestrated run ${run.run_id} failed at round ${run.round} in state ${run.state}: ${run.reason ?? "unreported"}. State file: ${path}.`;
 		return `Orchestrated run ${run.run_id} stopped at round ${run.round}; resident lane left as ${run.lane}.`;
+	},
+	/**
+	 * Y1 Tier 1: the lane ended its turn without calling `fade_phase`. No round was spent and no
+	 * swap happens — the same lane is re-briefed in VRAM with the ONE thing it owes, plus the
+	 * published schema, and told exactly what the next miss costs.
+	 */
+	nudge: (run: RunState): string => {
+		const phase = PHASE_FOR_STATE[run.state] ?? "coding_done";
+		return [
+			`Protocol nudge ${run.stall_count ?? 1}/${STALL_SYNTHESIZE_AT} — orchestrated run ${run.run_id}, state ${run.state}, round ${run.round}/${run.max_rounds} (UNSPENT: the round budget does not move here), lane ${run.lane}.`,
+			`Your turn ended with NO fade_phase call. The loop cannot advance without it and will not swap lanes.`,
+			`Call the fade_phase tool NOW: phase="${phase}", payload=<the JSON object serialized to a string>.`,
+			SCHEMA_HINT,
+			`The work is done? Say so with the acceptance command and what it printed in "result". The work is NOT done? Finish it, then report.`,
+			`The next miss auto-synthesizes this round's coding_done from git and the gate exit codes; the one after halts the run as stalled_protocol_error.`,
+		].join("\n");
+	},
+	/**
+	 * Y1 Tier 3: the circuit breaker tripped. The run is paused, the lane is left as it is, and
+	 * this is the diagnostic an operator acts on: what the machine saw, what is RED, what git
+	 * says, and the exact files to open.
+	 */
+	stalled: (run: RunState): string => {
+		const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
+		const phases = (run.phases ?? []).slice(-3).map((p) => `${p.phase} round ${p.round} accepted=${p.accepted}${p.notes ? ` notes=${p.notes}` : ""}`);
+		const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok).map((r) => `  RED: ${r.cmd}\n    expected: ${r.expected}\n    observed: ${r.tail}`);
+		const rejections = (run.rejection_history ?? []).slice(-5).map((r) => `  round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
+		return [
+			`Orchestrated run ${run.run_id} HALTED: stalled_protocol_error — ${run.protocol_retries ?? 0} turn(s) ended with no fade_phase call (state ${run.state}, round ${run.round}/${run.max_rounds}, lane ${run.lane}). The loop is paused; nothing further is sent to any lane and no lane was swapped.`,
+			phases.length > 0 ? `Last phases the machine saw: ${phases.join(" | ")}` : `No phase was ever accepted by this run.`,
+			run.synthesized ? `Synthesized coding_done at round ${run.synthesized.round} (${run.synthesized.at}): ${JSON.stringify(run.synthesized)}` : `Nothing was synthesized.`,
+			`Deterministic gate: ${gateSummary(run)}`,
+			...(failing.length > 0 ? ["Checks that are RED:", ...failing] : []),
+			...(rejections.length > 0 ? ["Recent rejections:", ...rejections] : []),
+			`Working tree: ${diffStat(run.repo)}`,
+			run.operator_note ? `Operator note: ${run.operator_note}` : "",
+			`Act on it: read ${path}, run the plan's own checks in ${run.repo}, then /orchestrate pause to unpause in place, /orchestrate code to resume on the code lane, or /orchestrate stop to end the run.`,
+		].filter(Boolean).join("\n");
 	},
 };
 

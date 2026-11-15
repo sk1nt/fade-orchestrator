@@ -13,13 +13,22 @@
 //   5. a GREEN gate on the next run lets agent_end issue exactly ONE POST /v1/load (the verifier
 //      swap) and the state reaches verifying,
 //   6. needs_repair records the verifier notes + task ids into rejection_history, round 2,
-//   7. /orchestrate halt persists state=stopped.
+//   7. /orchestrate halt persists state=stopped,
+//   8. the Tier-1 protocol gate: a phase-less turn is nudged with the round UNSPENT and no swap,
+//      the second miss synthesizes coding_done from `git status --porcelain` + gate exit codes,
+//      the third halts as stalled_protocol_error with ZERO lane loads,
+//   9. [p] pauses as a flag (load deferred, operator note durable) and resumes,
+//  10. the turn ledger writes one JSONL line per turn from the router's own numbers, and NO line
+//      when the router reports no pp/tg (never a fabricated zero),
+//  11. the verifier lane's active set carries no writers and a verifier edit/task is BLOCKED,
+//  12. an accepted verification tags `omp-ckpt/<run>/T<n>-passed` in the repo.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const repo = join(tmpdir(), "orch-gate-rig");
 rmSync(repo, { recursive: true, force: true });
@@ -28,6 +37,7 @@ mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
 // ---- stub router: counts requests, tracks the resident lane ----
 const reqLog = [];
 let resident = "flash-next";
+let metricsOn = true;
 const server = http.createServer(async (req, res) => {
   reqLog.push(`${req.method} ${req.url}`);
   let body = "";
@@ -49,6 +59,8 @@ const server = http.createServer(async (req, res) => {
     resident = model;
     return send(200, { ok: true, model });
   }
+  if (req.url === "/metrics")
+    return send(200, { requests: metricsOn ? [{ pp: 1499, decode_tok_s: 130, ttft_s: 0.4, hit_rate: 0.82 }] : [] });
   send(404, { error: "unknown" });
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -60,6 +72,7 @@ const tools = {};
 const commands = {};
 const hooks = {};
 const sent = [];
+let activeTools = ["read", "bash", "edit", "write", "grep", "task"];
 const pi = {
   registerTool: (t) => void (tools[t.name] = t),
   registerCommand: (name, c) => void (commands[name] = c),
@@ -67,8 +80,8 @@ const pi = {
   registerShortcut: () => {},
   setModel: async () => ({ switched: true }),
   setThinkingLevel: () => {},
-  getActiveTools: () => [],
-  setActiveTools: () => {},
+  getActiveTools: () => activeTools,
+  setActiveTools: (t) => void (activeTools = t),
   sendUserMessage: (t) => void sent.push(t),
 };
 const notes = [];
@@ -103,6 +116,7 @@ const seedState = (state, checks) => ({
   phases: [{ phase: "planning_done", lane: "deepseek", accepted: true, round: 1, at: "2026-11-15T00:00:00.000Z" }],
   repair_tasks: [],
   started_utc: "2026-11-15T00:00:00.000Z",
+  repo,
 });
 const writeState = (s) => {
   writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), JSON.stringify(s, null, 2));
@@ -205,6 +219,161 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	const volatileIdx = h ? h.indexOf("Task state") : -1;
 	ok("handover is stable-first (definitions before statuses)", stableIdx > 0 && volatileIdx > stableIdx, `stable=${stableIdx} volatile=${volatileIdx}`);
 	delete process.env.FADE_ORCHESTRATE_AUTO_RESUME;
+}
+
+// 9. Tier-1 protocol gate (Y1): a turn that ends with no `fade_phase` is protocol debt. The
+//    round budget and the lane swap are the two currencies here, so the gate must touch NEITHER.
+{
+	const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+	git("init", "-q");
+	git("config", "user.email", "rig@localhost");
+	git("config", "user.name", "fade-orchestrator-rig");
+	writeFileSync(join(repo, "a.ts"), "seed\n");
+	git("add", "-A");
+	git("commit", "-q", "-m", "rig seed");
+	writeFileSync(join(repo, "a.ts"), "changed by the coder lane\n");
+
+	writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, rejection_history: [], protocol_retries: 0, stall_count: 0, paused: false });
+	await hooks.session_start({}, ctx);
+	sent.length = 0;
+	const base = loads();
+
+	await hooks.agent_end({}, ctx); // miss 1 → nudge, in place, free
+	let s = readState();
+	ok("tier 1: nudge burns NO round", s.round === 1 && s.stall_count === 1 && s.protocol_retries === 1, `round=${s.round} stall=${s.stall_count} retries=${s.protocol_retries}`);
+	ok("tier 1: nudge pays NO swap", loads() === base, `loads=${loads() - base}`);
+	ok("tier 1: the nudge is sent to the resident lane", sent.some((m) => m.includes("Protocol nudge 1/2")), sent.join(" | ").slice(0, 140));
+
+	await hooks.agent_end({}, ctx); // miss 2 → synthesize from git + gate
+	await new Promise((r) => setTimeout(r, 60));
+	s = readState();
+	ok("tier 2: coding_done SYNTHESIZED from git + gate", s.synthesized?.phase === "coding_done" && s.state === "verifying", `${s.synthesized?.phase}/${s.state}`);
+	ok("tier 2: the synthesized result quotes git evidence", (s.tasks.find((t) => t.id === "T1")?.result ?? "").includes("git status --porcelain"), s.tasks[0]?.result);
+	ok("tier 2: the verifier swap is paid EXACTLY once", loads() - base === 1, `${loads() - base}`);
+	ok("tier 2: protocol debt is recorded as its own kind", (s.rejection_history ?? []).some((r) => r.kind === "protocol"), JSON.stringify((s.rejection_history ?? []).map((r) => r.kind)));
+}
+
+// 10. [p] pause: a flag, not a state — the lane load is deferred and the note is durable.
+{
+	const base = loads();
+	await commands.orchestrate.handler("pause hand-editing the fixture", ctx);
+	let s = readState();
+	ok("pause sets the flag and writes the operator note", s.paused === true && s.operator_note === "hand-editing the fixture", JSON.stringify(s.operator_note));
+	await hooks.agent_end({}, ctx);
+	ok("a paused loop sends no nudge and pays no swap", loads() === base && notes.some((n) => n.includes("no nudge sent")), notes.slice(-1)[0]);
+	await commands.orchestrate.handler("pause", ctx);
+	s = readState();
+	ok("the second pause resumes and clears the flag", s.paused === false, String(s.paused));
+}
+
+// 11. Tier-3 circuit breaker: the third phase-less turn halts cleanly, ZERO lane loads.
+{
+	const base = loads();
+	await hooks.agent_end({}, ctx); // miss 3 (synthesis is not an accepted phase, so the streak stands)
+	await new Promise((r) => setTimeout(r, 20));
+	let s = readState();
+	ok("tier 3: halts as stalled_protocol_error, paused", s.state === "stalled_protocol_error" && s.paused === true, `${s.state}/${s.paused}`);
+	ok("tier 3: ZERO lane loads", loads() === base, `${loads() - base}`);
+	ok("tier 3: the diagnostic names the acts", notes.some((n) => n.includes("stalled_protocol_error") && n.includes("/orchestrate code")), (notes.slice(-1)[0] ?? "").slice(0, 160));
+	let refused = "";
+	try {
+		await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }] });
+	} catch (e) {
+		refused = e.message;
+	}
+	ok("a stalled run refuses a phase with the rule named", /takes no phase/.test(refused), refused);
+	await commands.orchestrate.handler("code", ctx);
+	await new Promise((r) => setTimeout(r, 60));
+	s = readState();
+	ok("[c] resumes a stalled run onto the code lane", s.state === "coding" && s.paused === false, `${s.state}/${s.paused}`);
+}
+
+// 12. Y18 turn ledger: one line per turn from the router's numbers, and NO line without them.
+{
+	const jsonl = join(repo, "var", "omp-orchestrate", "metrics.jsonl");
+	const lines = () => (existsSync(jsonl) ? readFileSync(jsonl, "utf8").trim().split("\n").filter(Boolean) : []);
+	metricsOn = true;
+	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+	await hooks.agent_end({}, ctx);
+	await new Promise((r) => setTimeout(r, 60));
+	const withMetrics = lines();
+	const last = JSON.parse(withMetrics[withMetrics.length - 1] ?? "{}");
+	ok("the ledger writes one JSONL line per turn from the router's numbers", withMetrics.length >= 1 && last.pp === 1499 && last.tg === 130 && last.phase === "coding_done" && typeof last.swap_ms === "number", JSON.stringify(last));
+	metricsOn = false;
+	const before = lines().length;
+	await exec("verification_done", { verdict: "needs_repair", notes: "rig repair", tasks: [task("T2")] });
+	await hooks.agent_end({}, ctx);
+	await new Promise((r) => setTimeout(r, 60));
+	ok("a router reporting no pp/tg appends NO line (never a fabricated zero)", lines().length === before, `${before} → ${lines().length}`);
+}
+
+// 13. Y15 verifier sandbox: the thinking lane has no writers, and the guard enforces it.
+{
+	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
+	await commands.orchestrate.handler("verify", ctx);
+	await new Promise((r) => setTimeout(r, 60));
+	ok("the verifier lane's active set carries no writers", !activeTools.includes("edit") && !activeTools.includes("write") && !activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
+	const blocked = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "x", input: {} }, ctx);
+	ok("a verifier edit is BLOCKED with the rule named", blocked?.block === true && /read-only/.test(blocked.reason ?? ""), JSON.stringify(blocked));
+	const spawn = await hooks.tool_call({ type: "tool_call", toolName: "task", toolCallId: "y", input: {} }, ctx);
+	ok("a verifier subagent is blocked too (it can edit)", spawn?.block === true, JSON.stringify(spawn));
+	const allowed = await hooks.tool_call({ type: "tool_call", toolName: "read", toolCallId: "z", input: {} }, ctx);
+	ok("a verifier read is NOT blocked", allowed === undefined, JSON.stringify(allowed));
+}
+
+// 14. Y16: every task accepted by the verifier leaves a checkpoint tag the tree rolls back to.
+{
+	await exec("verification_done", { verdict: "accepted", checks: [["true", "green"]], notes: "rig accepted" });
+	const s = readState();
+	ok("accepted verification tags one checkpoint per passed task", s.checkpoints?.T1 === "omp-ckpt/GATE1/T1-passed" && s.checkpoints?.T2 === "omp-ckpt/GATE1/T2-passed", JSON.stringify(s.checkpoints));
+	const tagList = execFileSync("git", ["-C", repo, "tag", "-l"], { encoding: "utf8" });
+	ok("the checkpoint tag exists in the repo", tagList.includes("omp-ckpt/GATE1/T1-passed"), tagList.trim().split("\n").join(","));
+	ok("the run completes", s.state === "complete", s.state);
+}
+
+// 15. A delegated (subagent) session NEVER drives the loop. It shares the cwd, so an unguarded
+//     session_start adopted the operator's run and paid a verifier swap per spin-up (measured:
+//     70.1 s of pack swap and 181.7 GiB loaded across two spin-ups, zero tokens served).
+{
+	const nested = join(repo, "sessions", "2026-11-15T09-11-28-519Z_01a1de79-d407-740b-a74e-ce2c57a1c556", "Worker.jsonl");
+	mkdirSync(dirname(nested), { recursive: true });
+	writeFileSync(nested, "");
+	const jsonl = join(repo, "var", "omp-orchestrate", "metrics.jsonl");
+	const lines = () => (existsSync(jsonl) ? readFileSync(jsonl, "utf8").trim().split("\n").filter(Boolean) : []);
+	process.env.PI_SESSION_FILE = nested;
+	const base = loads();
+	const before = lines().length;
+	writeState({ ...seedState("coding", [["true", "green"]]), protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+	await hooks.session_start({}, ctx);
+	for (let i = 0; i < 3; i++) await hooks.agent_end({}, ctx); // three phase-less turns
+	await new Promise((r) => setTimeout(r, 60));
+	const s = readState();
+	ok("a delegated session pays ZERO lane loads", loads() === base, `${loads() - base}`);
+	ok("a delegated session writes NO ledger line", lines().length === before, `${before} → ${lines().length}`);
+	ok("a delegated session leaves the run's protocol counters untouched", s.protocol_retries === 0 && s.stall_count === 0, `${s.protocol_retries}/${s.stall_count}`);
+	const refused = await commands.orchestrate.handler("nested goal from a worker", ctx);
+	void refused;
+	ok("a delegated session refuses to start a run", notes.some((n) => n.includes("delegated (subagent) session") && n.includes("refused")), notes.slice(-1)[0]);
+	delete process.env.PI_SESSION_FILE;
+}
+
+// 16. [p] between rounds DEFERS the lane load — the swap is never paid into a paused loop, and
+//     resuming pays it exactly once.
+{
+	resident = "flash-next";
+	writeState({ ...seedState("coding", [["true", "green"]]), protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+	await hooks.session_start({}, ctx);
+	await new Promise((r) => setTimeout(r, 60));
+	await commands.orchestrate.handler("pause", ctx); // park the loop between rounds
+	const base = loads();
+	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+	await hooks.agent_end({}, ctx); // the gate is green, so the verifier load is now pending
+	await new Promise((r) => setTimeout(r, 60));
+	ok("a paused turn boundary defers the verifier load", loads() === base && notes.some((n) => n.includes("load is deferred")), `loads=${loads() - base} · ${(notes.slice(-1)[0] ?? "").slice(0, 90)}`);
+	await commands.orchestrate.handler("pause", ctx); // resume → the deferred load is paid
+	await new Promise((r) => setTimeout(r, 60));
+	ok("resuming pays the deferred load exactly once", loads() - base === 1, `${loads() - base}`);
+	ok("the resumed run sits on the verifier lane", readState().state === "verifying", readState().state);
 }
 
 server.close();
