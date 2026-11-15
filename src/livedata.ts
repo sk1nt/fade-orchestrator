@@ -4,11 +4,16 @@
  *
  * Measured basis (basalt 0.4.0, this host, 2026-11-14/15):
  * - `/health` during a swap: `{"loaded","loading","percent":42,"swap":{"from","to","phase","since"}}`.
- * - `/metrics`: `engine.quant` (IQ1_M), `expert_slots` (2200), `spill:{experts:960,total:15360}`,
- *   `live:{state,slots,queue,tok_s}`, and per-request `durations` whose FIRST element is TTFT and
- *   the rest are per-token decode seconds — decode tok/s = 1 / median(rest). The deepseek promote
- *   window measured ~91 tok/s for its first ~1,200 tokens, steady ~130; flash-next 480-647.
- *   Those are the cold-ramp and hot numbers the overlay labels.
+ * - `/metrics`: the tier fields are nested under `engine` —
+ *   `engine.{quant,version,expert_slots,expert_total,spill:{experts,total,bytes}}`,
+ *   `live:{state,queued,slots:{total,active,queue_depth},tok_s}`, and per-request records carrying
+ *   `decode_tok_s`, `hit_rate`, `reused`, `pcie_share`, `ssd_share`, `drafts_offered/accepted`
+ *   (older payloads carry `durations` whose FIRST element is TTFT and the rest per-token decode
+ *   seconds — decode tok/s = 1 / median(rest)). Measured on the same box: IQ1_M `expert_slots`
+ *   2,200 with **no spill**; IQ2_XXS 1,600 with **2,680/15,360 experts and 27.37 GB in the file**,
+ *   which is that pack's decode collapse — the tier row is the reason the plugin pins IQ1_M.
+ * - The deepseek promote window measured ~91 tok/s for its first ~1,200 tokens, steady ~130;
+ *   flash-next 480-647. Those are the cold-ramp and hot numbers the overlay labels.
  */
 import { join } from "node:path";
 import { ROUTER } from "./router.ts";
@@ -28,6 +33,13 @@ export interface MetricsRequest {
 	hit_rate?: number;
 	reused?: number;
 	prompt_tokens?: number;
+	/** Routed-expert reads that crossed PCIe / landed in the file (the spill cost, per request). */
+	pcie_share?: number;
+	ssd_share?: number;
+	drafts_offered?: number;
+	drafts_accepted?: number;
+	ttft_s?: number;
+	prompt_ms?: number;
 	durations?: number[];
 }
 
@@ -84,16 +96,24 @@ export async function fetchMetrics(): Promise<MetricsSnapshot | undefined> {
 	if (!m && !h) return undefined;
 	const mm = (m ?? {}) as Record<string, any>;
 	const hh = (h ?? {}) as Record<string, any>;
+	// basalt 0.4.0 nests the tier fields under `engine`; a pre-0.4 payload carried them flat
+	// (`expert_slots.total`, `spill.bytes_gb`). Read both, newest first — a reader that silently
+	// prints `?` for the numbers the overlay exists to show is the defect this ordering avoids.
+	const eng = (mm.engine ?? {}) as Record<string, any>;
+	const spill = (eng.spill ?? mm.spill) as Record<string, any> | undefined;
+	const bytes = typeof spill?.bytes === "number" ? spill.bytes : undefined;
+	const slots = typeof eng.expert_slots === "number" ? eng.expert_slots : mm.expert_slots?.total;
+	const liveQueued = mm.live?.queued ?? mm.live?.slots?.queue_depth;
 	const snap: MetricsSnapshot = {
-		quant: mm.engine?.quant,
-		engine_version: mm.engine?.version,
-		slots: mm.expert_slots?.total,
-		spill_experts: mm.spill?.experts,
-		spill_total: mm.spill?.total,
-		spill_bytes_gb: mm.spill?.bytes_gb,
+		quant: eng.quant ?? mm.quant,
+		engine_version: eng.version ?? mm.engine_version,
+		slots,
+		spill_experts: spill?.experts,
+		spill_total: spill?.total ?? eng.expert_total,
+		spill_bytes_gb: typeof spill?.bytes_gb === "number" ? spill.bytes_gb : bytes !== undefined ? bytes / 1e9 : undefined,
 		live_state: mm.live?.state,
-		live_slots: mm.live?.slots,
-		queue: mm.queue,
+		live_slots: mm.live?.slots?.active,
+		queue: typeof liveQueued === "number" ? liveQueued : Array.isArray(mm.queue) ? mm.queue.length : mm.queue,
 		tok_s: mm.live?.tok_s,
 		loaded: hh.loaded,
 		loading: hh.loading,
@@ -112,7 +132,7 @@ export function tiersFromMetrics(s: MetricsSnapshot | undefined): TierRow[] {
 	return [
 		{ label: "engine", value: `${s.engine_version ?? "?"} quant ${s.quant ?? "?"}` },
 		{ label: "resident", value: `${s.loaded ?? "?"}${s.loading ? " (loading)" : ""}${s.percent != null ? ` ${s.percent}%` : ""}` },
-		{ label: "expert slots", value: `${s.slots ?? "?"} · spill ${s.spill_experts ?? "?"}/${s.spill_total ?? "?"}${s.spill_bytes_gb ? ` · ${s.spill_bytes_gb} GiB` : ""}` },
+		{ label: "expert slots", value: `${s.slots ?? "?"} · spill ${s.spill_experts ?? "?"}/${s.spill_total ?? "?"}${s.spill_bytes_gb !== undefined ? ` · ${s.spill_bytes_gb.toFixed(1)} GB` : ""}` },
 		{ label: "decode now", value: s.tok_s ? `${Math.round(s.tok_s)} tok/s (queue ${s.queue ?? 0}, ${s.live_state ?? "?"})` : "idle" },
 		{ label: "best recent", value: best ? `${Math.round(best)} tok/s` : "no completed requests" },
 		moeCacheRow(s.requests),
@@ -203,14 +223,25 @@ export function moeCacheRow(requests: MetricsRequest[] | undefined): { label: st
 	const n = Math.min(withHit.length, 8);
 	const recent = withHit.slice(-n);
 	const mean = recent.reduce((s, r) => s + (r.hit_rate ?? 0), 0) / recent.length;
-	return { label: "prefix cache", value: `${(mean * 100).toFixed(1)}% hit over ${n} req · last ${((last.hit_rate ?? 0) * 100).toFixed(1)}% (${last.reused ?? 0} tok reused)` };
+	// `ssd_share` is the routed-expert fraction that came from the FILE — the spill cost as the
+	// engine measures it, per request. IQ1_M read 0.0 on this host; IQ2_XXS read >0 on every
+	// request it served, which is the whole reason the tier row matters.
+	const ssd = recent.filter((r) => typeof r.ssd_share === "number");
+	const ssdText = ssd.length > 0 ? ` · ssd ${((ssd.reduce((s, r) => s + (r.ssd_share ?? 0), 0) / ssd.length) * 100).toFixed(1)}%` : "";
+	return {
+		label: "prefix cache",
+		value: `${(mean * 100).toFixed(1)}% hit over ${n} req · last ${((last.hit_rate ?? 0) * 100).toFixed(1)}% (${last.reused ?? 0} tok reused)${ssdText}`,
+	};
 }
 
 /** Best decode rate observed for a lane across the /metrics request window (the hot baseline). */
 export function laneBestRate(s: MetricsSnapshot, lane: string): number | undefined {
 	const slug = lane.replace(":", "");
+	// basalt 0.4.0's request records carry no `model` (the window belongs to the resident lane, and
+	// `/metrics?model=` is filtered server-side); older payloads DO carry it. Either shape counts,
+	// and a model-tagged record for a DIFFERENT lane is still ignored.
 	const rates = (s.requests ?? [])
-		.filter((r) => typeof r.model === "string" && r.model.replace(":", "") === slug)
+		.filter((r) => typeof r.model !== "string" || r.model.replace(":", "") === slug)
 		.map(rateFromRequest)
 		.filter((r): r is number => r !== undefined);
 	return rates.length > 0 ? Math.max(...rates) : undefined;

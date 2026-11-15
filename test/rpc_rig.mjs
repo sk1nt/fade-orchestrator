@@ -9,7 +9,8 @@
 // It seeds <repo>/var/omp-orchestrate/{ACTIVE.json,state.json} with a deterministic run, drives
 // the command surface with the router pointed at a CLOSED port (the pill must render without
 // touching the network, and metrics fetches must degrade to no suffix), and asserts:
-//   1. the pill: one setStatus `⚡ flash-next · R1/6 · T3/6 · [Ctrl+O]`,
+//   1. the pill: one setStatus `⚡ fn:code · R1/6 · T3/6 · [Ctrl+O]` (short lane tag + short
+//      state tag: the footer is one shared row, and `flash-next` plus the rest overflowed it),
 //   2. the multi-line dump is GONE: no setWidget frame carries lines under the status key,
 //   3. the overlay: full untruncated objectives + swap-history section + tier labels + key legend,
 //   4. skip: state.json records T4 passed with a manual-skip note,
@@ -99,7 +100,14 @@ for (const line of `${run.stdout ?? ""}`.split("\n")) {
   if (f.type === "available_commands_update") commands = (f.commands ?? f.commandsUpdate ?? []).map((c) => (typeof c === "string" ? c : c.name));
 }
 
-const pill = ui.find((u) => u.method === "setStatus" && String(u.statusText ?? "").startsWith("⚡ flash-next · R1/6 · T3/6 · [Ctrl+O]"));
+const pill = ui.find((u) => u.method === "setStatus" && String(u.statusText ?? "").startsWith("⚡ fn:code · R1/6 · T3/6 · [Ctrl+O]"));
+// The footer is one shared row: a 10-character model name overflowed it. Assert the pill is
+// SHORT (the tag is derived from the lane, not hardcoded) and that no full model name leaks in.
+const pillText = String(pill?.statusText ?? "");
+const pillCaps = [
+  ["pill carries the short lane tag, not the model name", pill !== undefined && !pillText.includes("flash-next")],
+  ["pill stays one line under 48 chars", pillText.length > 0 && pillText.length < 48],
+];
 const dump = ui.filter((u) => u.method === "setWidget" && (u.key ?? u.widgetKey) === "fade" && Array.isArray(u.widgetLines ?? u.lines));
 const overlay = ui.filter((u) => u.method === "setWidget" && (u.key === "fade-overlay" || u.widgetKey === "fade-overlay")).map((u) => u.widgetLines ?? u.lines ?? []);
 const overlayLines = overlay.flat();
@@ -110,6 +118,7 @@ const finalState = JSON.parse(readFileSync(join(repo, "var", "omp-orchestrate", 
 const checks = [
   ["commands registered", commands.includes("orchestrate") && commands.includes("lanes")],
   ["pill rendered", pill !== undefined],
+  ...pillCaps,
   ["no multi-line dump under the status key", dump.length === 0],
   ["overlay rendered", overlayLines.length > 10],
   ["overlay untruncated objective", overlayLines.some((l) => l.includes("z".repeat(20)))],

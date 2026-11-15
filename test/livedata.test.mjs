@@ -28,12 +28,14 @@ test("coldHot: measured deepseek ramp 91 against steady 130 reads cold; 130 read
 });
 
 test("tiersFromMetrics: engine/quant/slots/spill rows from the measured 0.4.0 payload", () => {
+	// The measured shape: tiers nest under `engine`, spill bytes are decimal bytes (not GiB).
 	const rows = tiersFromMetrics({
 		engine_version: "0.4.0",
-		quant: "IQ1_M",
-		slots: 2200,
-		spill_experts: 960,
+		quant: "IQ2_XXS",
+		slots: 1600,
+		spill_experts: 2680,
 		spill_total: 15360,
+		spill_bytes_gb: 27.37253376,
 		live_state: "decode",
 		live_slots: 1,
 		queue: 0,
@@ -45,11 +47,71 @@ test("tiersFromMetrics: engine/quant/slots/spill rows from the measured 0.4.0 pa
 		at_utc: "2026-11-15T00:00:00Z",
 	});
 	const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
-	assert.equal(byLabel["engine"], "0.4.0 quant IQ1_M");
+	assert.equal(byLabel["engine"], "0.4.0 quant IQ2_XXS");
 	assert.equal(byLabel["resident"], "deepseek");
-	assert.match(byLabel["expert slots"], /2200 · spill 960\/15360/);
+	assert.match(byLabel["expert slots"], /1600 · spill 2680\/15360 · 27\.4 GB/);
 	assert.match(byLabel["decode now"], /130 tok\/s/);
 	assert.equal(tiersFromMetrics(undefined)[0].label, "router");
+});
+
+test("tiersFromMetrics: the IQ1 lane reads zero spill, which is the whole choice", () => {
+	const rows = tiersFromMetrics({
+		engine_version: "0.4.0",
+		quant: "IQ1_M",
+		slots: 2200,
+		spill_experts: 0,
+		spill_total: 15360,
+		live_state: "decode",
+		live_slots: 1,
+		queue: 0,
+		tok_s: 130,
+		loaded: "deepseek",
+		at_utc: "2026-11-15T00:00:00Z",
+	});
+	const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
+	assert.match(byLabel["expert slots"], /2200 · spill 0\/15360/);
+	assert.doesNotMatch(byLabel["expert slots"], /GB/, "no spill bytes means no size suffix");
+});
+
+test("fetchMetrics field mapping is exercised through the flat pre-0.4 shape too", () => {
+	// The pre-0.4 payload put the same numbers at the top level; the reader must not print `?`.
+	const rows = tiersFromMetrics({
+		engine_version: "0.3.3",
+		quant: "IQ1_M",
+		slots: 2200,
+		spill_experts: 0,
+		spill_total: 15360,
+		spill_bytes_gb: 0,
+		loaded: "deepseek",
+		queue: 2,
+		at_utc: "x",
+	});
+	const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
+	assert.equal(byLabel["engine"], "0.3.3 quant IQ1_M");
+	assert.match(byLabel["decode now"], /idle/, "no live rate reads idle, not a fake number");
+});
+
+test("laneBestRate: model-less (0.4.0) records count for the resident lane, tagged ones still filter", () => {
+	const snap = {
+		requests: [
+			{ prompt_n: 100, decode_tok_s: 91 },
+			{ prompt_n: 900, decode_tok_s: 130 },
+			{ model: "strata-flash/flash-next", prompt_n: 900, durations: [1, 0.002, 0.002, 0.002, 0.002] },
+		],
+		at_utc: "x",
+	};
+	assert.equal(laneBestRate(snap, "strata-flash/deepseek"), 130);
+	assert.equal(laneBestRate({ requests: [{ durations: [1, 0.01, 0.01, 0.01] }], at_utc: "x" }, "strata-flash/deepseek"), 100);
+});
+
+test("moeCacheRow: hit rate plus the engine's measured ssd share", () => {
+	const row = moeCacheRow([
+		{ hit_rate: 0.5, reused: 100, ssd_share: 0.0 },
+		{ hit_rate: 1.0, reused: 900, ssd_share: 0.0 },
+	]);
+	assert.match(row.value, /75\.0% hit over 2 req/);
+	assert.match(row.value, /ssd 0\.0%/);
+	assert.equal(moeCacheRow(undefined).value, "no hit_rate reported");
 });
 
 test("laneBestRate: max over the lane's requests, other lanes ignored", () => {

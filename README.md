@@ -77,7 +77,11 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
   history, engine/memory tiers (quant, expert slots, spill, decode tok/s), the last verifier
   critique, recent rejections. Keys: `s` skip task, `v` verify now, `r` reset round, `c` code,
   `h` halt, `esc` close.
-- Status pill (one footer line): `⚡ <lane> · R<round>/<max> · T<passed>/<total> · [Ctrl+O] · hot 130t/s`.
+- Status pill (one footer line): `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O] · hot 130t/s`
+  — the lane is a 2-character tag (`flash-next` → `fn`, `deepseek` → `de`) and the state a short
+  one (`plan`, `code`, `ver`, `fix`, `done`, `fail`, `stop`, `stall`), because the footer is a
+  shared row and the full model name overflowed it. `/orchestrate status` and the overlay always
+  print the full lane name.
   The main pane stays clean during long coding runs — the detail view is the overlay.
 
 State lives in `<cwd>/var/omp-orchestrate/`: `ACTIVE.json`, `state.json` (schema v2:
@@ -112,6 +116,26 @@ The overlay then shows `MoE <lane>: live · 2.4 h old · warm start`. Three stat
   profile, `src/models/deepseek41/tier.cpp`; `write_expert_profile` is wired only by the qwen4exp
   `--expert-profile-save` path). The verifier pack relearns placement on every swap and cannot be
   made warm by configuration.
+
+## Why the thinking lane pins `IQ1_M` (not `IQ2_XXS`)
+
+The same router can serve both DeepSeek packs under two aliases; this package defaults the
+plan/verify lane to the **IQ1_M** pack because it stays resident where IQ2_XXS spills. Measured on
+one host (122 GiB RAM, 2 × 32.6 GiB VRAM, identical settings both sides):
+
+| | expert slots | spill | decode (warm) | wall, short answer |
+|---|---:|---|---:|---:|
+| IQ1_M | 2,200 | **none** | 97–189 tok/s | 0.3–0.6 s |
+| IQ2_XXS | 1,600 | **2,680 / 15,360 experts · 27.4 GB in the file** | 37–65 tok/s | 1.0–49.1 s |
+
+IQ2 is the accuracy favourite on the KL/top-1 arms (0.2408 / 85.15 % vs 0.2779 / 83.88 %; PPL goes
+the other way, 3.1074 vs 3.0456) and a 10-question deterministic spot check tied at 10/10 — so the
+choice is throughput, not knowledge. The overlay makes it visible: the **expert slots** row prints
+the engine's own `spill`, and `spill.experts > 0` is the signal that the pack is served from disk.
+Full numbers, method and the reproduce-anywhere commands: [`docs/quant-choice.md`](docs/quant-choice.md).
+
+An IQ2 alias is still worth keeping: swaps are `POST /v1/load {"model":"<alias>"}` and clients wait
+through them, so an A/B is one request, never a restart.
 
 ## Fast handover (getting a fresh lane on topic)
 

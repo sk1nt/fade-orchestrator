@@ -1,9 +1,10 @@
 /**
  * The compact pill and the Ctrl+O overlay.
  *
- * Main pane: ONE status line — `⚡ <lane> · R<round>/<max> · T<passed>/<total> · [Ctrl+O]` —
- * and NOTHING multi-line above the editor while a run is live (the monolith painted a 6+ line
- * task dump there; during long coding runs that dump ate the transcript).
+ * Main pane: ONE status line — `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O]`
+ * (2-char lane tag + short state tag: the footer is a shared row) — and NOTHING multi-line above
+ * the editor while a run is live (the monolith painted a 6+ line task dump there; during long
+ * coding runs that dump ate the transcript).
  *
  * Overlay: `ctx.ui.custom(..., {overlay:true})` with keyboard focus. Keys: s skip, v verify,
  * r reset, h halt, c code, esc/q close. Outside interactive mode (RPC/print, `ctx.hasUI` false)
@@ -32,7 +33,38 @@ export const OVERLAY_WIDGET_KEY = "fade-overlay";
 export function pill(run: RunState, suffix?: string): string {
 	const total = run.tasks.length;
 	const passed = run.tasks.filter((t) => t.status === "passed").length;
-	return `⚡ ${run.lane} · R${run.round}/${run.max_rounds} · T${passed}/${total} · [Ctrl+O]${suffix ? ` · ${suffix}` : ""}`;
+	const st = statusTag(run);
+	return `⚡ ${st} · R${run.round}/${run.max_rounds} · T${passed}/${total} · [Ctrl+O]${suffix ? ` · ${suffix}` : ""}`;
+}
+
+/**
+ * Short lane name for the footer: "flash-next" -> "fn", "flash-ornith" -> "fo", "deepseek" -> "de".
+ * The pill is one line in a shared terminal row, so a 10-character model name plus round, tally,
+ * the key hint and the tok/s suffix overflowed it; 2 characters keep the whole line readable and
+ * still unambiguous (`/orchestrate status` and the overlay print the FULL name, always).
+ */
+export function laneTag(lane: string): string {
+	const m = /^(.*?)-(.*?)(?:-|$)/.exec(lane);
+	if (m) return `${m[1]![0]}${m[2]![0]}`;
+	return lane.length > 4 ? lane.slice(0, 2) : lane;
+}
+
+/**
+ * Short state tag: the state machine's name, never the phase prose. A stalled protocol error is
+ * the one state the pill must not hide (Tier-1 failure gate), so it stays readable as `stall`.
+ */
+export function statusTag(run: RunState): string {
+	const short: Record<string, string> = {
+		planning: "plan",
+		coding: "code",
+		verifying: "ver",
+		repair: "fix",
+		complete: "done",
+		failed: "fail",
+		stopped: "stop",
+		stalled_protocol_error: "stall",
+	};
+	return `${laneTag(run.lane)}:${short[run.state] ?? run.state}`;
 }
 
 /** The overlay body, untruncated: full objectives, acceptances, results, swap rows, tiers. */
