@@ -31,11 +31,11 @@ test("tiersFromMetrics: engine/quant/slots/spill rows from the measured 0.4.0 pa
 	// The measured shape: tiers nest under `engine`, spill bytes are decimal bytes (not GiB).
 	const rows = tiersFromMetrics({
 		engine_version: "0.4.0",
-		quant: "IQ2_XXS",
-		slots: 1600,
-		spill_experts: 2680,
+		quant: "IQ1_M",
+		slots: 2200,
+		spill_experts: 0,
 		spill_total: 15360,
-		spill_bytes_gb: 27.37253376,
+		spill_bytes_gb: 0.0,
 		live_state: "decode",
 		live_slots: 1,
 		queue: 0,
@@ -47,9 +47,9 @@ test("tiersFromMetrics: engine/quant/slots/spill rows from the measured 0.4.0 pa
 		at_utc: "2026-11-15T00:00:00Z",
 	});
 	const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
-	assert.equal(byLabel["engine"], "0.4.0 quant IQ2_XXS");
+	assert.equal(byLabel["engine"], "0.4.0 quant IQ1_M");
 	assert.equal(byLabel["resident"], "deepseek");
-	assert.match(byLabel["expert slots"], /1600 · spill 2680\/15360 · 27\.4 GB/);
+	assert.match(byLabel["expert slots"], /2200 · spill 0\/15360 · 0\.0 GB/);
 	assert.match(byLabel["decode now"], /130 tok\/s/);
 	assert.equal(tiersFromMetrics(undefined)[0].label, "router");
 });

@@ -9,9 +9,9 @@
  *   `live:{state,queued,slots:{total,active,queue_depth},tok_s}`, and per-request records carrying
  *   `decode_tok_s`, `hit_rate`, `reused`, `pcie_share`, `ssd_share`, `drafts_offered/accepted`
  *   (older payloads carry `durations` whose FIRST element is TTFT and the rest per-token decode
- *   seconds — decode tok/s = 1 / median(rest)). Measured on the same box: IQ1_M `expert_slots`
- *   2,200 with **no spill**; IQ2_XXS 1,600 with **2,680/15,360 experts and 27.37 GB in the file**,
- *   which is that pack's decode collapse — the tier row is the reason the plugin pins IQ1_M.
+ *   seconds — decode tok/s = 1 / median(rest)). Measured on the same box: the served IQ1_M
+ *   `expert_slots` is 2,200 with **no spill** — the tier row is the reason the plugin pins
+ *   IQ1_M.
  * - The deepseek promote window measured ~91 tok/s for its first ~1,200 tokens, steady ~130;
  *   flash-next 480-647. Those are the cold-ramp and hot numbers the overlay labels.
  */
@@ -224,8 +224,8 @@ export function moeCacheRow(requests: MetricsRequest[] | undefined): { label: st
 	const recent = withHit.slice(-n);
 	const mean = recent.reduce((s, r) => s + (r.hit_rate ?? 0), 0) / recent.length;
 	// `ssd_share` is the routed-expert fraction that came from the FILE — the spill cost as the
-	// engine measures it, per request. IQ1_M read 0.0 on this host; IQ2_XXS read >0 on every
-	// request it served, which is the whole reason the tier row matters.
+	// engine measures it, per request. The served IQ1_M reads 0.0 on this host, which is the
+	// whole reason the tier row matters.
 	const ssd = recent.filter((r) => typeof r.ssd_share === "number");
 	const ssdText = ssd.length > 0 ? ` · ssd ${((ssd.reduce((s, r) => s + (r.ssd_share ?? 0), 0) / ssd.length) * 100).toFixed(1)}%` : "";
 	return {
