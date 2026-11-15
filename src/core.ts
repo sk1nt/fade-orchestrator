@@ -158,23 +158,6 @@ export function checkParses(cmd: string): { ok: boolean; detail: string } {
 }
 
 /**
- * The gate's per-command wall budget. The 120 s constant was written for the fast checks — the
- * parity selftest runs 0.82 s and lineage_check 0.00 s — and is smaller than the rigs the plan is
- * allowed to declare: `node test/rpc_rig.mjs` measured 180.8 s wall on this box (it drives five
- * RPC frames through `omp --mode rpc`), so a green tree could never leave the round. Make the
- * budget configuration, read at call time so a rig can raise it for one command class.
- */
-export const GATE_CMD_TIMEOUT_DEFAULT_MS = 300_000;
-
-export function gateCmdTimeoutMs(env: Record<string, string | undefined> = process.env): number {
-	const raw = env.FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS;
-	if (raw === undefined || raw === "") return GATE_CMD_TIMEOUT_DEFAULT_MS;
-	const n = Number(raw);
-	// A garbage value must not shrink the gate to 0 s (every check would time out) nor disable it.
-	return Number.isFinite(n) && n > 0 ? n : GATE_CMD_TIMEOUT_DEFAULT_MS;
-}
-
-/**
  * The pre-swap gate (T4): the verifier swap costs a 13-25 s pack load; running the plan's own
  * checks on the code lane FIRST means the swap is only ever paid for a tree whose deterministic
  * checks already pass. Exit code is the verdict (deterministic); the `expected` text rides to
@@ -195,7 +178,7 @@ export function runGate(checks: [string, string][], cwd: string): GateResult {
 			};
 		}
 		try {
-			const out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: gateCmdTimeoutMs(), maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
+			const out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
 			return { cmd, expected, ok: true, tail: `${out}`.slice(-400) };
 		} catch (e) {
 			const err = e as { stdout?: string; message?: string };

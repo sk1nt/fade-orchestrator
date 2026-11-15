@@ -1,12 +1,10 @@
 #!/usr/bin/env node
-// ui.test.mjs — the status line's contract. The operator's placement order (2026-11-15, second
-// act: "I want the status for orchestrate to exist at the top and it shouldn't always be there,
-// only when in use … no footer for now") is that the pill rides a widget docked ABOVE the editor,
-// carries the FULL lane name, and is rendered ONLY while a run is in use: `topStatus` answers
-// `undefined` for no run, for a terminal run and for a run this session does not own, and the
-// caller clears the widget on every one of those. The footer's extension-status row
-// (`ctx.ui.setStatus`) is not written at all. laneTag/pillCompact survive ONLY as the
-// narrow-terminal fallback, where the host truncates the line with "…".
+// ui.test.mjs — the footer pill's contract. The operator's placement order (2026-11-15: "put this
+// text up where DeepSeek-v4.1 … is, it should fit fine") is that the pill carries the FULL lane
+// name: the host renders setStatus() text on the footer's extension-status row at full terminal
+// width, directly under the stats row whose right side is the model identifier, and that
+// identifier is longer than this line — so the full name fits. laneTag/pillCompact survive ONLY as
+// the narrow-terminal fallback, where the host truncates the row with "…".
 import os from "node:os";
 import assert from "node:assert/strict";
 import test from "node:test";
