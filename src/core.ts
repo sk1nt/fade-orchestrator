@@ -188,6 +188,28 @@ export function runGate(checks: [string, string][], cwd: string): GateResult {
 	return { at: new Date().toISOString(), passed: results.every((r) => r.ok), results };
 }
 
+/**
+ * The gate runs the plan's checks, and the checks are DATA. Measured 2026-11-15, run
+ * 20261115T091232Z-rqtj: two of the eight commands were unrunnable (`--artifacts` is not a flag of
+ * scan_resident_parity.sh, whose flags are --ref/--out/--lanes/--keep, and a `<placeholder>` is a
+ * shell redirect, so `bash -lc` died on the `<`). They were repaired in `state.json`, and the gate
+ * stayed red on the SAME two strings forever: `runGate` reads the owner session's in-memory
+ * `run.checks`, and only `session_start` re-reads the file. Refresh the run's checks from the
+ * on-disk state, keyed by `run_id` so a state file belonging to another run is never adopted, and
+ * report the delta so the refresh is visible, never silent.
+ */
+export function refreshChecks(run: RunState, live: RunState | undefined): { changed: boolean; to: number; added: string[]; removed: string[] } {
+	const before = run.checks.map((c) => c[0]);
+	if (!live || live.run_id !== run.run_id || !Array.isArray(live.checks)) return { changed: false, to: before.length, added: [], removed: [] };
+	const isPair = (c: unknown): c is [string, string] =>
+		Array.isArray(c) && c.length === 2 && typeof c[0] === "string" && typeof c[1] === "string";
+	const next: [string, string][] = (live.checks as unknown[]).filter(isPair);
+	const after = next.map((c) => c[0]);
+	if (JSON.stringify(before) === JSON.stringify(after)) return { changed: false, to: after.length, added: [], removed: [] };
+	run.checks = next;
+	return { changed: true, to: after.length, added: after.filter((c) => !before.includes(c)), removed: before.filter((c) => !after.includes(c)) };
+}
+
 /** `git diff --stat` tail: the volatile "what changed since" line a fresh lane needs. */
 export function diffStat(repo: string): string {
 	if (!isGitRepo(repo)) return notARepo(repo);

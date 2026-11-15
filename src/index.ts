@@ -179,6 +179,17 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (run && runDir) writeJson(statePath(), run);
 	};
 
+	/** The gate's checks are DATA: read the file, so an on-disk repair reaches the run object.
+	 *  Without this the gate is unrepairable in a live session — `state.json` can carry fixed
+	 *  commands while the session re-judges the plan's original broken pair (run
+	 *  20261115T091232Z-rqtj, two checks, every round). The refresh is announced, never silent. */
+	const gateChecks = (ctx: ExtensionContext): void => {
+		if (!run) return;
+		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
+		const r = refreshChecks(run, live);
+		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
+	};
+
 	const paint = (ctx: ExtensionContext): void => {
 		if (!run) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -491,6 +502,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// resident (loadLane on the resident entry costs 0 s), records the rejection, and
 			// sends the gate briefing with the observed tails — self-repair without a swap.
 			if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
+				gateChecks(ctx);
 				const gate = runGate(run.checks, run.repo);
 				run.gate_last = gate;
 				if (!gate.passed) {
@@ -775,6 +787,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// Tier-2: the result is built from what the machine can prove — the plan's own
 				// checks (exit codes) and git. A RED gate keeps the coder lane resident, exactly
 				// like the tool's pre-swap gate: the swap is paid only for a green tree.
+				gateChecks(ctx);
 				const gate = run.checks.length > 0 ? runGate(run.checks, run.repo) : undefined;
 				if (gate) run.gate_last = gate;
 				if (gate && !gate.passed) {

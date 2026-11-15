@@ -31,6 +31,7 @@ import {
 	porcelainEntries,
 	pushRejection,
 	readJson,
+	refreshChecks,
 	roundWindow,
 	runGate,
 	sameTaskPlan,
@@ -164,6 +165,28 @@ test("diffStat names the working-tree change or the clean state", () => {
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("refreshChecks: the gate honors an on-disk repair of the plan's checks, keyed by run_id", () => {
+	// The livelock measured 2026-11-15 (run 20261115T091232Z-rqtj): two checks were fixed in
+	// state.json and the gate kept re-judging the session's in-memory pair, every round.
+	const broken = [["bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?", "PASS 0"], ["cargo run --release --bin lineage_check -- --only pattern_scan_driver", "claims pass"]];
+	const run = mkRun({ checks: broken });
+	const repaired = [["bash scripts/ops/scan_resident_parity_selftest.sh", "both legs PASS"], ["src/fade_store_guard/target/release/lineage_check --only pattern_scan_driver", "2 pass, 0 fail"]];
+	const r = refreshChecks(run, { ...run, checks: repaired });
+	assert.equal(r.changed, true);
+	assert.equal(r.to, 2);
+	assert.deepEqual(r.removed, broken.map((c) => c[0]), "the broken pair is named as replaced");
+	assert.deepEqual(run.checks, repaired, "the run object now carries the file's commands");
+	const again = refreshChecks(run, { ...run, checks: repaired });
+	assert.equal(again.changed, false, "an equal file is a silent no-op — the announcement fires only when data moved");
+	assert.equal(refreshChecks(run, undefined).changed, false, "no state file is a no-op");
+	const foreign = refreshChecks(run, { ...run, run_id: "OTHER-RUN", checks: [["rm -rf /", "never"]] });
+	assert.equal(foreign.changed, false, "a state file from another run is never adopted");
+	assert.equal(run.checks[0][0], repaired[0][0], "the foreign file changed nothing");
+	const ragged = refreshChecks(run, { ...run, checks: [["only-one-element"], ["good", "check"], null, [7, "x"]] });
+	assert.equal(ragged.to, 1, "a malformed pair is dropped, never grafted into the gate");
+	assert.deepEqual(run.checks, [["good", "check"]]);
 });
 
 test("a non-repo run root degrades by name: git's --no-index usage page never reaches a briefing", () => {
