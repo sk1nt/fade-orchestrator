@@ -17,7 +17,7 @@
 //   4. skip: state.json records T4 passed with a manual-skip note,
 //   5. halt: notify + state.json stopped.
 // Usage: node test/rpc_rig.mjs [--repo DIR] [--timeout MS]
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const argv = process.argv.slice(2);
@@ -58,6 +58,19 @@ const state = {
 };
 rmSync(repo, { recursive: true, force: true });
 mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
+// The rig root must be a git working tree, exactly as gate_rig.mjs seeds it (git init + identity +
+// a seed commit): the extension reads the run root with `git status --porcelain` and
+// `git diff --stat`, and `omp --mode rpc` starts with this dir as cwd, so the harness's own status
+// call runs here too. Outside a working tree `git diff` does NOT fail -- it switches to --no-index
+// mode and answers with ~60 lines of usage (measured 2026-11-15 on this rig's default
+// /tmp/orch-rig-v2), which then rode into the status/overlay output and the TUI footer.
+const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+git("init", "-q");
+git("config", "user.email", "rig@localhost");
+git("config", "user.name", "rig");
+writeFileSync(join(repo, "a.ts"), "rig seed\n");
+git("add", "a.ts");
+git("commit", "-q", "-m", "rig seed");
 writeFileSync(join(repo, "var", "omp-orchestrate", "ACTIVE.json"), JSON.stringify({ run_id: "RIG2", repo, goal: "rig goal", started_utc: state.started_utc, max_rounds: 6 }, null, 2) + "\n");
 writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), JSON.stringify(state, null, 2) + "\n");
 

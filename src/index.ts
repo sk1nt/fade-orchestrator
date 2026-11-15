@@ -17,7 +17,7 @@ import { unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, PROVIDER, ROUTER, THINK_LANE, THINKING, listLanes, loadLane } from "./router.ts";
+import { CODE_LANE, PROVIDER, ROUTER, THINK_LANE, THINKING, listLanes, loadLane, routerBusy, type RouterBusy } from "./router.ts";
 import {
 	ACTIVE_FILENAME,
 	DEFAULT_ROUNDS,
@@ -49,12 +49,24 @@ import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, 
 // the keybindings table: app.tools.expand defaultKeys ctrl+o) — the operator asked for Ctrl+O,
 // so it is the default and the takeover is disclosed; set FADE_ORCHESTRATE_KEY to keep the
 // built-in (e.g. "ctrl+g").
+
+// Y10 pre-unload health gate: `POST /v1/load` unloads the RESIDENT lane, and a request queued at
+// that instant is answered by the router's own log line `swap flash-next -> deepseek (1 waiting)` —
+// 15-20 s and 52-130 GiB paid into a lane that is serving. The gate reads the router's busy surface
+// (`routerBusy`) and DEFERS the load: one poll every GATE_POLL_MS (default 3 s) for up to
+// GATE_BUDGET_MS (default 60 s) — 20 polls. Both are configuration so a rig can run a whole budget
+// in milliseconds; the documented interval/budget is what the box runs.
+const GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3000);
+const GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 60_000);
 const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "ctrl+o";
 
-// Y15: the mutating tools, by NAME. The verifier sandbox is a denylist, not an allowlist, so a
-// host tool this file has never seen cannot slip a write past it. `task` is on the list because a
-// subagent the verifier spawns can edit — delegating the write is exactly what the sandbox forbids.
-const MUTATING_TOOLS: Record<string, true> = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true, task: true };
+// Y15: the WRITING tools, by NAME. The verifier sandbox is a denylist, not an allowlist, so a host
+// tool this file has never seen cannot slip a write past it. Delegation is NOT on the list: `task`
+// writes nothing itself, and the sessions it spawns are inert by `isDelegatedSession` — blocking it
+// here only ever blocked the operator's own coding session (measured: a `task` call from the
+// operator returned "the verifier lane is read-only — task is refused" while the on-disk run sat on
+// the thinking lane).
+const MUTATING_TOOLS: Record<string, true> = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
 
 /**
  * Delegated (subagent) session detector. A subagent loads this extension in the SAME cwd, so an
@@ -75,6 +87,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let run: RunState | undefined;
 	let runDir: string | undefined;
 	let pending: { lane: string; phase: string } | undefined;
+	/** Y10: the lane switch currently open. A pre-unload deferral keeps it open for the whole gate
+	 *  budget, and two overlapping `POST /v1/load` calls are exactly the measured ping-pong. */
+	let switching: string | undefined;
 	let settledNotified = false;
 	let metrics: MetricsSnapshot | undefined;
 	let laneBest = 0;
@@ -192,6 +207,34 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			paint(ctx);
 		}
 		ctx.ui.notify(`fade_orchestrate: ${reason}`, "error");
+	};
+
+	/**
+	 * Y10: hold the lane load while the router is SERVING, and say so out loud. `laneSwap` calls this
+	 * BEFORE `setModel`/`loadLane`: a model switch issued into a lane that is still serving queues the
+	 * request the router answers by swapping BACK. The gate is bounded (GATE_POLL_MS/GATE_BUDGET_MS)
+	 * and visible — the first busy poll notifies, every poll refreshes the working message with the
+	 * elapsed budget and the counters the router reported. It is a DEFERRAL, not a refusal: the caller
+	 * keeps `pending` set, so the owed lane survives the whole wait. `over_budget` (busy for the full
+	 * budget) pays the load anyway — a loop that never lands its lane is a stalled run — and the
+	 * call site records that decision in `rejection_history`.
+	 */
+	const gateRouterIdle = async (lane: string, ctx: ExtensionContext): Promise<{ waited_ms: number; polls: number; over_budget: boolean; last: RouterBusy }> => {
+		const t0 = Date.now();
+		const budget_s = Math.round(GATE_BUDGET_MS / 1000);
+		const poll_s = Math.round(GATE_POLL_MS / 1000);
+		let polls = 0;
+		let last = await routerBusy();
+		while (last.busy) {
+			polls += 1;
+			const waited = Date.now() - t0;
+			if (waited >= GATE_BUDGET_MS) return { waited_ms: waited, polls, over_budget: true, last };
+			if (polls === 1) ctx.ui.notify(`fade_orchestrate: the ${lane} load is DEFERRED — ${last.reason}; retrying every ${poll_s}s up to ${budget_s}s`, "warning");
+			ctx.ui.setWorkingMessage(`fade_orchestrate: ${lane} load deferred ${Math.round(waited / 1000)}s/${budget_s}s — ${last.reason}`);
+			await new Promise((r) => setTimeout(r, GATE_POLL_MS));
+			last = await routerBusy();
+		}
+		return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
 	};
 
 	// The lane switch as one callable unit: `agent_end` (the phase contract's single load site)
@@ -802,7 +845,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// while the thinking lane holds the run is refused with the rule named, so the fix is
 	// DELEGATED back to the coder instead of silently applied by the verifier.
 	pi.on("tool_call", (event: { toolName?: string }) => {
-		if (!run || run.lane !== THINK_LANE) return undefined;
+		// The guard reads the ON-DISK run, not this session's copy: a session started before a lane
+		// change would otherwise enforce a lane that no longer exists (measured: the operator's own
+		// edits were refused by a stale in-memory `deepseek` with no way to unblock the session).
+		// Enforcement is the VERIFIER'S TURN only — `state: verifying` is the state the row names —
+		// and never inside a delegated session, which is inert by `isDelegatedSession`.
+		if (!run || isDelegatedSession()) return undefined;
+		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
+		if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return undefined;
 		const name = event.toolName ?? "";
 		if (MUTATING_TOOLS[name] !== true) return undefined;
 		pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);

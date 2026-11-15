@@ -29,6 +29,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { buildTestBundle } from "./build.mjs";
+
+// The rig IS the acceptance command (`node test/gate_rig.mjs`), so it builds the bundle it imports
+// instead of trusting whatever `.test-build/` some earlier run left behind — the 2026-11-15 pre-swap
+// gate died on `ERR_MODULE_NOT_FOUND .test-build/router.mjs` for exactly that reason.
+buildTestBundle();
 
 const repo = join(tmpdir(), "orch-gate-rig");
 rmSync(repo, { recursive: true, force: true });
@@ -312,13 +318,21 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
 	await commands.orchestrate.handler("verify", ctx);
 	await new Promise((r) => setTimeout(r, 60));
-	ok("the verifier lane's active set carries no writers", !activeTools.includes("edit") && !activeTools.includes("write") && !activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
+	ok("the verifier lane's active set carries no writers (delegation stays)", !activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
 	const blocked = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "x", input: {} }, ctx);
 	ok("a verifier edit is BLOCKED with the rule named", blocked?.block === true && /read-only/.test(blocked.reason ?? ""), JSON.stringify(blocked));
 	const spawn = await hooks.tool_call({ type: "tool_call", toolName: "task", toolCallId: "y", input: {} }, ctx);
-	ok("a verifier subagent is blocked too (it can edit)", spawn?.block === true, JSON.stringify(spawn));
+	ok("delegation is NOT blocked (a subagent writes nothing; its session is inert by block 15)", spawn === undefined, JSON.stringify(spawn));
 	const allowed = await hooks.tool_call({ type: "tool_call", toolName: "read", toolCallId: "z", input: {} }, ctx);
 	ok("a verifier read is NOT blocked", allowed === undefined, JSON.stringify(allowed));
+	// The measured self-lockout: a session that adopted the thinking lane at start must not keep
+	// refusing the operator's editor once the run is no longer the verifier's turn. The guard reads
+	// the ON-DISK state for exactly this reason.
+	const s13 = readState();
+	ok("the enforced state is the verifier's turn on the thinking lane", s13.state === "verifying" && s13.lane === resident, `${s13.state}/${s13.lane} vs resident ${resident}`);
+	writeState({ ...s13, state: "planning" });
+	const after = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "w", input: {} }, ctx);
+	ok("outside the verifier's turn the operator's edit is NOT blocked", after === undefined, JSON.stringify(after));
 }
 
 // 14. Y16: every task accepted by the verifier leaves a checkpoint tag the tree rolls back to.

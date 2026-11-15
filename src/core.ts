@@ -82,8 +82,29 @@ export function classifyTurnEnd(run: RunState, hadPhase: boolean): TurnEnd {
 	return "nudge";
 }
 
+/**
+ * Is `repo` a git working tree? Probed, never assumed. Outside a working tree `git diff` does NOT
+ * fail cleanly: with two path args (and, measured 2026-11-15, with `--stat` alone in the harness's
+ * own status call) it switches to `--no-index` mode and answers with its ~60-line usage page,
+ * which then rides into the briefing as the `Working tree:` line. One quiet `rev-parse --git-dir`
+ * answers for every git call the run makes, so the degraded state is named in one line.
+ */
+export function isGitRepo(repo: string): boolean {
+	try {
+		execFileSync("git", ["-C", repo, "rev-parse", "--git-dir"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8", stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** The one sentinel every git reader emits on a non-repo run root. */
+export const notARepo = (repo: string): string =>
+	`(not a git repo: ${repo} — no git evidence; start the run inside a working tree, or run \`git init\` in it)`;
+
 /** `git status --porcelain` verbatim (capped): the T2 synthesizer's evidence base. */
 export function porcelain(repo: string): string {
+	if (!isGitRepo(repo)) return notARepo(repo);
 	try {
 		const out = execFileSync("git", ["-C", repo, "status", "--porcelain"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
 		const head = `${out}`.replace(/\n+$/, "").split("\n").slice(0, 200).join("\n");
@@ -102,9 +123,13 @@ export function adaptiveRounds(nTasks: number, budget: number): number {
 	return Math.min(budget, Math.max(3, 2 + Math.ceil(nTasks / 2)));
 }
 
-/** Emitted verbatim into the tool error after the second schema rejection (auto-repair hint). */
+/**
+ * Emitted verbatim into the tool error after the second schema rejection (auto-repair hint).
+ * Y7: the `coding_done` example shows TWO entries on purpose — the batch shape is what the lane
+ * is taught, and the shape it sees in the hint is the shape it writes.
+ */
 export const SCHEMA_HINT =
-	'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"}]}; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}.';
+	'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}.';
 
 /** One pre-swap gate outcome: every check run deterministically, judged on exit code. */
 export interface GateResult {
@@ -134,6 +159,7 @@ export function runGate(checks: [string, string][], cwd: string): GateResult {
 
 /** `git diff --stat` tail: the volatile "what changed since" line a fresh lane needs. */
 export function diffStat(repo: string): string {
+	if (!isGitRepo(repo)) return notARepo(repo);
 	try {
 		const out = execFileSync("git", ["-C", repo, "diff", "--stat"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
 		const tail = `${out}`.trim().split("\n").slice(-6).join("\n");
@@ -230,6 +256,7 @@ export function checkpointName(run: RunState, taskId: string): string {
  */
 export function tagCheckpoint(repo: string, run: RunState, taskId: string): { tag: string; ok: boolean; error?: string } {
 	const tag = checkpointName(run, taskId);
+	if (!isGitRepo(repo)) return { tag, ok: false, error: `not a git repo: ${repo} — no checkpoint tag is possible` };
 	try {
 		execFileSync("git", ["-C", repo, "tag", "-f", tag], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
 		if (typeof run.checkpoints !== "object" || run.checkpoints === null) run.checkpoints = {};
@@ -427,6 +454,124 @@ export function validateChecks(raw: unknown): { checks?: [string, string][]; err
 	return { checks };
 }
 
+/**
+ * Y7: the tasks ONE coder window takes. The unit of cost is the lane swap — 15-20 s and
+ * 52-130 GiB, paid once per turn at `agent_end` — so a round costs the NUMBER OF WINDOWS, not the
+ * number of tasks: a 3-task plan reported one task per turn pays six transitions where two do the
+ * job.
+ *
+ * 4 is set against the bounds this file and `index.ts` already publish:
+ *  - planning calls `tasks.length <= 4` tier M, so a whole M plan is ONE window: a 3-task round
+ *    is code + verify — exactly 2 swaps, by construction;
+ *  - `adaptiveRounds` budgets the plan at 2 tasks per round (2 + ceil(n/2)), so 4 is DOUBLE the
+ *    rate the round budget assumes: the plan the planner sizes for two coding rounds lands in one
+ *    window and leaves the reserved rounds for repairs;
+ *  - the plan ceiling is `MAX_TASKS` (6 in this build, 8 at the ceiling), so 4 keeps every task
+ *    card UNTRUNCATED (objective, files, acceptance, dependencies) inside one coder context along
+ *    with its own test runs, and bounds a bounced window to at most half a maximal plan — a
+ *    repair round is never "redo the whole plan".
+ */
+export const MAX_WINDOW_TASKS = 4;
+
+/** One open task this window cannot start, and the dependency ids that hold it. */
+export interface WindowBlocked {
+	id: string;
+	blockedBy: string[];
+}
+
+export interface RoundWindow {
+	/** The tasks this window implements, in plan order, capped at `MAX_WINDOW_TASKS`. */
+	readyNow: Task[];
+	/** Open tasks with at least one unmet dependency, naming the unmet ids. */
+	blocked: WindowBlocked[];
+	/** Every task not yet passed — an operator's forced-pass skip (`[s]`) has left the window. */
+	open: Task[];
+}
+
+/**
+ * The task pool the current coding turn is briefed on, the same choice `[s] skip` makes in
+ * `keymap.ts`: a non-empty repair list IS this round's plan, otherwise the run's plan.
+ * `roundWindow`, `validateDone` and `applyDone` all read this pool, so the window it computes,
+ * the briefing it sends and the tasks it marks can never disagree.
+ */
+export function windowPool(run: RunState): Task[] {
+	return (run.repair_tasks ?? []).length > 0 ? run.repair_tasks : run.tasks;
+}
+
+/**
+ * Y7: the window the coder takes in THIS turn. `open` is every unpassed task in the pool;
+ * `readyNow` is the open tasks whose every dependency is resolved (passed, including a forced
+ * skip), in plan order, capped at `MAX_WINDOW_TASKS`; `blocked` names each open task with an
+ * unmet dependency and those ids. A ready task cut by the cap is in neither list — it is the NEXT
+ * window's `readyNow`, and `briefings.window` names it so the lane never starts it early.
+ */
+export function roundWindow(run: RunState): RoundWindow {
+	const pool = windowPool(run);
+	const resolved = new Set(pool.filter((t) => t.status === "passed").map((t) => t.id));
+	const unmet = (t: Task) => t.dependencies.filter((d) => !resolved.has(d));
+	const open = pool.filter((t) => t.status !== "passed");
+	const readyNow = open.filter((t) => unmet(t).length === 0).slice(0, MAX_WINDOW_TASKS);
+	const taken = new Set(readyNow.map((t) => t.id));
+	const blocked = open
+		.filter((t) => !taken.has(t.id))
+		.map((t) => ({ id: t.id, blockedBy: unmet(t) }))
+		.filter((b) => b.blockedBy.length > 0);
+	return { readyNow, blocked, open };
+}
+
+/** One reported task of a `coding_done` payload. */
+export interface DoneEntry {
+	id: string;
+	status: string;
+	result?: string;
+}
+
+/** The rule in the lane's own words; every refusal quotes it so the model can act on it. */
+export const WINDOW_RULE = "one coding_done per window: report EVERY task of this window in ONE payload, never one payload per task";
+
+/**
+ * Y7: validate a whole `coding_done` — SEVERAL tasks at once, all of them marked by `applyDone`.
+ * A payload naming NO task in `roundWindow().readyNow` while one exists is refused with the rule
+ * named: that one-task-per-turn report is exactly what makes a 3-task round cost six swaps, and
+ * the refusal is what closes the per-task window.
+ */
+export function validateDone(run: RunState, raw: unknown): { done?: DoneEntry[]; error?: string } {
+	if (!Array.isArray(raw) || raw.length === 0) return { error: "coding_done needs a non-empty done[]" };
+	const ids = new Set(windowPool(run).map((t) => t.id));
+	const done: DoneEntry[] = [];
+	for (const item of raw) {
+		if (typeof item !== "object" || item === null) return { error: "each done entry must be an object" };
+		const e = item as Record<string, unknown>;
+		if (typeof e.id !== "string" || !ids.has(e.id)) return { error: `done entry ${JSON.stringify(e.id)} is not a task of this run` };
+		if (done.some((d) => d.id === e.id)) return { error: `duplicate done entry for ${e.id as string}` };
+		if (!["passed", "failed", "blocked"].includes(String(e.status))) return { error: `${e.id as string} status must be passed|failed|blocked` };
+		done.push({ id: e.id as string, status: String(e.status), result: typeof e.result === "string" ? (e.result as string) : undefined });
+	}
+	const ready = roundWindow(run).readyNow;
+	if (ready.length > 0 && !done.some((d) => ready.some((t) => t.id === d.id))) {
+		return { error: `window rule (${WINDOW_RULE}): this window is ${ready.map((t) => t.id).join(",")}; ${JSON.stringify(done.map((d) => d.id))} names none of them` };
+	}
+	return { done };
+}
+
+/**
+ * Mark every reported task. Pure state: `round`, `max_rounds` and `state` belong to the phase
+ * application in `index.ts`, so marking a whole window spends no extra round and buys no swap
+ * beyond the one this turn already pays. Returns the tasks it marked, in report order.
+ */
+export function applyDone(run: RunState, done: DoneEntry[]): Task[] {
+	const pool = windowPool(run);
+	const marked: Task[] = [];
+	for (const d of done) {
+		const task = pool.find((t) => t.id === d.id);
+		if (!task) continue;
+		task.status = d.status;
+		task.result = d.result;
+		marked.push(task);
+	}
+	return marked;
+}
+
 export const briefings = {
 	plan: (run: RunState): string =>
 		[
@@ -444,6 +589,40 @@ export const briefings = {
 			`Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`,
 			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
 		].join("\n"),
+	/**
+	 * Y7: the coder's BATCH briefing — one window, one turn, one `coding_done`. Every task of
+	 * `roundWindow().readyNow` is spelled out UNTRUNCATED (objective, files, acceptance,
+	 * dependencies) because a card the lane cannot read in full is a card it implements from
+	 * imagination; the blocked tasks are listed with the ids that hold them so the lane knows what
+	 * to leave alone; and the one-payload contract is stated in the turn's own words, which is the
+	 * half that kills the per-task window (the refusal in `validateDone` is the other half).
+	 */
+	window: (run: RunState): string => {
+		const { readyNow, blocked, open } = roundWindow(run);
+		const inWindow = new Set(readyNow.map((t) => t.id));
+		const blockedIds = new Set(blocked.map((b) => b.id));
+		const deferred = open.filter((t) => !inWindow.has(t.id) && !blockedIds.has(t.id)).map((t) => t.id);
+		const entry = (id: string) => `{"id":"${id}","status":"passed"|"failed"|"blocked","result":"what the acceptance command observed"}`;
+		return [
+			`Phase 1 (coding) — ONE WINDOW, round ${run.round}/${run.max_rounds} · T${readyNow.length}/${open.length} · lane ${run.lane} · orchestrated run ${run.run_id}.`,
+			`Goal: ${run.goal}`,
+			readyNow.length > 0
+				? `Window contract: this ONE turn implements EVERY task below in ${run.repo} and reports them ALL in ONE coding_done payload: {"done":[${readyNow.map((t) => entry(t.id)).join(",")}]}. Do not report after one task and do not take a second coding turn for these tasks — one window, one coding_done, one lane swap.`
+				: `The window is EMPTY: every open task is blocked by an unpassed dependency. There is nothing to implement in this turn — do not send a coding_done naming a blocked task; report the blockers and end the turn.`,
+			readyNow.length > 0 ? `Tasks in this window (${readyNow.length} of ${open.length} open), each card in full:` : `Tasks in this window: none.`,
+			...readyNow.flatMap((t) => [
+				`  ${t.id} [${t.status ?? "pending"}] objective: ${t.objective}`,
+				`      files: ${t.files.join(", ")}`,
+				`      acceptance: ${t.acceptance}`,
+				`      dependencies: ${t.dependencies.length > 0 ? t.dependencies.join(", ") : "-"}`,
+			]),
+			blocked.length > 0
+				? `NOT in this window, unmet dependencies — do not start them and never name one in coding_done: ${blocked.map((b) => `${b.id} blocked by ${b.blockedBy.join(", ")}`).join("; ")}.`
+				: `Nothing is blocked by a dependency.`,
+			deferred.length > 0 ? `Ready but past the ${MAX_WINDOW_TASKS}-task window cap (the NEXT window's work, leave it alone now): ${deferred.join(", ")}.` : "",
+			`Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
+		].filter(Boolean).join("\n");
+	},
 	verify: (run: RunState): string =>
 		[
 			`Phase 2 (verification), round ${run.round} of orchestrated run ${run.run_id}.`,

@@ -18,6 +18,7 @@
  * r reset, h halt, c code, esc/q close. Outside interactive mode (RPC/print, `ctx.hasUI` false)
  * the SAME lines go to a widget, which is what the headless rig asserts.
  */
+import { hostname, userInfo } from "node:os";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { RunState } from "./core.ts";
 import type { SwapRow } from "./history.ts";
@@ -38,16 +39,77 @@ export interface OverlayData {
 export const OVERLAY_WIDGET_KEY = "fade-overlay";
 
 /**
+ * `FADE_ORCHESTRATE_REDACT=1` makes the bar safe to screenshot: no username, no home path, no
+ * hostname, no repo path. Read at call time, so the operator can flip it per run and the headless
+ * rig can assert both branches. Display-only: `state.json`, `metrics.jsonl` and
+ * `swap_history.json` are written by other modules, and the on-disk record stays verbatim.
+ */
+export function redactOn(): boolean {
+	return process.env.FADE_ORCHESTRATE_REDACT === "1";
+}
+
+/** `/home/<someone>` and a leading `~`: the home forms that survive a username miss. */
+const HOME_PATH = /\/home\/[^\s/]+/g;
+const HOME_TILDE = /~(?=\/|$)/g;
+
+/** The OS account: `$USER` first, the passwd entry as the fallback. Empty when neither answers. */
+function account(): string {
+	const env = process.env.USER;
+	if (env && env.length > 1) return env;
+	try {
+		const u = userInfo().username;
+		return u && u.length > 1 ? u : "";
+	} catch {
+		return ""; // No passwd entry (a squashed container image); the env var is all there is.
+	}
+}
+
+function machine(): string {
+	try {
+		return hostname().length > 1 ? hostname() : "";
+	} catch {
+		return "";
+	}
+}
+
+/**
+ * Replace the identity carried by a display string with fixed markers: the run's repo path and the
+ * `/home/<user>` / `~/` prefixes become `<path>`, the hostname becomes `<host>`, the OS account
+ * becomes `<user>`. Every other byte is untouched, and `on === false` returns the input unchanged.
+ *
+ * The literals go longest-first: the repo path sits under the home directory, so masking the home
+ * prefix first would leave `/projects/<repo>` — the repo name — on screen. Only the render
+ * boundary (`pill`, `statusTag`, `overlayLines`, and the widget they feed) calls this, which is
+ * what keeps the operator's durable record lossless.
+ */
+export function redact(text: string, on: boolean, repo?: string): string {
+	if (!on) return text;
+	let out = text;
+	if (repo && repo.length > 1) out = out.split(repo).join("<path>");
+	const host = machine();
+	if (host) out = out.split(host).join("<host>");
+	const user = account();
+	if (user) out = out.split(user).join("<user>");
+	// A path naming some OTHER account (an operator's `~`, a copied fixture) has to go too.
+	return out.replace(HOME_PATH, "<path>").replace(HOME_TILDE, "<path>");
+}
+
+/** The single place the render boundary applies the switch. */
+function shown(text: string, run: RunState): string {
+	return redact(text, redactOn(), run.repo);
+}
+
+/**
  * The footer status line: lane, state, round, task tally, the overlay key, the protocol-stall
  * badge when the Tier-1 gate is counting, and the tok/s suffix last.
  */
 export function pill(run: RunState, suffix?: string): string {
-	return renderPill(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix);
+	return shown(renderPill(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix), run);
 }
 
 /** Narrow-terminal fallback: 2-character lane tag, short state (`⚡ de:code · R1/6 …`). */
 export function pillCompact(run: RunState, suffix?: string): string {
-	return renderPill(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix);
+	return shown(renderPill(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix), run);
 }
 
 function renderPill(tag: string, run: RunState, suffix?: string): string {
@@ -88,15 +150,15 @@ const SHORT_STATE: Record<string, string> = {
  * being masked.
  */
 export function statusTag(run: RunState): string {
-	return `${run.lane}:${SHORT_STATE[run.state] ?? run.state}`;
+	return shown(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run);
 }
 
 /** The narrow-terminal tag (`de:code`). */
 export function statusTagCompact(run: RunState): string {
-	return `${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`;
+	return shown(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run);
 }
 
-/** The overlay body, untruncated: full objectives, acceptances, results, swap rows, tiers. */
+/** The overlay body, untruncated: full objectives, acceptances, results, swap rows, tiers. Each line is redacted on the way out. */
 export function overlayLines(d: OverlayData): string[] {
 	const { run } = d;
 	const out: string[] = [];
@@ -143,7 +205,7 @@ export function overlayLines(d: OverlayData): string[] {
 	}
 	out.push("");
 	out.push("[s] skip task  [v] verify now  [r] reset round  [p] pause/resume  [c] code  [h] halt  [esc] close");
-	return out;
+	return out.map((l) => shown(l, run));
 }
 
 /**

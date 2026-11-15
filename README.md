@@ -45,10 +45,14 @@ two lane entries are configuration, nothing here is host-specific.
   (`state: stalled_protocol_error`, paused, ZERO lane loads) and the notify/overlay carry the
   actionable diagnostic: what was seen, what is RED, the git state, and the acts
   (`/orchestrate pause`, `/orchestrate code`, `/orchestrate stop`).
-- **Verifier sandbox.** While the thinking lane holds the run, the mutating tools
-  (`edit`, `write`, `apply_patch`, `multiedit`, `notebook_edit`, `task`) are removed from the
-  active set — a denylist, so a host tool this extension has never seen cannot slip a write past
-  it — and the `tool_call` guard blocks them with the rule named, delegating the fix to the coder.
+- **Verifier sandbox.** While the **verifier's turn** is live (`state: verifying` on the thinking
+  lane), the writing tools (`edit`, `write`, `apply_patch`, `multiedit`, `notebook_edit`) are removed
+  from the active set — a denylist, so a host tool this extension has never seen cannot slip a write
+  past it — and the `tool_call` guard blocks them with the rule named, so the finding is delegated
+  back to the coder. The guard reads the **on-disk** run and enforces only the verifier's turn:
+  delegation (`task`) is never blocked (a subagent writes nothing, and its session is inert by the
+  rule below), and a session that adopted the thinking lane at start cannot keep refusing the
+  operator's editor after the run left `verifying` — that self-lockout was measured live.
 - **Checkpoints.** Every task the verifier accepts leaves `omp-ckpt/<run_id>/T<n>-passed` in the
   repo, namespaced per run so two runs on one tree never collide; the tag prints in the overlay.
 - **Delegated sessions are inert.** A subagent shares the cwd, so an unguarded `session_start`
@@ -89,7 +93,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 |---|---|---|
 | `FADE_ORCHESTRATE_ROUTER` | `http://127.0.0.1:18014` | basalt router base URL |
 | `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
-| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek:high` | entry that plans/verifies (thinking lane) |
+| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane) |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements |
 | `FADE_ORCHESTRATE_KEY` | `ctrl+o` | overlay key. **Ctrl+O is the app's "toggle tool output" binding** — the takeover is disclosed; set e.g. `ctrl+g` to keep the built-in |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the overlay as a widget instead of an overlay component (RPC/print hosts) |

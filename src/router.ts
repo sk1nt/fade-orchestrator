@@ -36,11 +36,13 @@ export async function listLanes(): Promise<{ health: string; models: RouterLane[
 	}
 }
 
+export type RouterHealth = { model?: string; loaded?: boolean | string; loading?: boolean; percent?: number | null; swap?: { from?: string; to?: string; phase?: string } };
+
 /** The router's own health line: `loading` is true while a swap is in flight. */
-export async function laneHealth(): Promise<{ model?: string; loaded?: boolean; loading?: boolean } | undefined> {
+export async function laneHealth(): Promise<RouterHealth | undefined> {
 	try {
 		const r = await fetch(`${ROUTER}/health`, { signal: AbortSignal.timeout(4000) });
-		return (await r.json()) as { model?: string; loaded?: boolean; loading?: boolean };
+		return (await r.json()) as RouterHealth;
 	} catch {
 		return undefined;
 	}
@@ -83,4 +85,98 @@ export async function loadLane(lane: string): Promise<{ ok: boolean; detail: str
 	} catch (e) {
 		return { ok: false, detail: msg(e), elapsed_s: (Date.now() - t0) / 1000 };
 	}
+}
+
+/** Y10: the answer the pre-unload gate reads — is the resident lane SERVING right now? */
+export interface RouterBusy {
+	busy: boolean;
+	/** Requests queued at the router — the number in its own `swap … (1 waiting)` line. */
+	waiting?: number;
+	/** Requests decoding in a slot right now. */
+	running?: number;
+	reason: string;
+}
+
+const finite = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+
+/** One `/metrics` read. A router that will not answer yields `undefined`, never a zero-filled object. */
+async function metricsSnapshot(): Promise<Record<string, any> | undefined> {
+	try {
+		const r = await fetch(`${ROUTER}/metrics`, { signal: AbortSignal.timeout(4000) });
+		return r.ok ? ((await r.json()) as Record<string, any>) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Prompt-processing tok/s of one request record: the engine's `pp`, else prompt tokens over the
+ *  prefill window (`prompt_ms`, with TTFT as the bound) — the same derivation the overlay uses. */
+function prefillRate(r: Record<string, any> | undefined): number | undefined {
+	const pp = finite(r?.pp);
+	if (pp !== undefined && pp > 0) return pp;
+	const n = finite(r?.prompt_tokens) ?? finite(r?.prompt_n);
+	if (n === undefined || n <= 0) return undefined;
+	const ms = finite(r?.prompt_ms);
+	const secs = ms !== undefined && ms > 0 ? ms / 1000 : finite(r?.ttft_s);
+	return secs !== undefined && secs > 0 ? n / secs : undefined;
+}
+
+/**
+ * The newest `/metrics` record the engine has NOT closed: no `finish`, no `duration_s`, no
+ * `decode_tok_s`, no `ttft_s`, and a prompt rate — i.e. the prompt is being read right now. The
+ * rows the engine has finished carry all four numbers (measured on this host: `finish: "stop"`,
+ * `duration_s`, `decode_tok_s`, `ttft_s`), so a finished row is never mistaken for a service.
+ */
+function openRequestRow(metrics: Record<string, any> | undefined): Record<string, any> | undefined {
+	const rows = Array.isArray(metrics?.requests) ? (metrics.requests as Record<string, any>[]) : [];
+	for (let i = rows.length - 1; i >= 0; i--) {
+		const r = rows[i];
+		if (!r) continue;
+		if (typeof r.finish === "string" || finite(r.duration_s) !== undefined) continue;
+		if (finite(r.decode_tok_s) !== undefined || finite(r.ttft_s) !== undefined) continue;
+		const pp = prefillRate(r);
+		if (pp !== undefined && pp > 0) return r;
+	}
+	return undefined;
+}
+
+/**
+ * Is the resident lane serving? `POST /v1/load` unloads it mid-request, and the router answers a
+ * request queued at that instant by swapping to the entry the QUEUED request names — the measured
+ * `swap flash-next -> deepseek (1 waiting)` (2026-11-14 21:55:50), 15-20 s and 52-130 GiB each.
+ * Three signals, all read from the router's own surface, never inferred from a timer:
+ *  * `/health` `loading: true` — a swap is already in flight (`swap.from/to`, `percent`);
+ *  * `/metrics` `live` — `slots.active` requests decoding, `queued`/`slots.queue_depth` waiting;
+ *  * `/metrics` `requests` — the newest record is a prompt in flight: a prompt rate with no
+ *    `decode_tok_s` and no `ttft_s` reported yet.
+ * An UNREACHABLE router is `busy: false` with a reason naming it. The caller gates on this to
+ * DEFER a load; stalling a run on a router that cannot answer is worse than the swap it saves, and
+ * a missing reading is never reported as a zero.
+ */
+export async function routerBusy(): Promise<RouterBusy> {
+	const [health, metrics] = await Promise.all([laneHealth(), metricsSnapshot()]);
+	const live = (metrics?.live ?? {}) as Record<string, any>;
+	const slots = (live.slots ?? {}) as Record<string, any>;
+	const running = finite(slots.active) ?? 0;
+	const waiting = finite(live.queued) ?? finite(slots.queue_depth) ?? (Array.isArray(live.queue) ? live.queue.length : 0);
+	const counters = `running=${running} waiting=${waiting}`;
+	const phase = typeof live.phase === "string" ? ` (${live.phase})` : "";
+	if (health === undefined && metrics === undefined) {
+		return { busy: false, running: 0, waiting: 0, reason: `router unreachable at ${ROUTER}: /health and /metrics both refused; a router that cannot answer is never read as a serving lane, so the load is not held` };
+	}
+	if (health?.loading === true) {
+		const sw = health.swap;
+		const pct = finite(health.percent);
+		return { busy: true, running, waiting, reason: `swap in flight${sw?.from ? ` ${sw.from} -> ${sw.to ?? "?"}` : ""}${pct !== undefined ? ` at ${Math.round(pct)}%` : ""}${phase}; ${counters}` };
+	}
+	if (running > 0 || waiting > 0) {
+		return { busy: true, running, waiting, reason: `slot busy: ${typeof live.state === "string" ? live.state : "serving"}${phase}; ${counters}` };
+	}
+	const open = openRequestRow(metrics);
+	if (open) {
+		const pp = prefillRate(open);
+		return { busy: true, running, waiting, reason: `request ${open.id ?? "?"} is prompting (pp=${pp === undefined ? "?" : Math.round(pp)} tok/s) with no decode_tok_s and no ttft_s yet${phase}; ${counters}` };
+	}
+	const resident = health?.model ?? (typeof health?.loaded === "string" ? health.loaded : undefined) ?? "?";
+	return { busy: false, running, waiting, reason: `idle: ${resident} resident, no swap, no open request${metrics === undefined ? ", /metrics unread" : ""}; ${counters}` };
 }
