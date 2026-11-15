@@ -100,8 +100,22 @@ test("laneTag: a single token keeps its first two characters, short names pass t
 // boundary (pill / statusTag / overlayLines and the widget those lines feed). The durable record —
 // state.json, metrics.jsonl, swap_history.json — is written by other modules and stays verbatim,
 // which is why the flag-off cases below demand byte-identical output.
-const REPO = "/home/rwest/projects/fadetheworld";
+// The identity the redactor must erase is the MACHINE's, never a literal. A hardcoded account made
+// tests 70 and 71 go red on GitHub Actions (measured 2026-11-15, run 43702442808): the fixture said
+// `rwest` while the runner's account is `runner`, so the renderer — which erases the real account,
+// hostname and repo — was asserted against a token it was never given.
+const USER = process.env.USER && process.env.USER.length > 1 ? process.env.USER : safeUsername();
+const HOME = `/home/${USER}`; // the shape of the HOME_PATH rule (`/home/<account>`), any OS
+const REPO = `${HOME}/projects/fadetheworld`;
 const HOST = os.hostname();
+
+function safeUsername() {
+	try {
+		return os.userInfo().username;
+	} catch {
+		return "";
+	}
+}
 
 /** Set the switch for one call, restore the ambient value after — the tests share `process.env`. */
 const withFlag = (value, fn) => {
@@ -117,8 +131,8 @@ const withFlag = (value, fn) => {
 };
 
 const assertNoIdentity = (s) => {
-	assert.ok(!s.includes("rwest"), `the account must not survive: ${s}`);
-	assert.ok(!s.includes("/home/"), `the home path must not survive: ${s}`);
+	if (USER) assert.ok(!s.includes(USER), `the account must not survive: ${s}`);
+	assert.ok(!s.includes("/home/"), `the /home/<account> form must not survive: ${s}`);
 	assert.ok(!s.includes(REPO), `the repo path must not survive: ${s}`);
 	if (HOST) assert.ok(!s.includes(HOST), `the hostname must not survive: ${s}`);
 };
@@ -135,12 +149,12 @@ const overlayData = () => ({
 		tasks: [{ id: "T1", objective: "redact the bar", files: ["deploy/omp/src/ui.ts"], acceptance: "npm test", dependencies: [], round: 1, status: "passed" }],
 	}),
 	swaps: [{ from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "hot_steady", at: "2026-11-15T00:00:00Z" }],
-	tiers: [{ label: "engine", value: "/home/rwest/.basalt/config.json" }],
+	tiers: [{ label: "engine", value: `${HOME}/.basalt/config.json` }],
 	critique: `verified: 60 pass in ${REPO}`,
 });
 
 test("redact: account, home, tilde, hostname and the repo path become fixed markers, everything else byte-identical", () => {
-	const raw = `${REPO} /home/other/x ~/x ${HOST} rwest@${HOST} · R1/6 · T2/3`;
+	const raw = `${REPO} /home/other/x ~/x ${HOST} ${USER}@${HOST} · R1/6 · T2/3`;
 	const on = withFlag("1", () => redact(raw, true, REPO));
 	assertNoIdentity(on);
 	assert.ok(on.includes("<path>"), `the path marker must be there: ${on}`);
@@ -154,7 +168,7 @@ test("redact: account, home, tilde, hostname and the repo path become fixed mark
 
 test("redact: the pill is screenshot-safe with the flag on, lane/round/tally intact", () => {
 	const r = run({ lane: "deepseek", repo: REPO });
-	const p = withFlag("1", () => pill(r, `130t/s · ${REPO} by rwest on ${HOST}`));
+	const p = withFlag("1", () => pill(r, `130t/s · ${REPO} by ${USER} on ${HOST}`));
 	assertNoIdentity(p);
 	assert.equal(p, "⚡ deepseek:code · R1/6 · T2/3 · [Ctrl+O] · 130t/s · <path> by <user> on <host>", "the round/task tally survives");
 	const c = withFlag("1", () => pillCompact(r, `hot 130t/s in ${REPO}`));

@@ -135,7 +135,26 @@ export const SCHEMA_HINT =
 export interface GateResult {
 	at: string;
 	passed: boolean;
-	results: { cmd: string; expected: string; ok: boolean; tail: string }[];
+	results: { cmd: string; expected: string; ok: boolean; invalid?: boolean; tail: string }[];
+}
+/**
+ * Can bash even PARSE this check string? A check is a claim the machine runs, and a string that
+ * does not parse fails before exec, so the gate records an exit code no tree state can move.
+ * Measured on run `20261115T091232Z-rqtj`: the plan declared
+ * `bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?` — `<pinned` is an
+ * input redirect and `dir>` an output redirect whose required word is the `;` operator — and the
+ * round livelocked: seven `coding_done` reports, seven identical refusals, zero lane loads, because
+ * "the check failed" and "the check is not a command" looked identical to the gate. The gate must
+ * never spawn such a row, and a plan that carries one is refused where the plan is authored.
+ */
+export function checkParses(cmd: string): { ok: boolean; detail: string } {
+	try {
+		execFileSync("/bin/bash", ["-n", "-c", cmd], { stdio: "pipe", timeout: 5_000 });
+		return { ok: true, detail: "" };
+	} catch (e) {
+		const err = e as { stderr?: string; message?: string };
+		return { ok: false, detail: `${err.stderr ?? ""}${err.message ?? String(e)}`.replace(/\s+/g, " ").slice(0, 220) };
+	}
 }
 
 /**
@@ -146,6 +165,18 @@ export interface GateResult {
  */
 export function runGate(checks: [string, string][], cwd: string): GateResult {
 	const results = checks.map(([cmd, expected]) => {
+		// A row that cannot parse is never spawned: its exit code is a property of the STRING, so
+		// recording it as a code failure tells the coder to fix a tree that is already green.
+		const parse = checkParses(cmd);
+		if (!parse.ok) {
+			return {
+				cmd,
+				expected,
+				ok: false,
+				invalid: true,
+				tail: `not a command — bash -n: ${parse.detail} | plan defect: re-declare this check (planning_done); no tree state can make it pass`,
+			};
+		}
 		try {
 			const out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
 			return { cmd, expected, ok: true, tail: `${out}`.slice(-400) };
@@ -209,7 +240,7 @@ function entryTouches(e: PorcelainEntry, files: string[]): boolean {
 export function gateSummary(run: RunState): string {
 	const g = run.gate_last;
 	if (!g) return "(no pre-swap gate recorded)";
-	const parts = g.results.map((r) => `${r.ok ? "ok" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
+	const parts = g.results.map((r) => `${r.ok ? "ok" : r.invalid ? "INVALID" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
 	return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}: ${parts.join(" | ") || "no checks"}`;
 }
 
@@ -449,9 +480,37 @@ export function validateChecks(raw: unknown): { checks?: [string, string][]; err
 	const checks: [string, string][] = [];
 	for (const pair of raw) {
 		if (!Array.isArray(pair) || pair.length !== 2 || pair.some((x) => typeof x !== "string")) return { error: "each check must be [command, expected]" };
-		checks.push([pair[0] as string, pair[1] as string]);
+		const cmd = pair[0] as string;
+		// A check is a claim the machine RUNS. Refuse one that is not a command HERE, at the plan's
+		// authoring edge: a `bash -n` failure never execs, so it is red for every tree the run can
+		// produce, and a plan carrying one livelocks the coder (run 20261115T091232Z-rqtj: seven
+		// refusals, zero lane loads, because the gate could not tell a broken string from a failure).
+		const parse = checkParses(cmd);
+		if (!parse.ok) {
+			return {
+				error: `check ${checks.length + 1} is not a command — bash cannot parse it: ${parse.detail} | the command ${JSON.stringify(cmd)} (a <placeholder> in the text is a shell redirect, not an argument); re-declare the check with a runnable command (e.g. the tool's own --ref/--root form)`,
+			};
+		}
+		checks.push([cmd, pair[1] as string]);
 	}
 	return { checks };
+}
+
+/** The phase note a plan act leaves in `phases`, and the bound: ONE plan act per round. */
+export const PLAN_ACT_NOTE = "plan act: checks re-declared (the gate proved a check is not a command)";
+
+/**
+ * Is `b` the SAME plan as `a`? A plan act re-declares the CHECKS the gate proved to be
+ * non-commands; the tasks are not up for renegotiation mid-round, so equality is element for
+ * element on every planning field (`round`/`status`/`result` are machine state, not the plan).
+ */
+export function sameTaskPlan(a: Task[], b: unknown[]): boolean {
+	if (!Array.isArray(b) || a.length !== b.length) return false;
+	const key = (t: { id: string; objective: string; files: string[]; acceptance: string; dependencies: string[] }) =>
+		JSON.stringify([t.id, t.objective, [...t.files].sort(), t.acceptance, [...t.dependencies].sort()]);
+	const want = a.map(key).sort();
+	const got = (b as Parameters<typeof key>[0][]).map(key).sort();
+	return want.length === got.length && want.every((k, i) => k === got[i]);
 }
 
 /**
@@ -643,10 +702,18 @@ export const briefings = {
 		].join("\n");
 	},
 	gate: (run: RunState): string => {
-		const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok);
+		const results = run.gate_last?.results ?? [];
+		const invalid = results.filter((r) => r.invalid);
+		const failing = results.filter((r) => !r.ok && !r.invalid);
 		return [
 			`Pre-swap gate RED, round ${run.round} of orchestrated run ${run.run_id} — the verifier lane was NOT loaded; the swap is only paid for a green tree.`,
+			...invalid.map((f) => `INVALID CHECK (not a command, never executed): ${f.cmd}\n  expected: ${f.expected}\n  ${f.tail}`),
 			...failing.map((f) => `FAIL: ${f.cmd}\n  expected: ${f.expected}\n  observed tail: ${f.tail}`),
+			...(invalid.length > 0
+				? [
+						`${invalid.length} of the plan's checks are PLAN DEFECTS: bash refuses to parse them, so no state of ${run.repo} can make them green and no amount of coding will pay the swap. Fixing the tree is not the remedy — the exit is a plan act: call fade_phase phase="planning_done" with the rows re-declared as runnable commands (the tool's own --ref / --root / absolute-binary forms, no <placeholders>), keeping every task.`,
+					]
+				: []),
 			`Fix the causes in ${run.repo} (the checks are the plan's own), re-run them yourself until they pass, then call fade_phase phase="coding_done" again.`,
 		].join("\n");
 	},

@@ -203,7 +203,7 @@ Ways to load it:
 ## Tests
 
 ```bash
-npm test                 # 25 unit tests: keymap, overlay data, history, state v2, gate, MoE
+npm test                 # 74 unit tests: keymap, overlay data, history, state v2, gate, MoE
 node test/rpc_rig.mjs    # headless proof through `omp --mode rpc`: pill, overlay content,
                          # skip/halt persistence (needs the omp CLI; runs ~90 s)
 node test/gate_rig.mjs   # fake-pi harness: phase tool, pre-swap gate (zero loads on red),
@@ -214,6 +214,14 @@ The rig drives the command surface with the router pointed at a closed port: the
 with nothing networked, and metrics must degrade to no suffix. RPC cannot carry raw keystrokes,
 so the `Ctrl+O` binding itself is a TUI check; the overlay's content and every key's action run
 through the same code paths the component calls.
+
+**Run root = git working tree.** `/orchestrate` roots a run at the session cwd and reads that
+directory with git (`status --porcelain`, `diff --stat`, checkpoint tags). Outside a working tree
+`git diff` does not fail — git switches to `--no-index` mode and prints its usage page — so every
+git reader is gated on one `rev-parse --git-dir` probe (`isGitRepo`) and degrades to the named
+sentinel `(not a git repo: <path> …)`: the synthesizer then reports each task `blocked` naming the
+missing repo instead of inventing working-tree evidence, and checkpoint tags are refused by name.
+Both rigs seed their root with `git init` + a commit for the same reason.
 
 ## Layout
 

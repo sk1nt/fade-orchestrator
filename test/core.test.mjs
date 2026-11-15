@@ -16,6 +16,7 @@ import {
 	adaptiveRounds,
 	applyDone,
 	briefings,
+	checkParses,
 	checkpointName,
 	classifyTurnEnd,
 	countRejections,
@@ -32,8 +33,10 @@ import {
 	readJson,
 	roundWindow,
 	runGate,
+	sameTaskPlan,
 	synthesizeCodingDone,
 	tagCheckpoint,
+	validateChecks,
 	validateDone,
 	writeJson,
 } from "../.test-build/core.mjs";
@@ -489,4 +492,64 @@ test("an all-blocked window says so and blocks the report it cannot make", () =>
 	assert.deepEqual(w.blocked, [{ id: "T1", blockedBy: ["T2"] }, { id: "T2", blockedBy: ["T1"] }], "a dependency cycle is reported, not swallowed");
 	assert.match(briefings.window(run), /window is EMPTY/);
 	assert.equal(validateDone(run, [{ id: "T1", status: "passed", result: "x" }]).error, undefined, "with no window there is no window to skip");
+});
+
+// ---- the gate's plan-defect class (run 20261115T091232Z-rqtj) -------------------------------
+// The plan declared `bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?`.
+// `<pinned` is an input redirect and `dir>` an output redirect whose required word is the `;`
+// operator, so bash dies at PARSE time: the row is red for every tree the run can build, and the
+// gate refused seven coding_done reports over it. A check that is not a command is a defect in the
+// PLAN, and the machine must say so in those words.
+const NOT_A_COMMAND = "bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?";
+
+test("checkParses separates a command from a string bash cannot parse", () => {
+	assert.equal(checkParses("cd deploy/omp && npm test").ok, true);
+	assert.equal(checkParses("true").ok, true);
+	const bad = checkParses(NOT_A_COMMAND);
+	assert.equal(bad.ok, false);
+	assert.match(bad.detail, /syntax error/, "the parse error travels in the refusal");
+});
+
+test("validateChecks refuses an unparseable check at the plan's authoring edge", () => {
+	const bad = validateChecks([[NOT_A_COMMAND, "PASS 0 on the pinned nightly"]]);
+	assert.match(bad.error, /is not a command/);
+	assert.match(bad.error, /--ref/, "the refusal names the runnable form, not just the failure");
+	const good = validateChecks([["bash scripts/ops/scan_resident_parity.sh --ref reports/evaluation/pattern_scan_20261115 --lanes grid", "byte rc 0"]]);
+	assert.equal(good.error, undefined, good.error ?? "the runnable form is accepted");
+	assert.equal(good.checks.length, 1);
+});
+
+test("runGate NEVER spawns an unparseable check and grades it INVALID, not FAIL", () => {
+	const dir = mkdtempSync(join(tmpdir(), "gate-parse-"));
+	const marker = join(dir, "spawned");
+	// The row keeps the plan's exact redirect shape and adds a side effect: if the gate spawned it,
+	// `marker` would exist.
+	const g = runGate([[`touch ${marker} --artifacts <pinned dir>; echo $?`, "never runs"], ["true", "runs"]], dir);
+	assert.equal(existsSync(marker), false, "an unparseable row is never executed");
+	assert.equal(g.results[0].invalid, true);
+	assert.match(g.results[0].tail, /not a command/);
+	assert.equal(g.results[1].ok, true, "the parseable rows still run");
+	assert.equal(g.passed, false, "a plan defect never pays the verifier swap");
+	assert.match(gateSummary({ gate_last: g }), /INVALID/);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("the gate briefing names the plan defect and its exit, and keeps real failures separate", () => {
+	const g = runGate([[NOT_A_COMMAND, "PASS 0"], ["false", "must pass"]], process.cwd());
+	const text = briefings.gate({ gate_last: g, round: 1, run_id: "R", repo: "/repo" });
+	assert.match(text, /INVALID CHECK \(not a command, never executed\)/);
+	assert.match(text, /PLAN DEFECTS/);
+	assert.match(text, /phase="planning_done"/, "the briefing names the plan act as the exit");
+	assert.match(text, /FAIL: false/, "a check that ran and failed is still a failure");
+});
+
+test("sameTaskPlan: a plan act re-declares the checks, never the plan", () => {
+	const plan = [
+		{ id: "T1", objective: "a", files: ["b.ts", "a.ts"], acceptance: "x", dependencies: [] },
+		{ id: "T2", objective: "b", files: ["c.ts"], acceptance: "y", dependencies: ["T1"] },
+	];
+	assert.equal(sameTaskPlan(plan, plan.map((t) => ({ ...t, round: 3, status: "passed" }))), true, "machine state is not the plan");
+	assert.equal(sameTaskPlan(plan, [...plan].reverse()), true, "order is not the plan");
+	assert.equal(sameTaskPlan(plan, [{ ...plan[0], objective: "changed" }, plan[1]]), false);
+	assert.equal(sameTaskPlan(plan, [plan[0]]), false, "dropping a task is not a plan act");
 });
