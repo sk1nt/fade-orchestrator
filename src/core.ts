@@ -163,13 +163,23 @@ export function roundsForTasks(tasks: Task[], budget: number): number {
  * is taught, and the shape it sees in the hint is the shape it writes.
  */
 export const SCHEMA_HINT =
-	'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}.';
+	'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}. A planning check whose ACCEPTED state is not exit-0 says so in the expected text\'s first words — "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.';
 
 /** One pre-swap gate outcome: every check run deterministically, judged on exit code. */
 export interface GateResult {
 	at: string;
 	passed: boolean;
-	results: { cmd: string; expected: string; ok: boolean; invalid?: boolean; tail: string }[];
+	results: {
+		cmd: string;
+		expected: string;
+		ok: boolean;
+		invalid?: boolean;
+		/** The exit state the plan ASKED for: `exit0` is the default; `nonzero`/`quiet` are declared. */
+		want?: "exit0" | "nonzero" | "quiet";
+		/** A declared-failure check that failed as declared: green, and labelled, never a silent pass. */
+		as_expected?: boolean;
+		tail: string;
+	}[];
 }
 /**
  * Can bash even PARSE this check string? A check is a claim the machine runs, and a string that
@@ -192,10 +202,27 @@ export function checkParses(cmd: string): { ok: boolean; detail: string } {
 }
 
 /**
+ * The plan's `expected` text can NAME a state that is not exit-0. Measured 2026-11-15 on run
+ * `20261115T142431Z-r73i` (repo `fade-fabric`): the plan declared
+ * `git -C . rev-parse --git-dir` → "fails: the tree is not a git repo yet, so nothing is
+ * committable until init" and `grep -rln "burnin\." probes benches` → "no output: no probe or
+ * bench emits burnin.* metrics". Both are the ACCEPTED state, and both landed as RED rows, so the
+ * operator saw a red screen on a run whose expectations were met. The declared forms are the head
+ * words below; anything else keeps the exit-0 rule.
+ */
+export function expectation(expected: string): "exit0" | "nonzero" | "quiet" {
+	const e = (expected ?? "").trim();
+	if (/^(no output|no matches?|empty( |$)|silent)\b/i.test(e)) return "quiet";
+	if (/^(fails?|failed|non-?zero|exits? ?[1-9]\d*|exit code [1-9]\d*|[1-9]\d* ?(on exit|exit))\b/i.test(e)) return "nonzero";
+	return "exit0";
+}
+
+/**
  * The pre-swap gate (T4): the verifier swap costs a 13-25 s pack load; running the plan's own
  * checks on the code lane FIRST means the swap is only ever paid for a tree whose deterministic
  * checks already pass. Exit code is the verdict (deterministic); the `expected` text rides to
- * the verifier briefing for the judgement calls.
+ * the verifier briefing for the judgement calls, and its head words can declare the accepted
+ * exit state (see `expectation`).
  */
 export function runGate(checks: [string, string][], cwd: string): GateResult {
 	const results = checks.map(([cmd, expected]) => {
@@ -208,16 +235,36 @@ export function runGate(checks: [string, string][], cwd: string): GateResult {
 				expected,
 				ok: false,
 				invalid: true,
+				want: "exit0" as const,
 				tail: `not a command — bash -n: ${parse.detail} | plan defect: re-declare this check (planning_done); no tree state can make it pass`,
 			};
 		}
+		const want = expectation(expected);
+		let exit0 = false;
+		let out = "";
 		try {
-			const out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
-			return { cmd, expected, ok: true, tail: `${out}`.slice(-400) };
+			out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
+			exit0 = true;
 		} catch (e) {
-			const err = e as { stdout?: string; message?: string };
-			return { cmd, expected, ok: false, tail: `${err.stdout ?? ""}${err.message ?? String(e)}`.slice(-400) };
+			const err = e as { stdout?: string; status?: number; message?: string };
+			out = `${err.stdout ?? ""}`;
+			const code = typeof err.status === "number" ? err.status : undefined;
+			if (want === "nonzero") {
+				return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected — the plan declares this state: ${expected} | exit ${code ?? "non-zero"}: ${`${out}${err.message ?? String(e)}`.slice(-300)}`.slice(-400) };
+			}
+			if (want === "quiet" && out.trim() === "") {
+				return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected — no output, exit ${code ?? "non-zero"}; the plan declares this state: ${expected}` };
+			}
+			return { cmd, expected, ok: false, want, tail: `${out}${err.message ?? String(e)}`.slice(-400) };
 		}
+		// exit 0: a declared-failure row whose premise is stale is a REPORTED break, not a pass.
+		if (want === "nonzero") {
+			return { cmd, expected, ok: false, want, tail: `expected a failure and the command exited 0 — the plan's declared state is stale, re-declare the check: ${expected} | ${out.slice(-300)}` };
+		}
+		if (want === "quiet" && out.trim() !== "") {
+			return { cmd, expected, ok: false, want, tail: `expected no output and the command printed ${out.trim().split("\n").length} line(s): ${out.slice(0, 300)}` };
+		}
+		return { cmd, expected, ok: true, want, tail: `${out}`.slice(-400) };
 	});
 	return { at: new Date().toISOString(), passed: results.every((r) => r.ok), results };
 }
@@ -296,8 +343,9 @@ function entryTouches(e: PorcelainEntry, files: string[]): boolean {
 export function gateSummary(run: RunState): string {
 	const g = run.gate_last;
 	if (!g) return "(no pre-swap gate recorded)";
-	const parts = g.results.map((r) => `${r.ok ? "ok" : r.invalid ? "INVALID" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
-	return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}: ${parts.join(" | ") || "no checks"}`;
+	const parts = g.results.map((r) => `${r.ok ? (r.as_expected ? "ok*" : "ok") : r.invalid ? "INVALID" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
+	const asExp = g.results.filter((r) => r.as_expected).length;
+	return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}${asExp ? ` (${asExp} as expected)` : ""}: ${parts.join(" | ") || "no checks"}`;
 }
 
 export interface SynthesizedDone {

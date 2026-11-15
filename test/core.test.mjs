@@ -22,6 +22,7 @@ import {
 	countRejections,
 	critiquesFor,
 	diffStat,
+	expectation,
 	gateSummary,
 	handover,
 	handoverText,
@@ -44,6 +45,7 @@ import {
 	validateTasks,
 	writeJson,
 } from "../.test-build/core.mjs";
+import { gateRows } from "../.test-build/screendata.mjs";
 
 const mkRun = (over = {}) =>
 	normalizeRun({
@@ -703,4 +705,64 @@ test("Y7: a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, 
 	);
 	assert.equal(applyDone(run, v.done).length, 3, "one payload marks the whole window");
 	assert.equal(ids(roundWindow(run).readyNow), "", "the round has no second window left to pay");
+});
+
+// ── declared-failure checks: a plan can name a NON-zero exit as the accepted state ──────────────
+// Measured 2026-11-15, run 20261115T142431Z-r73i (repo fade-fabric): the plan declared
+// `git -C . rev-parse --git-dir` → "fails: the tree is not a git repo yet" and
+// `grep -rln "burnin\." probes benches` → "no output: no probe or bench emits burnin.* metrics".
+// Both were the accepted state and both rendered RED, so the operator saw a red screen on a run
+// whose expectations were met. The declared forms are the head words; everything else keeps exit-0.
+test("expectation: the plan's head words declare the accepted exit state", () => {
+	assert.equal(expectation("exit 0, no failures"), "exit0");
+	assert.equal(expectation("fails: the tree is not a git repo yet"), "nonzero");
+	assert.equal(expectation("FAILS: nonzero on a clean tree"), "nonzero");
+	assert.equal(expectation("no output: no probe emits burnin.* metrics"), "quiet");
+	assert.equal(expectation("empty output"), "quiet");
+});
+
+test("runGate: a declared failure that fails is GREEN and labelled; a stale premise is a REPORTED break", () => {
+	const g = runGate(
+		[
+			["git -C /nonexistent-orch-dir rev-parse --git-dir", "fails: the tree is not a git repo yet"],
+			["true", "fails: this row should have failed"],
+			["false", "no output: nothing prints"],
+			["echo printed", "no output: nothing prints"],
+			["true", "exit 0, no failures"],
+			["false", "exit 0, no failures"],
+		],
+		process.cwd(),
+	);
+	const declared = g.results.find((r) => r.cmd.includes("nonexistent-orch-dir"));
+	assert.equal(declared.ok, true, "declared failure, failed as declared = ok");
+	assert.equal(declared.as_expected, true);
+	assert.equal(declared.want, "nonzero");
+	assert.match(declared.tail, /as expected/);
+	const stale = g.results.find((r) => r.expected.includes("this row should have failed"));
+	assert.equal(stale.ok, false, "a declared failure that exits 0 is a stale premise, named");
+	assert.match(stale.tail, /stale/);
+	const quiet = g.results.find((r) => r.cmd === "false" && r.want === "quiet");
+	assert.equal(quiet.ok, true, "no output and non-zero exit is the declared state");
+	assert.equal(quiet.as_expected, true);
+	const printed = g.results.find((r) => r.cmd === "echo printed");
+	assert.equal(printed.ok, false, "a quiet check that prints is a real break");
+	assert.match(printed.tail, /expected no output and the command printed 1 line\(s\)/);
+	assert.equal(g.results.find((r) => r.cmd === "true" && r.want === "exit0").ok, true);
+	assert.equal(g.results.find((r) => r.cmd === "false" && r.want === "exit0").ok, false, "the exit-0 default is untouched");
+	assert.equal(g.passed, false, "two real breaks keep the gate red");
+});
+
+test("gateRows: the as-expected rows are labelled and counted, and the gate reads them GREEN-side", () => {
+	const g = runGate(
+		[
+			["git -C /nonexistent-orch-dir rev-parse --git-dir", "fails: the tree is not a git repo yet"],
+			["true", "exit 0, no failures"],
+		],
+		process.cwd(),
+	);
+	const rows = gateRows(g);
+	assert.equal(rows[0].tone, "ok", "every row is in its declared state, so the gate row is GREEN");
+	assert.match(rows[0].value, /GREEN 0\/2 failing · 1 as expected/);
+	assert.ok(rows.some((r) => r.label === "  ok*" && /not a git repo/.test(r.value)), "the as-expected row is named");
+	assert.ok(!rows.some((r) => r.label === "  red"), "no red row is rendered for a declared state");
 });

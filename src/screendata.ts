@@ -154,9 +154,18 @@ export function swapRows(swaps: SwapRow[]): MetricRow[] {
 /** The pre-swap gate as one row: a red gate is the reason a round repeated. */
 export function gateRows(gate: GateResult | undefined): MetricRow[] {
 	if (!gate) return [{ label: "gate", value: "no gate run this round", tone: "dim" }];
-	const failing = gate.results.filter((r) => !r.ok);
-	const rows: MetricRow[] = [{ label: "gate", value: `${gate.passed ? "GREEN" : "RED"} ${failing.length}/${gate.results.length} failing · ${clockOf(gate.at)}`, tone: gate.passed ? "ok" : "bad" }];
-	for (const f of failing) rows.push({ label: "  red", value: `${f.cmd} → ${f.expected}`, tone: "bad" });
+	const bad = gate.results.filter((r) => !r.ok);
+	const asExpected = gate.results.filter((r) => r.as_expected);
+	const rows: MetricRow[] = [
+		{
+			label: "gate",
+			value: `${gate.passed ? "GREEN" : "RED"} ${bad.length}/${gate.results.length} failing${asExpected.length ? ` · ${asExpected.length} as expected` : ""} · ${clockOf(gate.at)}`,
+			tone: gate.passed ? "ok" : "bad",
+		},
+	];
+	for (const f of bad) rows.push({ label: "  red", value: `${f.cmd} → ${f.expected}`, tone: "bad" });
+	// A declared-failure row that failed as declared is GREEN, and it says so — never a silent pass.
+	for (const a of asExpected) rows.push({ label: "  ok*", value: `${a.cmd} → ${a.expected}`, tone: "dim" });
 	return rows;
 }
 
