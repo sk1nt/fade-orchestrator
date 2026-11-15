@@ -191,6 +191,22 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("halt persists state stopped", readState().state === "stopped");
 }
 
+// 8. condensed handover: resume sends it, and it is STABLE-FIRST (the cache-hitting prefix)
+{
+	resident = "flash-next";
+	writeState(seedState("coding", [["true", "green"]]));
+	process.env.FADE_ORCHESTRATE_AUTO_RESUME = "1";
+	sent.length = 0;
+	await hooks.session_start({}, ctx);
+	await new Promise((r) => setTimeout(r, 400));
+	const h = sent.find((m) => m.includes("Resume of orchestrated run"));
+	ok("auto-resume sends the condensed handover", Boolean(h));
+	const stableIdx = h ? h.indexOf("Task definitions") : -1;
+	const volatileIdx = h ? h.indexOf("Task state") : -1;
+	ok("handover is stable-first (definitions before statuses)", stableIdx > 0 && volatileIdx > stableIdx, `stable=${stableIdx} volatile=${volatileIdx}`);
+	delete process.env.FADE_ORCHESTRATE_AUTO_RESUME;
+}
+
 server.close();
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));
@@ -199,3 +215,4 @@ if (failed.length > 0) {
   process.exit(1);
 }
 console.log("gate rig: all checks pass");
+process.exit(0);
