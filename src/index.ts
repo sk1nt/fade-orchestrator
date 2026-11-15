@@ -23,10 +23,11 @@ import {
 	DEFAULT_ROUNDS,
 	MAX_ROUNDS,
 	MAX_TASKS,
+	PLAN_ACT_NOTE,
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, runGate, synthesizeCodingDone, tagCheckpoint,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
 	STATUS_KEY,
 	TERMINAL,
 	briefings,
@@ -352,6 +353,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const st: RunState = run;
 		st.phases.push({ phase, lane: st.lane, accepted: true, round: st.round, at: new Date().toISOString(), notes: typeof payload.notes === "string" ? payload.notes : undefined });
 		if (phase === "planning_done") {
+			if (st.state === "coding") {
+				// Plan act (the gate proved a check is not a command): checks only. Tasks, statuses,
+				// results, round and budget are untouched, the state stays `coding`, and the lane
+				// stays CODE — the coder is already resident, so the act pays NO swap.
+				st.checks = payload.checks as [string, string][];
+				st.phases[st.phases.length - 1].notes = PLAN_ACT_NOTE;
+				return { next: CODE_LANE, nextState: "coding" };
+			}
 			st.tasks = (payload.tasks as Task[]).map((t) => ({ ...t, round: st.round }));
 			st.checks = payload.checks as [string, string][];
 			st.tier = st.tasks.length <= 2 ? "S" : st.tasks.length <= 4 ? "M" : "L";
@@ -425,7 +434,23 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			if (run.round > run.max_rounds) throw new Error(`fade_phase: round ${run.round} exceeds max_rounds ${run.max_rounds}`);
 			const allowed = PHASE_FOR_STATE[run.state];
 			if (!allowed) throw new Error(`fade_phase: state ${run.state} takes no phase`);
-			if (params.phase !== allowed) throw new Error(`fade_phase: state ${run.state} takes phase ${allowed}, not ${params.phase}`);
+			// ONE exception, and only when the gate PROVED it: a check bash refuses to PARSE is a
+			// defect in the plan, and no tree state can move its exit code. Refusing the plan act
+			// from `coding` is what livelocked run 20261115T091232Z-rqtj — seven coding_done
+			// reports, seven identical refusals, zero lane loads. The exception re-declares CHECKS
+			// only, and the tasks must be the plan's own (validated below), so it cannot rewrite
+			// the plan to dodge a red gate.
+			const gatePlanDefect = (run.gate_last?.results ?? []).some((r) => r.invalid);
+			if (params.phase !== allowed) {
+				if (!(params.phase === "planning_done" && run.state === "coding" && gatePlanDefect)) {
+					throw new Error(
+						`fade_phase: state ${run.state} takes phase ${allowed}, not ${params.phase}` +
+							(gatePlanDefect
+								? " — the gate recorded a check that is not a command, so a planning_done that keeps every task and re-declares the checks IS accepted from this state"
+								: ""),
+					);
+				}
+			}
 			try {
 				payload = JSON.parse(params.payload) as Record<string, unknown>;
 			} catch {
@@ -445,6 +470,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				if (tasks.error) throw new Error(`fade_phase: ${tasks.error}`);
 				const checks = validateChecks(payload.checks);
 				if (checks.error) throw new Error(`fade_phase: ${checks.error}`);
+				if (run.state === "coding") {
+					// A plan act: the checks only. The tasks are frozen for the round, and the act
+					// is allowed ONCE per round — an unlimited re-declaration is a gate bypass.
+					const st = run;
+					if (!sameTaskPlan(st.tasks, payload.tasks as unknown[])) {
+						throw new Error("fade_phase: a plan act from `coding` must carry the plan's tasks UNCHANGED (same ids, objectives, files, acceptance, dependencies) — only the checks may be re-declared");
+					}
+					const acts = st.phases.filter((p) => p.phase === "planning_done" && p.round === st.round && p.notes === PLAN_ACT_NOTE).length;
+					if (acts >= 1) {
+						throw new Error(`fade_phase: this round already spent its one plan act (round ${st.round}) — the checks are now the plan; make the tree satisfy them, halt, or let the verifier judge them`);
+					}
+				}
 			}
 			if (params.phase === "coding_done") {
 				if (!Array.isArray(payload.done) || payload.done.length === 0) throw new Error("fade_phase: coding_done needs a non-empty done[]");

@@ -17,6 +17,12 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run typecheck
+      # The interactive install path skips this on purpose (OMP loads .ts directly), so the
+      # bundle the publish loop ships is proved here: esbuild must emit a non-empty dist/index.js.
+      - name: Build
+        run: npm run build
+      - name: Bundle is present
+        run: test -s dist/index.js
       - name: Unit tests
         run: npm test
       # The RPC rig (test/rpc_rig.mjs) needs the omp CLI and is run on the host that

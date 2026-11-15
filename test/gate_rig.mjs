@@ -390,6 +390,112 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("the resumed run sits on the verifier lane", readState().state === "verifying", readState().state);
 }
 
+// 17. The plan-defect class: a check bash cannot parse is INVALID and is NEVER spawned, and the
+//     only way out is a plan act — a `planning_done` from `coding` that keeps EVERY task and
+//     re-declares the checks. Run 20261115T091232Z-rqtj livelocked for seven identical refusals
+//     over `… --artifacts <pinned dir>`, because the gate read "not a command" as "the tree fails".
+{
+	resident = "flash-next";
+	const BAD = "bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?";
+	const plain = (s) => s.tasks.map((t) => ({ id: t.id, objective: t.objective, files: t.files, acceptance: t.acceptance, dependencies: t.dependencies }));
+
+	// 17a. Where the plan is authored, the row is refused there, paying no swap.
+	writeState({ ...seedState("planning", []), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+	await hooks.session_start({}, ctx);
+	const authorBase = loads();
+	let authorThrew = "";
+	try {
+		await exec("planning_done", { tasks: [task("T1")], checks: [[BAD, "PASS 0 on the pinned nightly"]] });
+	} catch (e) {
+		authorThrew = e.message;
+	}
+	ok("planning refuses a check that is not a command", /is not a command/.test(authorThrew), authorThrew.slice(0, 90));
+	ok("the authoring refusal pays NO swap and burns no round", loads() === authorBase && readState().state === "planning", `loads=${loads() - authorBase} state=${readState().state}`);
+
+	// 17b. A plan that already carries it: the gate runs at the turn boundary, grades the row
+	// INVALID, keeps the coder resident (ZERO loads, round unspent) and names the plan act.
+	writeState({ ...seedState("coding", [[BAD, "PASS 0"], ["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+	await hooks.session_start({}, ctx);
+	const gateBase = loads();
+	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+	sent.length = 0;
+	await hooks.agent_end({}, ctx);
+	await new Promise((r) => setTimeout(r, 80));
+	const g = readState();
+	const gateText = sent.join(" | ");
+	ok("the gate grades the unparseable row INVALID", (g.gate_last?.results ?? []).some((r) => r.invalid === true && r.cmd === BAD), JSON.stringify((g.gate_last?.results ?? []).map((r) => [r.ok, r.invalid])));
+	ok("the gate briefing names the plan defect and its exit", /INVALID CHECK \(not a command, never executed\)/.test(gateText) && /PLAN DEFECTS/.test(gateText) && /planning_done/.test(gateText), gateText.slice(0, 140));
+	ok("a plan defect pays NO verifier swap", loads() === gateBase, `${loads() - gateBase}`);
+	ok("a plan defect leaves the round and the coder lane alone", g.round === 1 && g.state === "coding", `${g.round}/${g.state}`);
+
+	// 17c. The plan act: accepted from `coding`; checks replaced; tasks, round, budget and lane
+	// untouched; no swap; recorded by name.
+	let actErr = "";
+	try {
+		await exec("planning_done", { tasks: plain(g), checks: [["true", "green"]] });
+	} catch (e) {
+		actErr = e.message;
+	}
+	const st1 = readState();
+	ok("the plan act is accepted from coding", actErr === "" && st1.checks.length === 1 && st1.checks[0][0] === "true", actErr.slice(0, 110));
+	ok("the plan act leaves the round, the state and the tasks alone", st1.round === g.round && st1.state === "coding" && st1.tasks.map((t) => t.id).join(",") === g.tasks.map((t) => t.id).join(","), `${st1.round}/${st1.state}`);
+	ok("the plan act pays NO swap", loads() === gateBase, `${loads() - gateBase}`);
+	ok("the plan act is recorded by name in the phase log", `${st1.phases.at(-1).notes}`.includes("plan act"), `${st1.phases.at(-1).notes}`);
+
+	// 17d. The exception is bounded: ONE plan act per round, and it can never rewrite the plan.
+	let second = "";
+	try {
+		await exec("planning_done", { tasks: plain(st1), checks: [["false", "must fail"]] });
+	} catch (e) {
+		second = e.message;
+	}
+	ok("a round gets ONE plan act", /already spent its one plan act/.test(second), second.slice(0, 90));
+	let changed = "";
+	try {
+		await exec("planning_done", {
+			tasks: [
+				{ ...task("T1"), objective: "a DIFFERENT objective" },
+				{ ...task("T2") },
+			],
+			checks: [["true", "green"]],
+		});
+	} catch (e) {
+		changed = e.message;
+	}
+	ok("a plan act cannot rewrite the plan", /must carry the plan's tasks UNCHANGED/.test(changed), changed.slice(0, 90));
+}
+
+// 18. The gate's checks are DATA: a plan repaired in state.json must reach the gate. The unit
+// test can only call refreshChecks; this is the end-to-end shape the live run showed (run
+// 20261115T091232Z-rqtj, eight coding_done rows in round 1, every one refused by the SAME two
+// commands after those commands had already been fixed on disk): the session adopts the file at
+// session_start, the gate judges the in-memory copy, and nothing re-reads the file.
+{
+	resident = "flash-next";
+	const broken = [["false", "unrunnable by design"], ["bash -c 'exit 3'", "red by design"]];
+	writeState(seedState("coding", broken));
+	await hooks.session_start({}, ctx); // the session adopts the broken pair
+	const l0 = loads();
+	notes.length = 0;
+	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+	const red = readState();
+	ok("broken checks keep the run in coding and pay zero loads", red.state === "coding" && loads() === l0, `state=${red.state} loads=${loads() - l0}`);
+	ok("the red gate names both broken commands", (red.rejection_history ?? []).some((r) => r.reason.includes("gate") && r.reason.includes("false") && r.reason.includes("exit 3")), (red.rejection_history ?? []).slice(-1)[0]?.reason);
+
+	// The repair lands ONLY on disk: the run object in this session still carries `broken`.
+	writeState({ ...red, checks: [["true", "green"], ["echo ok", "ok"]] });
+	notes.length = 0;
+	const l1 = loads();
+	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+	const s = readState();
+	ok("a pair repaired on disk reaches the gate and leaves coding", s.state === "verifying", s.state);
+	ok("the repaired pair is the one that ran", (s.gate_last?.results ?? []).length === 2 && (s.gate_last?.results ?? []).every((r) => r.ok), JSON.stringify(s.gate_last?.results ?? []));
+	ok("the refresh is announced, never silent", notes.some((n) => n.includes("re-read the checks") && n.includes("replaced")), JSON.stringify(notes.slice(-2)));
+	ok("no load is paid inside the phase call itself", loads() === l1, `loads=${loads() - l1}`);
+	await hooks.agent_end({}, ctx);
+	ok("the verifier swap is paid once for the refreshed green tree", loads() - l1 === 1, `loads=${loads() - l1}`);
+}
+
 server.close();
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

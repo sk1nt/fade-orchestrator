@@ -98,6 +98,22 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_KEY` | `ctrl+o` | overlay key. **Ctrl+O is the app's "toggle tool output" binding** — the takeover is disclosed; set e.g. `ctrl+g` to keep the built-in |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the overlay as a widget instead of an overlay component (RPC/print hosts) |
 | `FADE_ORCHESTRATE_BASALT_CONFIG` | unset | the basalt serve config JSON; enables the per-lane MoE placement panel (`expert-profile-save`) |
+| `FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS` | `300000` | the pre-swap gate's per-command wall budget; the rig class measured 180.8 s (`node test/rpc_rig.mjs`), so a 120 s constant could never leave the round |
+
+## Publish and tree parity
+
+`deploy/omp/` in the fade repo is the split **source**: `scripts/ops/orchestrator_publish.sh` maps
+it to this repo with `git subtree split` (history preserved) and, before any push, proves the
+split's tree equals `deploy/omp` at HEAD and names the divergence class — a push that would discard
+remote commits **refuses** unless `--force` is passed deliberately (measured 2026-11-15: five
+commits lived on the clone and were not in the split; the old blind `--force` deleted them).
+
+The clone you install from is a **consumer**: keep it at the split head
+(`git fetch && git reset --hard <split>`), and in the fade repo run
+`scripts/ops/omp_tree_parity_check.sh` — exit 0 `trees equal` (compared by tree object id), exit 1
+`BREAK` naming every differing path, exit 2 a named `SKIP clone_missing`. The clone is the code the
+extension **loads** (the `fade_orchestrate.ts` symlink resolves into it); the split is the code that
+**ships**; this gate is what stops those from becoming two different programs.
 
 ## Surface
 

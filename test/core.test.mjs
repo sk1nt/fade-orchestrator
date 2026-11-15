@@ -21,6 +21,8 @@ import {
 	classifyTurnEnd,
 	countRejections,
 	diffStat,
+	gateCmdTimeoutMs,
+	GATE_CMD_TIMEOUT_DEFAULT_MS,
 	gateSummary,
 	handover,
 	handoverText,
@@ -564,6 +566,34 @@ test("the gate briefing names the plan defect and its exit, and keeps real failu
 	assert.match(text, /PLAN DEFECTS/);
 	assert.match(text, /phase="planning_done"/, "the briefing names the plan act as the exit");
 	assert.match(text, /FAIL: false/, "a check that ran and failed is still a failure");
+});
+
+test("gateCmdTimeoutMs: the gate's per-command budget is configuration, and it reaches the exec", () => {
+	assert.equal(gateCmdTimeoutMs({}), GATE_CMD_TIMEOUT_DEFAULT_MS, "unset is the default");
+	assert.equal(GATE_CMD_TIMEOUT_DEFAULT_MS, 300_000, "300 s: the rpc rig measured 180.8 s wall, so a 120 s constant could never leave the round");
+	assert.equal(gateCmdTimeoutMs({ FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS: "" }), GATE_CMD_TIMEOUT_DEFAULT_MS, "empty is unset");
+	assert.equal(gateCmdTimeoutMs({ FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS: "1500" }), 1500, "a rig can raise the budget per process");
+	assert.equal(gateCmdTimeoutMs({ FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS: "0" }), GATE_CMD_TIMEOUT_DEFAULT_MS, "0 never disables the budget");
+	assert.equal(gateCmdTimeoutMs({ FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS: "-5" }), GATE_CMD_TIMEOUT_DEFAULT_MS, "a negative value never shrinks it");
+	assert.equal(gateCmdTimeoutMs({ FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS: "banana" }), GATE_CMD_TIMEOUT_DEFAULT_MS, "a non-number falls back to the default, never NaN");
+
+	// The value reaches the child: a 5 s sleep is cut by a 250 ms budget.
+	const prev = process.env.FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS;
+	process.env.FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS = "250";
+	try {
+		const at = Date.now();
+		const g = runGate([["sleep 5", "killed by the budget"]], process.cwd());
+		const elapsed = Date.now() - at;
+		assert.equal(g.results[0].ok, false, "the long command is cut at the budget");
+		assert.ok(elapsed < 4000, `the cut is the budget's, not the sleep's: ${elapsed} ms`);
+		assert.match(g.results[0].tail, /ETIMEDOUT/, `the tail reports the kill by name: ${g.results[0].tail}`);
+	} finally {
+		if (prev === undefined) delete process.env.FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS;
+		else process.env.FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS = prev;
+	}
+	// And the default is generous enough for the real rig class: a 1 s command passes untouched.
+	const g2 = runGate([["sleep 1; echo ok", "ok"]], process.cwd());
+	assert.equal(g2.results[0].ok, true, g2.results[0].tail);
 });
 
 test("sameTaskPlan: a plan act re-declares the checks, never the plan", () => {
