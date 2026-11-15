@@ -58,7 +58,24 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(obj));
   };
-  if (req.url.startsWith("/health")) return send(200, { status: "ok", loaded: resident, loading: swapLine !== null, percent: null, swap: swapLine });
+  // The MEASURED basalt 0.4.0 `/health` shape (curl '…/health?phase=display', 2026-11-15):
+  // `loaded` is a BOOLEAN — "is a pack resident" — and the resident lane rides under `model`;
+  // `percent` is null at rest. The invented shape (`loaded: <lane key>`) is what let the panel crash
+  // on the live router: the reader took `true` for a name and the renderer threw
+  // (`name.indexOf is not a function`), so the panel opened nothing.
+  if (req.url.startsWith("/health"))
+    return send(200, {
+      status: "ok",
+      max_context: 262144,
+      model: resident,
+      images: 0,
+      api_key: "set",
+      loaded: resident !== null,
+      loading: swapLine !== null,
+      service: "basalt",
+      percent: null,
+      swap: swapLine,
+    });
   if (req.url === "/v1/models")
     return send(200, {
       data: [
@@ -72,7 +89,29 @@ const server = http.createServer(async (req, res) => {
     return send(200, { ok: true, model });
   }
   if (req.url === "/metrics")
-    return send(200, { requests: metricsOn ? [{ pp: 1499, decode_tok_s: 130, ttft_s: 0.4, hit_rate: 0.82 }] : [] });
+    // The MEASURED basalt 0.4.0 payload, captured from :18014 on 2026-11-15 and trimmed to the
+    // fields the panel reads. The load-bearing details, each of which an invented fixture missed:
+    //  - the tier fields are NESTED under `engine`;
+    //  - `engine.quant` carries the LANE NAME, so the engine row must print no quant at all;
+    //  - `engine.spill` is null and `expert_total` sits beside `expert_slots`;
+    //  - `live.tok_s` is null when idle, and the queue is `live.slots.queue_depth`/`live.queued`;
+    //  - `requests[]` carries NO `model` field (only `path`/`slot`), and `best.decode.tok_s` is the
+    //    strongest rate the router publishes.
+    return send(200, {
+      engine: { model: resident, version: "0.4.0", quant: resident, expert_slots: 2200, expert_total: 15360, spill: null, max_context: 262144, kv: "int8" },
+      live: {
+        state: metricsOn ? "decoding" : "idle",
+        load: null,
+        queued: 0,
+        slots: { total: 1, active: metricsOn ? 1 : 0, queue_depth: 0 },
+        queue: [],
+        tok_s: metricsOn ? 130.5 : null,
+      },
+      best: { prefill: { tok_s: 14947.5 }, decode: { tok_s: 471.0 } },
+      totals: { requests: 1844, prompt: 229256971, reused: 224063798 },
+      requests: metricsOn ? [{ id: "r_1844", path: "/v1/chat/completions", slot: 0, duration_s: 0.7, prompt_tokens: 1499, reused: 1187, output_tokens: 312, decode_tok_s: 130.0, hit_rate: 0.82, ttft_s: 0.4 }] : [],
+      swap: swapLine,
+    });
   send(404, { error: "unknown" });
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -84,12 +123,19 @@ const tools = {};
 const commands = {};
 const hooks = {};
 const sent = [];
+/** The registered chords (the host's table, as the extension sees it) and the recorded surfaces:
+ *  the rigs read the SAME contract the TUI renders — widget writes, status-bar writes, and the
+ *  raw-input listeners the extension binds (the panel's chord is delivered there, never by registerShortcut). */
+const shortcuts = {};
+const widgets = new Map();
+const statusRows = new Map();
+const inputHandlers = [];
 let activeTools = ["read", "bash", "edit", "write", "grep", "task"];
 const pi = {
   registerTool: (t) => void (tools[t.name] = t),
   registerCommand: (name, c) => void (commands[name] = c),
   on: (evt, h) => void (hooks[evt] = h),
-  registerShortcut: () => {},
+  registerShortcut: (key, opts) => void (shortcuts[key] = opts),
   setModel: async () => ({ switched: true }),
   setThinkingLevel: () => {},
   getActiveTools: () => activeTools,
@@ -101,16 +147,24 @@ const ctx = {
   hasUI: false,
   cwd: repo,
   modelRegistry: { find: () => ({ id: "stub" }) },
+  getContextUsage: () => ({ tokens: 41234, contextWindow: 1048576, percent: 3.9, baselineSource: "test" }),
   abort: () => {},
   isIdle: () => true,
   hasPendingMessages: () => false,
   signal: undefined,
   ui: {
-    setStatus: () => {},
-    setWidget: () => {},
+    setStatus: (key, text) => void (text === undefined ? statusRows.delete(key) : statusRows.set(key, text)),
+    setWidget: (key, lines, opts) => void (lines === undefined ? widgets.delete(key) : widgets.set(key, { lines, opts })),
     notify: (m) => void notes.push(m),
     setWorkingMessage: () => {},
     custom: async () => undefined,
+    onTerminalInput: (h) => {
+      inputHandlers.push(h);
+      return () => {
+        const i = inputHandlers.indexOf(h);
+        if (i >= 0) inputHandlers.splice(i, 1);
+      };
+    },
   },
 };
 
@@ -142,6 +196,13 @@ const mod = await import("../.test-build/index.mjs");
 mod.default(pi);
 const checks = [];
 const ok = (name, cond, detail = "") => checks.push({ name, ok: Boolean(cond), detail });
+
+
+/**
+ * `words` on one row, whitespace-agnostic: the panel pads its metric label column, so the contract
+ * is that the words ride on one row, never the exact padding count.
+ */
+const hasRow = (s, words) => new RegExp(words.split(/\s+/).map((w) => w.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")).join("\\s+")).test(s);
 
 // 1+2. v1 -> v2 migration happens on resume; the first persisted snapshot proves it, together
 // with the planning tier and adaptive budget (a 2-task plan reserves 3 rounds).
@@ -310,7 +371,9 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	await new Promise((r) => setTimeout(r, 60));
 	const withMetrics = lines();
 	const last = JSON.parse(withMetrics[withMetrics.length - 1] ?? "{}");
-	ok("the ledger writes one JSONL line per turn from the router's numbers", withMetrics.length >= 1 && last.pp === 1499 && last.tg === 130 && last.phase === "coding_done" && typeof last.swap_ms === "number", JSON.stringify(last));
+	// pp is a RATE (prompt tokens over the prefill window: 1499 tok over the 0.4 s ttft = 3748 tok/s)
+	// and tg the decode rate; the fixture's numbers are the expectation, not a remembered string.
+	ok("the ledger writes one JSONL line per turn from the router's numbers", withMetrics.length >= 1 && last.pp === 3748 && last.tg === 130 && last.ttft === 0.4 && last.kv_hit_pct === 82 && last.phase === "coding_done" && typeof last.swap_ms === "number", JSON.stringify(last));
 	metricsOn = false;
 	const before = lines().length;
 	await exec("verification_done", { verdict: "needs_repair", notes: "rig repair", tasks: [task("T2")] });
@@ -563,7 +626,44 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("a quiet lane carries no guard clause", quietNote === "", JSON.stringify(quietNote));
 }
 
-server.close();
+// 20. The Alt+Shift+F screen and the status row. The row is the one line the operator sees all day,
+//     and it says what the loop is doing in the operator's own words (2026-11-15: "use a nerdfont …
+//     and just say Orchestrator: plan R1/6 T0/0"); the panel is the detail view, opened on
+//     `alt+shift+f` — the chord the host's own conflict probe reports FREE (`alt+f` is
+//     `tui.editor.cursorWordRight`, `ctrl+o` is `app.tools.expand`) and byte-distinct (ESC + `F`).
+//     The default surface writes no status-bar row, and a terminal run clears the row.
+{
+  resident = "flash-next";
+  writeState(seedState("coding", [["true", "green"]]));
+  await hooks.session_start({}, ctx);
+  const top = widgets.get("fade-top");
+  const row = top?.lines?.[0] ?? "";
+  ok("the status row is the operator's line: glyph, Orchestrator, state, round, tally, key", row === "󰚩 Orchestrator: code R1/6 · T0/2 · [Alt+Shift+F]", JSON.stringify(row));
+  ok("the row is docked above the editor (the surface the loop can own)", top?.opts?.placement === "aboveEditor", JSON.stringify(top?.opts));
+  ok("the default surface writes NO status-bar row", statusRows.size === 0, JSON.stringify([...statusRows.keys()]));
+  ok("the chord is bound by the raw-input listener", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
+  ok("the panel's chord is registered as a shortcut, so the host parses it", Boolean(shortcuts["alt+shift+f"]), JSON.stringify(Object.keys(shortcuts)));
+  ok("the fallback chord is registered where the host accepts it", Boolean(shortcuts["alt+shift+i"]), JSON.stringify(Object.keys(shortcuts)));
+  ok("an unrelated keystroke is not consumed", inputHandlers[0]("x") === undefined);
+  const consumed = inputHandlers[0]("\x1bF");
+  ok("Alt+Shift+F is consumed and opens the panel", consumed?.consume === true, JSON.stringify(consumed));
+  await new Promise((r) => setTimeout(r, 300));
+  const panel = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
+  ok("the panel opens with the run's header", panel.includes("fade-orchestrator GATE1"), panel.slice(0, 240));
+  ok("the panel carries the task list", panel.includes("TASKS 0/2 passed"), panel.slice(0, 400));
+  ok("the panel carries the phase rail", panel.includes("PHASES") && panel.includes("planning_done"), panel.slice(0, 900));
+  ok("the panel carries the engine column", panel.includes("ENGINE / ROUTER") && hasRow(panel, "resident flash-next"), panel.slice(0, 900));
+  ok("the panel carries the context meter", hasRow(panel, "context 41.2k / 1.05M (3.9%)"), panel.slice(0, 900));
+  ok("the panel names the ledger it has: the swap this rig drove is on screen, not a placeholder", panel.includes("LANE SWAPS") && /→/.test(panel) && !panel.includes("no swaps recorded"), panel.slice(0, 1200));
+  ok("the panel ends with the key bar", panel.includes("[esc] close") && panel.includes("[s] skip selected"));
+  await commands.orchestrate.handler("halt", ctx);
+  ok("a terminal run clears the status row", !widgets.has("fade-top"), JSON.stringify([...widgets.keys()]));
+  process.env.PI_SESSION_FILE = join(repo, "sessions", "2026-11-15T00-00-00-000Z_parent", "agent.jsonl");
+  await hooks.session_start({}, ctx);
+  ok("a delegated session binds no extra listener on the chord", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
+  delete process.env.PI_SESSION_FILE;
+}
+
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));
 if (failed.length > 0) {

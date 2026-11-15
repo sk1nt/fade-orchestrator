@@ -11,6 +11,8 @@
  *   /orchestrate [--rounds N] <goal>   start a run (default 6 rounds, max 6)
  *   /orchestrate status                state, lane, round, tasks, phase log, path
  *   /orchestrate stop [--clear]        mark the run stopped (leave the resident lane)
+ *   Alt+F                              the live panel: tasks, phases, engine metrics, swap cost
+ *                                      (keys s/v/r/p/c/h act on the selected task; esc closes)
  *   /lanes                             live router census: both entries + health
  */
 import { unlinkSync } from "node:fs";
@@ -38,17 +40,25 @@ import {
 	type RunState,
 	type Task,
 } from "./core.ts";
-import { OVERLAY_WIDGET_KEY, TOP_WIDGET_KEY, openOverlay, topStatus, type FlipBadge, type OverlayData } from "./ui.ts";
+import { chordBytes, keyLabel, modelLabel, ORCH_STATUS_KEY, OVERLAY_WIDGET_KEY, statusLines, TOP_WIDGET_KEY, type FlipBadge, type SwapPill } from "./ui.ts";
 import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keymap.ts";
-import { appendTurn, readSwaps, turnRecordOrNull } from "./history.ts";
-import { laneMoe, moeRows } from "./moe.ts";
+import { appendTurn, turnRecordOrNull } from "./history.ts";
+import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, startSwapWatch, type MetricsSnapshot } from "./livedata.ts";
 import { handoverText } from "./core.ts";
-import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, startSwapWatch, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
+import { laneMoe } from "./moe.ts";
+import { openPanel, type PanelAction } from "./panel.ts";
+import { collectScreen, type ScreenData } from "./screendata.ts";
 
-// The overlay key. Ctrl+O is the app's "toggle tool output" binding on this host (measured in
-// the keybindings table: app.tools.expand defaultKeys ctrl+o) — the operator asked for Ctrl+O,
-// so it is the default and the takeover is disclosed; set FADE_ORCHESTRATE_KEY to keep the
-// built-in (e.g. "ctrl+g").
+// The panel key, chosen by measurement, not by table-guessing. The operator asked for Ctrl+O first;
+// the host binds `ctrl+o` to `app.tools.expand` and ACTS on its own bindings, so the screen cannot
+// live there. `alt+f` (the operator's second choice) looked free in the strings-extracted default
+// table and is NOT: the host's runtime answers `keybinding tui.editor.cursorWordRight` for it
+// (measured via `getShortcutConflict`, 2026-11-15), and the pty rig watched ESC f move the cursor
+// word instead of opening a panel. `alt+shift+f` (ESC + `F`) answers FREE and is byte-distinct, so
+// that is the key. `FADE_ORCHESTRATE_KEY` moves it (`ctrl+<a-z>`, `alt+<a-z>` and
+// `alt+shift+<a-z>` have byte forms; `ctrl+shift+<a-z>` does not — shift is invisible inside a
+// control code, measured). `FADE_ORCHESTRATE_FALLBACK_KEY` (default `alt+shift+i`, measured FREE,
+// ESC + `I`) is the registered companion chord.
 
 // Y10 pre-unload health gate: `POST /v1/load` unloads the RESIDENT lane, and a request queued at
 // that instant is answered by the router's own log line `swap flash-next -> deepseek (1 waiting)` —
@@ -58,7 +68,12 @@ import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, 
 // in milliseconds; the documented interval/budget is what the box runs.
 const GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3000);
 const GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 60_000);
-const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "ctrl+o";
+const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+shift+f";
+// The status row's surface. `widget` (the default) docks it above the editor; `status` writes the
+// same text to the host's status bar, which is the right choice only for a `statusLine` config that
+// placed the `status` segment after the model — the host puts the text wherever the config says, and
+// an extension cannot move a segment (measured on this box: `status` sits on the right).
+const SURFACE = process.env.FADE_ORCHESTRATE_SURFACE === "status" ? "status" : "widget";
 
 // Y15: the WRITING tools, by NAME. The verifier sandbox is a denylist, not an allowlist, so a host
 // tool this file has never seen cannot slip a write past it. Delegation is NOT on the list: `task`
@@ -94,6 +109,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let metrics: MetricsSnapshot | undefined;
 	let laneBest = 0;
 	let metricsTimer: NodeJS.Timeout | undefined;
+	/** The raw-input listener that owns the panel chord, its open flag, and the chord's disclosure. */
+	let inputUnsub: (() => void) | undefined;
+	let panelOpen = false;
+	let conflictReported = false;
+	/** The chord is settled only when a LIVE probe says so; `probeHasAnswered` distinguishes a real
+	 *  "free" from the loading-phase probe that threw (measured: the host dispatches `session_start`
+	 *  during extension loading, where the probe throws). */
+	let chordResolved = false;
+	let probeHasAnswered = false;
 	let turnSeq = 0;
 	let turnPhase: string | undefined;
 	let turnSwapMs = 0;
@@ -102,6 +126,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	/** Y21: the lane churn the flip guard observed, as the surfaces render it. `undefined` when
 	 *  the window is quiet, so a healthy run never advertises a flip. */
 	let flipBadge: FlipBadge | undefined;
+	/** The lane the router is loading RIGHT NOW, as the status row renders it. Set by `switchLane`
+	 *  for the loop's own swap and refreshed from the swap watch's /health samples, so the row is
+	 *  multicolored only while a pack is actually coming in; cleared the moment it lands. */
+	let swapPill: SwapPill | undefined;
 
 	const refreshMetrics = async (): Promise<void> => {
 		const s = await fetchMetrics();
@@ -190,11 +218,27 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		}
 	};
 
-	// Measured on this host: registerTool() puts fade_phase in the registry (/tools lists it) but
-	// NOT in the active set the model is offered, so every phase briefing must activate it first.
-	const ensurePhaseTool = async (): Promise<void> => {
-		const active = pi.getActiveTools();
-		if (!active.includes("fade_phase")) await pi.setActiveTools([...active, "fade_phase"]);
+	/**
+	 * Measured on this host: registerTool() puts fade_phase in the registry (/tools lists it) but
+	 * NOT in the active set the model is offered, so every phase briefing must activate it first.
+	 *
+	 * The action methods are GUARDED during extension loading — omp 18.20.2 throws
+	 * "Extension runtime not initialized. Action methods cannot be called during extension
+	 * loading." — and the host can dispatch `session_start` before it installs the runtime. That
+	 * throw disabled the WHOLE extension (measured 2026-11-15 in both live rigs: every assertion
+	 * failed behind `Warning: Failed to load extension …/fade_orchestrate.ts`). So this call is
+	 * defensive and answers a boolean; `agent_start` runs it again, and by the first turn the
+	 * runtime is live — the only moment the tool has to exist.
+	 */
+	const ensurePhaseTool = async (): Promise<boolean> => {
+		try {
+			const active = pi.getActiveTools();
+			if (active.includes("fade_phase")) return true;
+			await pi.setActiveTools([...active, "fade_phase"]);
+			return true;
+		} catch {
+			return false;
+		}
 	};
 
 	const statePath = (): string => (runDir ? join(runDir, STATE_FILENAME) : "<unset>");
@@ -213,22 +257,49 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
 	};
 
+	/** True once THIS process has written the status-bar row (the opt-in surface). The widget
+	 *  surface never touches `setStatus` at all — proved by `test/rpc_rig.mjs`: the default surface
+	 *  is the top widget, and a clear-only call there is an API touch the contract forbids. */
+	let statusWritten = false;
+	/**
+	 * Clear BOTH surfaces. A run not in use leaves nothing on screen, and the surface that is
+	 * configured is not the only one that can hold a stale row — a run that ran with
+	 * `FADE_ORCHESTRATE_SURFACE=status` earlier in this process must have its bar row removed.
+	 */
+	const clearSurface = (ctx: ExtensionContext): void => {
+		ctx.ui.setWidget(TOP_WIDGET_KEY, undefined, { placement: "aboveEditor" });
+		if (statusWritten) {
+			statusWritten = false;
+			ctx.ui.setStatus(ORCH_STATUS_KEY, undefined);
+		}
+	};
+
 	const paint = (ctx: ExtensionContext): void => {
 		if (!run) {
-			ctx.ui.setWidget(TOP_WIDGET_KEY, undefined);
+			clearSurface(ctx);
 			ctx.ui.setWidget(OVERLAY_WIDGET_KEY, undefined);
 			return;
 		}
-		// ONE status line at the TOP of the editor, and ONLY while a run is in use (operator order
-		// 2026-11-15: "I want the status for orchestrate to exist at the top and it shouldn't
-		// always be there, only when in use … no footer for now"). `topStatus` answers `undefined`
-		// for no run, for a terminal run (including a run adopted from disk at session_start) and
-		// for a run this session does not own, and every one of those CLEARS the widget. The footer
-		// row (`ctx.ui.setStatus`) is never written. The detail view stays the overlay
-		// (Ctrl+O / `/orchestrate overlay`), so the transcript stays clean during long coding runs.
-		const cols = typeof process.stdout.columns === "number" ? process.stdout.columns : undefined;
-		const lines = topStatus(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), cols });
-		ctx.ui.setWidget(TOP_WIDGET_KEY, lines);
+		// ONE status row, and ONLY while a run is in use (operator order 2026-11-15: the status must
+		// "exist at the top … only when in use … no footer for now", then "use a nerdfont … and just
+		// say Orchestrator: plan R1/6 T0/0"). `statusLines` answers `undefined` for no run, for a
+		// terminal run (including a run adopted from disk at session_start) and for a run this
+		// session does not own, and every one of those CLEARS the surface. The default surface is the
+		// top widget: the host prints `setStatus` text in the `status` segment wherever the USER's
+		// `statusLine` config placed it, and an extension cannot add or move a status-line segment,
+		// so the row — not the bar — is what the loop can own (ui.ts: "Placement").
+		// `FADE_ORCHESTRATE_SURFACE=status` opts into the status bar for a config that placed the
+		// `status` segment right after the model. The detail view stays the panel, and the row's key
+		// hint is the configured chord's label, so the row never advertises a key it does not honor.
+		const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(FADE_KEY) });
+		if (!lines) {
+			clearSurface(ctx);
+			return;
+		}
+		if (SURFACE === "status") {
+			statusWritten = true;
+			ctx.ui.setStatus(ORCH_STATUS_KEY, lines.map((l) => l.trim()).join(" · "));
+		} else ctx.ui.setWidget(TOP_WIDGET_KEY, lines, { placement: "aboveEditor" });
 	};
 
 	const fail = (ctx: ExtensionContext, reason: string): void => {
@@ -289,14 +360,23 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// first-completion and steady decode rates off /metrics and appends a history row —
 		// the durable measurement behind batch-verification-into-one-residency decisions.
 		const from = run?.lane ?? "";
+		// The status row names the switch, multicolored, while the pack is coming in: the model name
+		// appears here exactly once (abbreviated), and the steady row names no model at all.
+		swapPill = { from, to: modelLabel(model.name ?? lane) };
+		paint(ctx);
 		// Optimal MoE loading, measured per swap (moe.ts): the Flash-Next pack saves its learned
 		// adaptive-tier placement and starts from it; the profile's existence + age BEFORE this
 		// swap is what decides "warm start" vs the 91 tok/s cold ramp.
 		const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
-		const watch = startSwapWatch(lane, moe);
+		const watch = startSwapWatch(lane, moe, (percent) => {
+			if (!swapPill) return;
+			swapPill = { ...swapPill, percent };
+			paint(ctx);
+		});
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
 		const loaded = await loadLane(lane);
 		ctx.ui.setWorkingMessage();
+		swapPill = undefined;
 		if (!loaded.ok) {
 			watch.cancel();
 			fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
@@ -324,44 +404,159 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		}, 0);
 	};
 
-	const lastCritique = (): string | undefined => {
-		const phases = run?.phases ?? [];
-		for (let i = phases.length - 1; i >= 0; i--) if (phases[i].phase === "verification_done") return phases[i].notes;
-		return undefined;
+	/**
+	 * The Alt+F screen: one provider call = one screen. It reads the run object, the run dir's
+	 * ledgers, the router (the cached snapshot is refreshed and persisted here, so the engine rows
+	 * on the panel MOVE while it is open) and the host's context meter. Every number a source did
+	 * not answer is named by `collectScreen`, never printed as a zero.
+	 */
+	const panelProvider = (ctx: ExtensionContext): (() => Promise<ScreenData>) | undefined => {
+		if (!run || !runDir) return undefined;
+		const state = run;
+		const dir = runDir;
+		return async () => {
+			const s = await fetchMetrics();
+			if (s) {
+				metrics = s;
+				persistMetrics(dir, s);
+			}
+			return collectScreen({
+				run: state,
+				runDir: dir,
+				lanes: { think: THINK_LANE, code: CODE_LANE },
+				names: { [THINK_LANE]: ctx.modelRegistry.find(PROVIDER, THINK_LANE)?.name, [CODE_LANE]: ctx.modelRegistry.find(PROVIDER, CODE_LANE)?.name },
+				context: ctx.getContextUsage(),
+				metrics,
+				flip: flipBadge,
+				...(process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}),
+			});
+		};
 	};
 
-	const showOverlay = async (ctx: ExtensionContext): Promise<void> => {
-		if (!run || !runDir) {
+	/** A panel key is a loop control: the same directives `/orchestrate` answers, on the SELECTED task. */
+	const actOnPanel = (ctx: ExtensionContext, a: PanelAction): void => {
+		if (!run) return;
+		const dir =
+			a.key === "s" ? actSkip(run, a.taskId) : a.key === "v" ? actVerify(run) : a.key === "r" ? actReset(run) : a.key === "p" ? actPause(run) : a.key === "c" ? actCode(run) : a.key === "h" ? actHalt(run) : undefined;
+		if (!dir) return;
+		persist();
+		paint(ctx);
+		ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+		// [p]/[c] resumed a paused loop: pay the lane load that pausing deferred.
+		if (!run.paused && pending) {
+			const deferred = pending;
+			pending = undefined;
+			void switchLane(deferred.lane, ctx);
+		}
+		if (dir.next) void switchLane(dir.next, ctx);
+	};
+
+	const showPanel = async (ctx: ExtensionContext): Promise<void> => {
+		const provider = panelProvider(ctx);
+		if (!provider) {
 			ctx.ui.notify("orchestrate: no run active", "info");
 			return;
 		}
 		try {
-			const s = await fetchMetrics();
-			if (s) {
-				metrics = s;
-				if (runDir) persistMetrics(runDir, s);
-			}
-			const tiers = [...tiersFromMetrics(metrics), ...moeRows([THINK_LANE, CODE_LANE], { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG })];
-			const data: OverlayData = { run, swaps: readSwaps(runDir), tiers, critique: lastCritique(), flip: flipBadge };
-			await openOverlay(ctx, data, (key) => {
-				if (!run) return;
-				const dir =
-					key === "s" ? actSkip(run) : key === "v" ? actVerify(run) : key === "r" ? actReset(run) : key === "p" ? actPause(run) : key === "c" ? actCode(run) : key === "h" ? actHalt(run) : undefined;
-				if (!dir) return;
-				persist();
-				paint(ctx);
-				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
-				// [p]/[c] resumed a paused loop: pay the lane load that pausing deferred.
-				if (!run.paused && pending) {
-					const deferred = pending;
-					pending = undefined;
-					void switchLane(deferred.lane, ctx);
-				}
-				if (dir.next) void switchLane(dir.next, ctx);
-			}, process.env.FADE_ORCHESTRATE_HEADLESS === "1");
+			await openPanel(ctx, provider, (a) => actOnPanel(ctx, a), process.env.FADE_ORCHESTRATE_HEADLESS === "1");
 		} catch (e) {
-			ctx.ui.notify(`orchestrate: overlay failed: ${String(e instanceof Error ? e.message : e)}`, "error");
+			// The message alone sent me hunting twice: the panel renders from six sources, and the
+			// message names the expression, not the caller. Two stack lines ride along.
+			const where = e instanceof Error && typeof e.stack === "string" ? ` @ ${e.stack.split("\n").slice(1, 4).map((l) => l.trim()).join(" | ")}` : "";
+			ctx.ui.notify(`orchestrate: panel failed: ${String(e instanceof Error ? e.message : e)}${where}`, "error");
 		}
+	};
+
+	// The read is guarded, not just the call. omp 18.20.2's loading-phase proxy answers a property
+	// `get` of a guarded action method with the SAME throw as the call, and a throw in the factory body
+	// fails the LOAD: measured 2026-11-15 in a live operator session, the extension died behind
+	// `Warning: Failed to load extension …/fade_orchestrate.ts: Extension runtime not initialized.
+	// Action methods cannot be called during extension loading.` — which silently costs the status row,
+	// the panel, `/orchestrate` AND the `fade_phase` tool, because `registerTool`/`registerCommand`
+	// below it never run. One refused property read must never be able to take the surface down.
+	let conflictProbe: unknown;
+	try {
+		conflictProbe = Reflect.get(pi, "getShortcutConflict");
+	} catch {
+		conflictProbe = undefined;
+	}
+	/**
+	 * The host's answer about a chord, `undefined` when the chord is free: `kind` names the class
+	 * (`reserved` / `keybinding`) and `owner`/`keybindings[0]` the host action that holds it. Swallowed
+	 * for two measured reasons: the method is absent from the published types, and omp 18.20.2's
+	 * loading-phase stub throws "Extension runtime not initialized. Action methods cannot be called
+	 * during extension loading." for it, which disabled the whole extension (measured 2026-11-15 in the
+	 * rpc and pty rigs, where every assertion failed behind `Warning: Failed to load extension
+	 * …/fade_orchestrate.ts`). `probeHasAnswered` separates a swallowed throw from a real "free".
+	 */
+	const hostConflict = (key: string): { kind: string; owner?: string; keybindings?: string[] } | undefined => {
+		if (typeof conflictProbe !== "function") return undefined;
+		try {
+			const answer = (conflictProbe as (k: string) => { kind: string; owner?: string; keybindings?: string[] } | undefined).call(pi, key);
+			probeHasAnswered = true;
+			return answer;
+		} catch {
+			return undefined;
+		}
+	};
+
+
+	// The chord, taken at the raw-input layer. That layer is the proven path: `registerShortcut` is
+	// refused for a chord the host's table holds ("Extension shortcut conflicts with built-in
+	// shortcut" in getShortcuts, measured for ctrl+o), and a raw listener sees the bytes whatever
+	// owns the action. While the panel is open the byte is NOT consumed: the overlay keeps its own
+	// keys (esc closes).
+	const CHORD = chordBytes(FADE_KEY);
+	const FALLBACK_KEY = process.env.FADE_ORCHESTRATE_FALLBACK_KEY ?? "alt+shift+i";
+	const openPanelGuarded = async (ctx: ExtensionContext): Promise<void> => {
+		if (panelOpen) return;
+		panelOpen = true;
+		try {
+			await showPanel(ctx);
+		} finally {
+			panelOpen = false;
+		}
+	};
+
+	/**
+	 * The host's chord table — the chords its own action table binds, read out of the 18.20.2 binary and
+	 * confirmed at runtime by the conflict probe where the probe answers (measured 2026-11-15: `alt+f`
+	 * answers `keybinding tui.editor.cursorWordRight`; `alt+shift+f` and `alt+shift+i` answer FREE, which
+	 * is why the extension's chord is `alt+shift+f`).
+	 *
+	 * The table exists because the probe is **not callable when a hook can run**: `getShortcutConflict`
+	 * throws for the loading-phase proxy, `session_start` fires inside that window, and an idle TUI
+	 * session — the pty rig, and an operator reading the wall — has no `agent_start` to retry on. Measured
+	 * in every rig state: with the disclosure tied to the probe alone it never reached the screen. So the
+	 * probe decides when it answers and the table decides when it does not; the chord is always disclosed.
+	 */
+	const HOST_HELD_CHORDS: Record<string, true> = {
+		"ctrl+c": true, "ctrl+d": true, "ctrl+g": true, "ctrl+l": true, "ctrl+o": true, "ctrl+r": true,
+		"ctrl+s": true, "ctrl+t": true, "ctrl+y": true, "ctrl+z": true, "ctrl+.": true,
+		"alt+a": true, "alt+b": true, "alt+d": true, "alt+f": true, "alt+g": true, "alt+h": true,
+		"alt+i": true, "alt+k": true, "alt+l": true, "alt+m": true, "alt+n": true, "alt+o": true,
+		"alt+p": true, "alt+r": true, "alt+y": true,
+		"alt+shift+c": true, "alt+shift+k": true, "alt+shift+l": true, "alt+shift+p": true, "alt+shift+v": true,
+	};
+
+	/** One disclosure, at `session_start`: which key opens the screen, and whether the host holds it. */
+	const resolveChord = (ctx: ExtensionContext): void => {
+		if (!CHORD || chordResolved) return;
+		const conflict = hostConflict(FADE_KEY);
+		const owner = (conflict?.keybindings?.[0] ?? conflict?.owner) as string | undefined;
+		const held = conflict !== undefined || (!probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true);
+		chordResolved = true;
+		if (conflictReported) return;
+		conflictReported = true;
+		const text = held
+			? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) — the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z`
+			: `orchestrate: ${keyLabel(FADE_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
+		// The FIRST notify of a session is swallowed by the host's TUI attach: measured in the pty rig
+		// (2026-11-15), the disclosure fired at `session_start` never reached the scrollback while the
+		// notify ~20 lines later in the same hook rendered every time. Deferring past the attach is the
+		// remedy; the one-shot flags above are set synchronously, so the deferral can never double-print.
+		const at = setTimeout(() => ctx.ui.notify(text, "info"), 500);
+		at.unref?.();
 	};
 
 	/** Apply one validated phase; returns the lane to load and the resulting state. */
@@ -604,12 +799,37 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerShortcut(FADE_KEY as Parameters<typeof pi.registerShortcut>[0], {
-		description: "fade orchestrator overlay: tasks, swap history, tiers, critique (s/v/r/c/h)",
-		handler: async (ctx) => {
-			await showOverlay(ctx);
-		},
-	});
+	// The panel's chord is registered as a shortcut, so the HOST parses the chord string: that is the
+	// robust delivery for an `alt+…` chord, whose two bytes (ESC + letter) a pty can split across
+	// reads. The host is the authority on who owns a chord — `getShortcuts()` logs
+	// "Extension shortcut conflicts with built-in shortcut" and skips a chord its table holds
+	// (measured for `ctrl+o`) — and the raw-input listener bound at `session_start` stays as the
+	// byte-level path. Both routes go through `openPanelGuarded`, so a keystroke opens one panel.
+	//
+	// Registration runs in the factory body, i.e. at LOAD. The same rule as the probe read above: a
+	// refused chord SKIPS and never propagates, because a load-time throw costs the status row, the
+	// panel, `/orchestrate` and the `fade_phase` tool at once. The fallback chord and
+	// `/orchestrate overlay` are the paths that survive a refused chord.
+	const registerChord = (key: string, description: string): void => {
+		try {
+			pi.registerShortcut(key as Parameters<typeof pi.registerShortcut>[0], {
+				description,
+				handler: async (ctx: ExtensionContext) => {
+					await openPanelGuarded(ctx);
+				},
+			});
+		} catch {
+			/* the host holds this chord: the listener, the fallback chord and the command path remain */
+		}
+	};
+	registerChord(FADE_KEY, `fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h) [${keyLabel(FADE_KEY)}]`);
+
+	// The fallback chord is registered the same way: it is the key that opens the screen when the
+	// configured chord collides with a host binding.
+	if (!hostConflict(FALLBACK_KEY)) {
+		registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
+	}
+
 	pi.registerCommand("orchestrate", {
 		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
@@ -629,7 +849,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return;
 			}
 			if (first === "overlay") {
-				await showOverlay(ctx);
+				await openPanelGuarded(ctx);
 				return;
 			}
 			if (first === "handover") {
@@ -682,7 +902,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					persist();
 				}
 				pending = undefined;
-				ctx.ui.setWidget(TOP_WIDGET_KEY, undefined);
+				clearSurface(ctx);
 				ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
 					try {
@@ -779,6 +999,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// loads, while the read-only refusals landed on the workers' own edits.
 		if (isDelegatedSession()) return;
 		await ensurePhaseTool();
+		// Bind the chord for this session. A delegated worker never binds it: the keystroke is global
+		// to the terminal, and the panel belongs to the session that owns the run.
+		if (CHORD && !inputUnsub) {
+			inputUnsub = ctx.ui.onTerminalInput((data) => {
+				if (data !== CHORD || panelOpen) return undefined;
+				void openPanelGuarded(ctx);
+				return { consume: true };
+			});
+		}
+		// One disclosure of the chord: the probe decides when it answers, the host's chord table when
+		// it cannot (see `resolveChord`).
+		resolveChord(ctx);
 		const repo = ctx.cwd;
 		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
 		const state = readJson<RunState>(join(repo, "var", "omp-orchestrate", STATE_FILENAME));
@@ -802,6 +1034,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
+		// The runtime is live by the first turn, so this is the safe retry point for the phase tool.
+		if (!(await ensurePhaseTool())) setTimeout(() => void ensurePhaseTool(), 500);
 		paint(ctx);
 		void refreshMetrics().then(() => paint(ctx));
 	});
@@ -930,7 +1164,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		ctx.ui.setWidget(TOP_WIDGET_KEY, undefined);
+		clearSurface(ctx);
 		stopMetricsTimer();
+		if (inputUnsub) {
+			inputUnsub();
+			inputUnsub = undefined;
+		}
 	});
 }

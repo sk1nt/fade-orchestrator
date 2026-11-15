@@ -30,6 +30,8 @@ export function buildTestBundle() {
     "src/core.ts",
     "src/moe.ts",
     "src/ui.ts",
+    "src/screendata.ts",
+    "src/panel.ts",
     "src/router.ts",
     "--bundle",
     "--format=esm",

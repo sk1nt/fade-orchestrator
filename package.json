@@ -12,7 +12,9 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "npm run test:build && node --test \"test/*.test.mjs\"",
     "test:build": "node test/build.mjs",
-    "test:gate": "node test/gate_rig.mjs"
+    "test:gate": "node test/gate_rig.mjs",
+    "test:rpc": "node test/build.mjs && node test/rpc_rig.mjs",
+    "test:pty": "node test/build.mjs && node test/pty_rig.mjs"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

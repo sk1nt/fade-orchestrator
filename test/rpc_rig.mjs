@@ -78,10 +78,18 @@ const observe = (name, detail) => observations.push({ name, detail });
 // (measured rig_26: three turns, protocol 3/3 stall, zero loads). The verifier lane is the model
 // the loop itself plans/verifies on, so this is the honest choice, and its loads are real and
 // attributable like every other lane actor.
+const rigEnv = { ...process.env };
+// The rig must not inherit the CALLER's session identity. A `task` agent's `PI_SESSION_FILE` is
+// nested inside a dated parent dir, which is exactly the shape `isDelegatedSession` reads as a
+// subagent: inherited, every rig session was classified delegated, the row was suppressed by the
+// `owned` rule and `/orchestrate plan` was refused with "this is a delegated (subagent) session"
+// (measured 2026-11-15, 5 checks failed on the empty frame stream). The child host sets its own.
+delete rigEnv.PI_SESSION_FILE;
+delete rigEnv.PI_SESSION_ID;
 const child = spawn("omp", ["--model", "basalt-deepseek/deepseek:auto", "--mode", "rpc", "--no-session"], {
 	cwd: repo,
 	env: {
-		...process.env,
+		...rigEnv,
 		OMP_DATA_DIR: join(repo, ".omp"),
 		// A named key is required: the extension registers the lanes and calls setModel under it.
 		FADE_ORCHESTRATE_STATE_KEY: "rpcrig",
@@ -131,6 +139,11 @@ const c1 = frames.length;
 sendCmd("/orchestrate plan");
 await new Promise((r) => setTimeout(r, 12_000));
 const c2 = frames.length;
+// The Alt+Shift+F screen rides the live run: `/orchestrate overlay` renders the SAME collector and
+// renderer the key binds to (the headless path writes the panel as a widget), and it must be
+// captured BEFORE the halt — after a halt there is no run to show.
+sendCmd("/orchestrate overlay");
+await new Promise((r) => setTimeout(r, 6_000));
 // deepseek:auto OBEYS the systemPrompt literally: with "Reply with exactly: rig" it answers text
 // and the run stalls at protocol 3/3 (measured rig_27: three turns, zero loads). This prompt's
 // systemPrompt demands the tool call, and the window covers the verifier lane's cold load (17 s)
@@ -144,8 +157,6 @@ const c3 = frames.length;
 sendCmd("/orchestrate halt");
 await new Promise((r) => setTimeout(r, 4_000));
 const c4 = frames.length;
-sendCmd("/orchestrate overlay");
-await new Promise((r) => setTimeout(r, 6_000));
 
 // The rpc frame shape (recorded in /tmp/rpc_frames.jsonl): extension_ui_request frames carry the
 // fields FLAT — `method`, `widgetKey`, `widgetLines`, `message`, `notifyType` — not a `params`
@@ -158,19 +169,26 @@ const frameText = (f) => `${f.message ?? ""}\n${f.text ?? ""}\n${(Array.isArray(
 const dump = frames.filter((f) => (f.widgetKey ?? "") === "fade" && Array.isArray(f.widgetLines));
 /** A top-widget CLEAR frame: `setWidget("fade-top", undefined)` — the "not in use" state. */
 const isTopClear = (f) => f.method === "setWidget" && (f.widgetKey ?? "") === "fade-top" && !Array.isArray(f.widgetLines);
+/** The panel's headless writes: `setWidget("fade-overlay", lines)` — the screen a TTY would show. */
+const panelFrames = frames.filter((f) => f.method === "setWidget" && (f.widgetKey ?? "") === "fade-overlay" && Array.isArray(f.widgetLines));
+const panelText = () => panelFrames.map(frameText).join("\n");
 // The first check is the host itself: with ZERO frames every other check is noise, and the
 // summary's method list is the diagnosis (extension not loaded / registry rejected / no paint).
 ok("the host produced extension_ui_request frames at all", frames.length > 0, `frames=${frames.length} stderr=${stderr.join("").slice(-400)}`);
 
-ok("the pill renders at the TOP of the editor (setWidget fade-top)", topFrames.length > 0, `widgets=${topFrames.length}`);
+ok("the status row renders at the TOP of the editor (setWidget fade-top)", topFrames.length > 0, `widgets=${topFrames.length}`);
 ok(
-	"the top line carries the FULL lane name and the state",
-	topFrames.some((f) => topLines(f).some((l) => /⚡ deepseek:plan · R1\/6 · T0\/1 · \[Ctrl\+O\]/.test(l))),
+	"the row is the operator's line: glyph, Orchestrator, state, round, tally, the key",
+	topFrames.some((f) => topLines(f).some((l) => /Orchestrator: plan R1\/6 · T0\/1 · \[Alt\+Shift\+F\]/.test(l))),
 	JSON.stringify(topLines(topFrames[0])),
 );
-ok("no footer status row is written at all (no footer for now)", statusFrames.length === 0, JSON.stringify(statusFrames.map((f) => f.method)));
 ok(
-	"the pill carries NO flip line before the router churned",
+	"the DEFAULT surface writes no status-bar row (setStatus is the opt-in, FADE_ORCHESTRATE_SURFACE=status)",
+	statusFrames.length === 0,
+	JSON.stringify(statusFrames.map((f) => f.method)),
+);
+ok(
+	"the row carries NO flip line before the router churned",
 	topFrames.length > 0 && !topLines(topFrames[0]).some((l) => l.includes("lane flip")),
 	JSON.stringify(topLines(topFrames[0])),
 );
@@ -221,9 +239,37 @@ const rigSwaps = (() => {
 // The resident-lane optimization is the anti-ping-pong design: a lane already up pays NO load, so
 // the honest bound is 0..2 rows for one accepted phase, never a reload per turn.
 ok("the loop pays at most ONE lane load per accepted phase (rows 0..2; resident lanes pay none)", rigSwaps.length <= 2, JSON.stringify({ rows: rigSwaps.length, pairs: rigSwaps.map((r) => `${r.from}->${r.to}`) }));
-// The clear lands at the halt command itself (actHalt -> paint -> topStatus() === undefined), so
+// The clear lands at the halt command itself (actHalt -> paint -> statusLines() === undefined), so
 // the window is from just BEFORE the command (c3), not after it settles (c4).
 ok("halt clears the top widget: a run not in use leaves nothing on screen", frames.slice(c3).some(isTopClear), `clears=${frames.slice(c3).filter(isTopClear).length} topFrames=${topFrames.length}`);
+// The Alt+Shift+F screen's headless surface: `/orchestrate overlay` renders the panel through the
+// same collector and the same renderer the key binds to, so the frame carries the operator's columns.
+// The task tally is matched by GRAMMAR, not by a number: this rig runs `/orchestrate plan`, and the
+// planner rewrites the task list from its own payload, so a pinned `0/2` asserts the planner's output.
+// Measured 2026-11-15: the panel rendered `TASKS 0/1 passed` with the T1 row, its files, deps and
+// acceptance, `ENGINE / ROUTER`, `LANE SWAPS` and `[esc] close` — every section present — and the
+// check failed on the number alone.
+ok(
+	"the panel renders the run's header, the task list, the engine column and the swap cost",
+	(() => {
+		const t = panelText().replace(/\s+/g, " ");
+		return (
+			t.includes("fade-orchestrator rpcrig") &&
+			/TASKS \d+\/\d+ passed/.test(t) &&
+			t.includes("▶") &&
+			t.includes("acceptance:") &&
+			t.includes("ENGINE / ROUTER") &&
+			t.includes("LANE SWAPS") &&
+			t.includes("[esc] close")
+		);
+	})(),
+	`panels=${panelFrames.length} text=${panelText().replace(/\s+/g, " ").slice(0, 300)}`,
+);
+ok(
+	"the panel's lines fit the 110-column bound",
+	panelFrames.every((f) => frameText(f).split("\n").every((l) => l.length <= 110)),
+	`widest=${Math.max(0, ...panelFrames.flatMap((f) => frameText(f).split("\n").map((l) => l.length)))}`,
+);
 // The frame-shape record: every check's filter reads `method`/`params`, and this file is the
 // evidence when a filter goes blind (the setWidget key field is the current unknown).
 writeFileSync("/tmp/rpc_frames.jsonl", frames.map((f) => JSON.stringify(f)).join("\n"));

@@ -56,7 +56,17 @@ export interface MetricsSnapshot {
 	live_slots?: number;
 	queue?: number;
 	tok_s?: number;
+	/** The router's own best decode rate (`best.decode.tok_s`), the strongest rate it publishes. */
+	best_decode?: number;
+	/** The lane the router RESIDENTS, as a lane key ("flash-next"). Measured on basalt 0.4.0,
+	 *  `/health?phase=display` answers `loaded` as a BOOLEAN ("is a pack resident") and names the
+	 *  lane under `model`. Reading `loaded` as the name — the flat pre-0.4 shape — printed
+	 *  `resident true`, made the `◆resident` marker unmatchable, and threw in the renderer
+ *  (`name.indexOf is not a function`), so the panel opened nothing. `src/router.ts` already reads
+	 *  this correctly; this reader now agrees with it. */
 	loaded?: string;
+	/** The router's own boolean: is any pack resident at all. */
+	packLoaded?: boolean;
 	loading?: boolean;
 	percent?: number | null;
 	requests?: MetricsRequest[];
@@ -145,6 +155,8 @@ export async function fetchMetrics(): Promise<MetricsSnapshot | undefined> {
 	if (!m && !h) return undefined;
 	const mm = (m ?? {}) as Record<string, any>;
 	const hh = (h ?? {}) as Record<string, any>;
+	/** A lane key is a non-empty string; the router's boolean/number fields are never one. */
+	const laneKey = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
 	// basalt 0.4.0 nests the tier fields under `engine`; a pre-0.4 payload carried them flat
 	// (`expert_slots.total`, `spill.bytes_gb`). Read both, newest first — a reader that silently
 	// prints `?` for the numbers the overlay exists to show is the defect this ordering avoids.
@@ -153,8 +165,14 @@ export async function fetchMetrics(): Promise<MetricsSnapshot | undefined> {
 	const bytes = typeof spill?.bytes === "number" ? spill.bytes : undefined;
 	const slots = typeof eng.expert_slots === "number" ? eng.expert_slots : mm.expert_slots?.total;
 	const liveQueued = mm.live?.queued ?? mm.live?.slots?.queue_depth;
+	// Measured on the live router (2026-11-15): `engine.quant` carries the LANE NAME, not a
+	// quantization, so a reader that prints it labels the engine `quant flash-next`. A quant is only
+	// printed when the payload names one that is not the lane.
+	const lane = laneKey(hh.model) ?? laneKey(eng.model) ?? laneKey(mm.model);
+	const quant = [eng.quant, mm.quant].find((q) => typeof q === "string" && q.length > 0 && q !== lane);
+	const bestDecode = typeof mm.best?.decode?.tok_s === "number" ? mm.best.decode.tok_s : undefined;
 	const snap: MetricsSnapshot = {
-		quant: eng.quant ?? mm.quant,
+		quant: typeof quant === "string" ? quant : undefined,
 		engine_version: eng.version ?? mm.engine_version,
 		slots,
 		spill_experts: spill?.experts,
@@ -164,9 +182,11 @@ export async function fetchMetrics(): Promise<MetricsSnapshot | undefined> {
 		live_slots: mm.live?.slots?.active,
 		queue: typeof liveQueued === "number" ? liveQueued : Array.isArray(mm.queue) ? mm.queue.length : mm.queue,
 		tok_s: mm.live?.tok_s,
-		loaded: hh.loaded,
-		loading: hh.loading,
-		percent: hh.percent ?? null,
+		best_decode: bestDecode,
+		loaded: lane,
+		packLoaded: typeof hh.loaded === "boolean" ? hh.loaded : undefined,
+		loading: hh.loading === true,
+		percent: typeof hh.percent === "number" ? hh.percent : null,
 		requests: Array.isArray(mm.requests) ? mm.requests : undefined,
 		at_utc: new Date().toISOString(),
 	};
@@ -177,13 +197,14 @@ export async function fetchMetrics(): Promise<MetricsSnapshot | undefined> {
 export function tiersFromMetrics(s: MetricsSnapshot | undefined): TierRow[] {
 	if (!s) return [{ label: "router", value: `${ROUTER} unreachable` }];
 	const rates = (s.requests ?? []).map(rateFromRequest).filter((r): r is number => r !== undefined);
-	const best = rates.length > 0 ? Math.max(...rates) : undefined;
+	const bestRate = Math.max(s.best_decode ?? -Infinity, ...(rates.length > 0 ? rates : [-Infinity]));
+	const best = Number.isFinite(bestRate) ? bestRate : undefined;
 	return [
-		{ label: "engine", value: `${s.engine_version ?? "?"} quant ${s.quant ?? "?"}` },
-		{ label: "resident", value: `${s.loaded ?? "?"}${s.loading ? " (loading)" : ""}${s.percent != null ? ` ${s.percent}%` : ""}` },
+		{ label: "engine", value: `${s.engine_version ?? "?"}${s.quant ? ` quant ${s.quant}` : ""}` },
+		{ label: "resident", value: `${s.loaded ?? (s.packLoaded === true ? "pack (lane unnamed)" : "?")}${s.loading ? " (loading)" : ""}${s.percent != null ? ` ${s.percent}%` : ""}` },
 		{ label: "expert slots", value: `${s.slots ?? "?"} · spill ${s.spill_experts ?? "?"}/${s.spill_total ?? "?"}${s.spill_bytes_gb !== undefined ? ` · ${s.spill_bytes_gb.toFixed(1)} GB` : ""}` },
 		{ label: "decode now", value: s.tok_s ? `${Math.round(s.tok_s)} tok/s (queue ${s.queue ?? 0}, ${s.live_state ?? "?"})` : "idle" },
-		{ label: "best recent", value: best ? `${Math.round(best)} tok/s` : "no completed requests" },
+		{ label: "best recent", value: best !== undefined ? `${Math.round(best)} tok/s` : "no completed requests" },
 		moeCacheRow(s.requests),
 	];
 }
@@ -210,8 +231,11 @@ export interface SwapWatchHandle {
  * Start watching a swap the caller is about to drive: sample /health (phase/percent) every 2 s.
  * The row is only written when the router actually swapped (a swap object observed, or the
  * resident lane differed at start); a no-op "load the resident entry" produces nothing.
+ *
+ * `onSample` reports each sample's percent as it arrives, so the status row can animate the load
+ * (the multicolored "switching" line) instead of showing one static word for 20 seconds.
  */
-export function startSwapWatch(to: string, moe?: LaneMoe): SwapWatchHandle {
+export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: number | undefined) => void): SwapWatchHandle {
 	const t0 = Date.now();
 	const percentPath: number[] = [];
 	let sawSwap = false;
@@ -220,8 +244,15 @@ export function startSwapWatch(to: string, moe?: LaneMoe): SwapWatchHandle {
 		while (!stopped && Date.now() - t0 < 120_000) {
 			const h = await fetchJson<Record<string, any>>(`${ROUTER}/health?phase=load:${to.replace(/[^a-z0-9]+/gi, "_")}`, 2000);
 			if (h?.swap) sawSwap = true;
-			if (typeof h?.percent === "number") percentPath.push(h.percent);
-			if (h?.loaded === to && h?.loading === false) break;
+			const pct = typeof h?.percent === "number" ? h.percent : undefined;
+			if (pct !== undefined) percentPath.push(pct);
+			onSample?.(pct);
+			// basalt 0.4.0 names the resident lane under `model` and answers `loaded` as a boolean, so
+			// the old `h.loaded === to` test could NEVER fire on this router: every swap ran out the
+			// full 120 s window and the row's percent never moved. The string form stays as the
+			// pre-0.4 / rig shape.
+			const resident = typeof h?.model === "string" ? h.model : typeof h?.loaded === "string" ? h.loaded : undefined;
+			if (resident !== undefined && resident === to && (h?.loading === false || h?.loaded === true)) break;
 			await new Promise((r) => setTimeout(r, 2000));
 		}
 		stopped = true;

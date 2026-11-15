@@ -1,48 +1,46 @@
 /**
- * The compact pill and the Ctrl+O overlay.
+ * The status row and the redaction boundary.
  *
- * Main pane: ONE status line at the TOP, above the editor, carrying the FULL lane name —
- * `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O]` — and NOTHING multi-line
- * above the editor while a run is live (the monolith painted a 6+ line task dump there; during
- * long coding runs that dump ate the transcript).
+ * Main pane: ONE status line at the TOP, docked above the editor, in the operator's own words
+ * (2026-11-15: "use a nerdfont … and just say Orchestrator: plan R1/6 T0/0"):
+ *   󰚩 Orchestrator: plan R1/6 · T0/0 · [Ctrl+O]
+ * and NOTHING multi-line above the editor while a run is live (the monolith painted a 6+ line task
+ * dump there; during long coding runs that dump ate the transcript).
  *
- * Placement (operator order 2026-11-15, second act: "I want the status for orchestrate to exist at
- * the top and it shouldn't always be there, only when in use … no footer for now"): the row lives
- * in `ctx.ui.setWidget(TOP_WIDGET_KEY, …)`, which the host docks above the editor. The footer
- * extension-status row (`ctx.ui.setStatus`) is NOT written at all — no footer for now. And the
- * widget is written ONLY while a run is in use: `topStatus` answers `undefined` for no run, for a
- * terminal state (`complete`/`failed`/`stopped`) and for a run this session does not own, and the
- * caller clears the widget in every one of those cases.
+ * Placement. The row lives in `ctx.ui.setWidget(TOP_WIDGET_KEY, …)`. The host's status BAR cannot
+ * carry it where the operator first asked — immediately after the model name — measured in the
+ * host's own renderer: `setStatus` text is printed in the `status` segment at the position the
+ * USER's `statusLine.leftSegments`/`rightSegments` put it (on this box: the right side, after
+ * `context_pct`), and an extension has no API to add a status-line segment or to move one. So the
+ * top row is the delivered surface, and `FADE_ORCHESTRATE_SURFACE=status` opts into
+ * `ctx.ui.setStatus(ORCH_STATUS_KEY, …)` for a config that placed the `status` segment after
+ * `model`. The footer extension-status row is otherwise never written ("no footer for now").
  *
- * Overlay: `ctx.ui.custom(..., {overlay:true})` with keyboard focus. Keys: s skip, v verify,
- * r reset, h halt, c code, esc/q close. Outside interactive mode (RPC/print, `ctx.hasUI` false)
- * the SAME lines go to a widget, which is what the headless rig asserts.
+ * The row is written ONLY while a run is in use: `statusLines` answers `undefined` for no run, for
+ * a terminal state (`complete`/`failed`/`stopped`, including a run adopted from disk at
+ * session_start) and for a run this session does not own, and the caller clears the surface in
+ * every one of those cases.
+ *
+ * `chordBytes` maps the configured key to the raw byte the raw-input listener consumes: the host
+ * reserves `ctrl+o` in its shortcut table (measured: a reserved chord is logged and skipped by
+ * `getShortcuts()`), so the panel is delivered by intercepting the keystroke, never by registering it.
  */
 import { hostname, userInfo } from "node:os";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { RunState } from "./core.ts";
 import { TERMINAL } from "./core.ts";
-import type { SwapRow } from "./history.ts";
 
 export interface TierRow {
 	label: string;
 	value: string;
 }
 
-export interface OverlayData {
-	run: RunState;
-	swaps: SwapRow[];
-	tiers: TierRow[];
-	/** Y21: the lane churn the flip guard observed, rendered as its own paragraph. */
-	flip?: FlipBadge;
-	/** The previous round's verifier critique (notes + failing checks), verbatim. */
-	critique?: string;
-}
-
 export const OVERLAY_WIDGET_KEY = "fade-overlay";
 
-/** The top-of-editor status widget. `TOP_WIDGET_KEY` is the ONLY surface the pill is drawn on. */
+/** The top-of-editor status widget. `TOP_WIDGET_KEY` is the surface the status row is drawn on. */
 export const TOP_WIDGET_KEY = "fade-top";
+
+/** The status-bar key for the opt-in `FADE_ORCHESTRATE_SURFACE=status` placement. */
+export const ORCH_STATUS_KEY = "fade-orch";
 
 /**
  * `FADE_ORCHESTRATE_REDACT=1` makes the bar safe to screenshot: no username, no home path, no
@@ -106,24 +104,137 @@ function shown(text: string, run: RunState): string {
 }
 
 /**
- * The status line: lane, state, round, task tally, the overlay key, the protocol-stall
- * badge when the Tier-1 gate is counting, and the tok/s suffix last.
+ * The leading glyph. A Nerd Font private-use codepoint by default, overridable for a terminal
+ * without one (`FADE_ORCHESTRATE_GLYPH="⚡"`); an empty value drops the glyph and the space.
  */
-export function pill(run: RunState, suffix?: string): string {
-	return shown(renderPill(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix), run);
+export function orchGlyph(): string {
+	return process.env.FADE_ORCHESTRATE_GLYPH ?? "󰚩";
 }
 
-/** Narrow-terminal fallback: 2-character lane tag, short state (`⚡ de:code · R1/6 …`). */
-export function pillCompact(run: RunState, suffix?: string): string {
-	return shown(renderPill(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix), run);
+/**
+ * The byte form a chord produces, which is what a raw-input listener compares against.
+ *
+ *  - `ctrl+<letter>` is a control code: `ctrl+o` -> 0x0f.
+ *  - `alt+<letter>` is ESC + the letter: `alt+f` -> `\x1bf`.
+ *  - `alt+shift+<letter>` is ESC + the uppercase letter, so it is byte-distinct from `alt+<letter>`
+ *    — and this is the family the panel lives in: the host's runtime reports `alt+f` bound to
+ *    `tui.editor.cursorWordRight` and `alt+shift+f` FREE (measured through its own conflict probe).
+ *
+ * `ctrl+shift+<letter>` is deliberately NOT here: on a TTY, shift is invisible inside a control
+ * code, and that is measured, not inferred — in the pty rig a `ctrl+shift+t` keystroke arrived as
+ * `ctrl+t` and ran the host's ctrl+t action, and the pane answered "Thinking blocks: visible".
+ * A chord that must be distinct from a control code has to be an `alt+…` chord.
+ */
+export function chordBytes(key: string): string | undefined {
+	const k = key.trim().toLowerCase();
+	const ctrl = /^ctrl\+([a-z])$/.exec(k);
+	if (ctrl) return String.fromCharCode((ctrl[1] as string).charCodeAt(0) - 96);
+	const altShift = /^alt\+shift\+([a-z])$/.exec(k);
+	if (altShift) return `\x1b${(altShift[1] as string).toUpperCase()}`;
+	const alt = /^alt\+([a-z])$/.exec(k);
+	if (alt) return `\x1b${alt[1] as string}`;
+	return undefined;
 }
 
-function renderPill(tag: string, run: RunState, suffix?: string): string {
+/** The chord as a row labels it: `ctrl+o` → `Ctrl+O`, `alt+shift+f` → `Alt+Shift+F`. Never bare lowercase. */
+export function keyLabel(key: string): string {
+	return key
+		.trim()
+		.toLowerCase()
+		.split("+")
+		.map((part) => (part === "ctrl" ? "Ctrl" : part === "alt" ? "Alt" : part === "shift" ? "Shift" : part.toUpperCase()))
+		.join("+");
+}
+
+/**
+ * The model segment, abbreviated to the operator's form of 2026-11-15:
+ *   "flash-next (Swift Flash Next IQ3_S, dual RTX 5090)"                        -> "flash-next (IQ3_S, dual)"
+ *   "deepseek (Basalt DeepSeek-V4.1-Flash UD-IQ1_M, dual RTX 5090, 122 GiB SSD)" -> "deepseek (IQ1_M, dual)"
+ * The quant and the GPU count are the two facts that change the loop's economics; the version, the
+ * family word and the RAM tier are noise on a 100-column row. A name carrying neither passes its
+ * base segment through, so an unknown model is never masked.
+ */
+export function modelLabel(name: string): string {
+	const paren = name.indexOf("(");
+	// A bare model id (no display-name parenthetical) is already the operator's form: pass it through.
+	if (paren < 0) return name.trim();
+	const base = name.slice(0, paren).trim();
+	if (base === "") return name.trim();
+	const quant = /(IQ\d+[A-Za-z0-9_]*|Q[0-8]_[A-Za-z0-9]+)/i.exec(name);
+	const hw = /\b(dual|tri|quad|single)\b/i.exec(name);
+	const bits = [quant ? quant[1] : "", hw ? hw[1].toLowerCase() : ""].filter(Boolean);
+	return bits.length > 0 ? `${base} (${bits.join(", ")})` : base;
+}
+
+/**
+ * A per-character hue ramp. The row that names a lane switch is colored by design (operator order
+ * 2026-11-15: "when actively switching, it should be a multicolored text"), and the percent drives
+ * the phase, so each repaint visibly moves the ramp: the row is a progress bar the eye can catch in
+ * the corner of the screen. A steady run prints NO escape codes at all — the color means "working".
+ */
+export function ramp(text: string, phase = 0): string {
+	const chars = [...text];
+	if (chars.length === 0) return text;
+	const hslRgb = (h: number, s: number, l: number): [number, number, number] => {
+		const k = (n: number) => (n + h / 30) % 12;
+		const a = s * Math.min(l, 1 - l);
+		const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+		return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+	};
+	return chars
+		.map((c, i) => {
+			const [r, g, b] = hslRgb(((i / Math.max(1, chars.length)) * 300 + phase * 12) % 360, 0.85, 0.62);
+			return `\x1b[38;2;${r};${g};${b}m${c}\x1b[0m`;
+		})
+		.join("");
+}
+
+/** What the router is loading right now, as the row renders it. Built by the wiring layer. */
+export interface SwapPill {
+	from: string;
+	to: string;
+	percent?: number;
+}
+
+/**
+ * The live status row, and the single place the "only when in use" rule lives.
+ *
+ * `undefined` — the caller must CLEAR the surface — when there is no run, when the run is terminal
+ * (`complete`/`failed`/`stopped`, including a run adopted from disk at session_start: a finished run
+ * never advertises), and when this session does not own the run. A live run yields one line:
+ *   `<glyph> Orchestrator: <state> R<round>/<max> · T<passed>/<total> · [<key>]`
+ * with the protocol-stall badge, the paused marker and the tok/s suffix riding behind it, plus a
+ * second line naming the competing entries while the flip guard is firing. The steady line carries
+ * no model name (operator order 2026-11-15): the host's model segment is the model's surface, and
+ * printing it here would name the model a second time.
+ *
+ * While a lane is loading the line REPLACES its state segment with the switch, multicolored, and
+ * the model name appears exactly once — the abbreviated label of the lane coming in.
+ */
+export function statusLines(
+	run: RunState | undefined,
+	opts: { suffix?: string; flip?: FlipBadge; owned?: boolean; swap?: SwapPill; key?: string } = {},
+): string[] | undefined {
+	if (!run) return undefined;
+	if (TERMINAL[run.state] === true) return undefined;
+	if (opts.owned === false) return undefined;
 	const total = run.tasks.length;
 	const passed = run.tasks.filter((t) => t.status === "passed").length;
 	const stall = (run.stall_count ?? 0) > 0 ? ` · protocol ${run.stall_count}/3` : "";
 	const paused = run.paused === true ? " · paused" : "";
-	return `⚡ ${tag} · R${run.round}/${run.max_rounds} · T${passed}/${total} · [Ctrl+O]${stall}${paused}${suffix ? ` · ${suffix}` : ""}`;
+	const glyph = orchGlyph();
+	const head = glyph === "" ? "" : `${glyph} `;
+	// The open-key hint rides the configured chord, never a literal, so the row and the key agree.
+	const hint = `[${opts.key ?? "Ctrl+O"}]`;
+	if (opts.swap) {
+		const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
+		const line = `${head}Orchestrator: switching ${opts.swap.from}→${opts.swap.to}${pct} · ${hint}${stall}${paused}`;
+		return [shown(ramp(line, opts.swap.percent ?? 0), run)];
+	}
+	const line = `${head}Orchestrator: ${shortState(run.state)} R${run.round}/${run.max_rounds} · T${passed}/${total} · ${hint}${stall}${paused}${opts.suffix ? ` · ${opts.suffix}` : ""}`;
+	if (!opts.flip || opts.flip.flips < 1) return [shown(line, run)];
+	const who = opts.flip.competing.length > 0 ? opts.flip.competing.join(", ") : "the other lane";
+	return [shown(line, run), shown(`  lane flip: ${opts.flip.flips} swaps in ${opts.flip.window_s}s — requests naming ${who} (not ${run.lane})`, run)];
 }
 
 /**
@@ -138,32 +249,8 @@ export interface FlipBadge {
 }
 
 /**
- * The top-of-editor status lines, and the single place the "only when in use" rule lives.
- *
- * `undefined` — the caller must CLEAR the widget — when there is no run, when the run is terminal
- * (`complete`/`failed`/`stopped`, including a run adopted from disk at session_start: a finished
- * run never advertises), and when this session does not own the run. A live run yields the pill
- * line, plus a flip line naming the competing entries when the guard is firing.
- */
-export function topStatus(
-	run: RunState | undefined,
-	opts: { suffix?: string; flip?: FlipBadge; owned?: boolean; cols?: number } = {},
-): string[] | undefined {
-	if (!run) return undefined;
-	if (TERMINAL[run.state] === true) return undefined;
-	if (opts.owned === false) return undefined;
-	const narrow = opts.cols !== undefined && opts.cols < 72;
-	const line = narrow ? pillCompact(run, opts.suffix) : pill(run, opts.suffix);
-	if (!opts.flip || opts.flip.flips < 1) return [line];
-	const who = opts.flip.competing.length > 0 ? opts.flip.competing.join(", ") : "the other lane";
-	return [line, `  lane flip: ${opts.flip.flips} swaps in ${opts.flip.window_s}s — requests naming ${who} (not ${run.lane})`];
-}
-
-/**
- * Short lane name, used only by `pillCompact`/`statusTagCompact`: "flash-next" -> "fn",
- * "deepseek" -> "de". The host truncates the status row at the terminal width, so on a narrow
- * terminal the full lane name would be cut with "…" and the tally with it; the tag keeps the line
- * readable there. `/orchestrate status` and the overlay print the FULL name, always.
+ * Short lane name, used by the panel's compact rows: "flash-next" -> "fn", "deepseek" -> "de".
+ * `/orchestrate status` and the panel's header print the FULL name, always.
  */
 export function laneTag(lane: string): string {
 	const m = /^(.*?)-(.*?)(?:-|$)/.exec(lane);
@@ -184,118 +271,10 @@ const SHORT_STATE: Record<string, string> = {
 };
 
 /**
- * The footer tag with the FULL lane name (`deepseek:code`) — the row has the room, and the model
- * identifier above it is longer. An unknown future state passes through untruncated rather than
- * being masked.
+ * The state machine's short name (`planning` -> `plan`), exported for the panel's rows. An unknown
+ * future state passes through untruncated rather than being masked.
  */
-export function statusTag(run: RunState): string {
-	return shown(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run);
+export function shortState(state: string): string {
+	return SHORT_STATE[state] ?? state;
 }
 
-/** The narrow-terminal tag (`de:code`). */
-export function statusTagCompact(run: RunState): string {
-	return shown(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run);
-}
-
-/** The overlay body, untruncated: full objectives, acceptances, results, swap rows, tiers. Each line is redacted on the way out. */
-export function overlayLines(d: OverlayData): string[] {
-	const { run } = d;
-	const out: string[] = [];
-	out.push(`fade-orchestrator ${run.run_id} · ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds}${run.tier ? ` · tier ${run.tier}` : ""}`);
-	out.push(`goal: ${run.goal}`);
-	if (run.paused === true) out.push(`paused: the loop is stopped for manual edits${run.operator_note ? ` · operator note: ${run.operator_note}` : ""}`);
-	if ((run.protocol_retries ?? 0) > 0) {
-		out.push(`protocol: ${run.protocol_retries} turn(s) ended without fade_phase · consecutive stalls ${run.stall_count ?? 0}/3${run.synthesized ? ` · auto-synthesized ${run.synthesized.phase} at round ${run.synthesized.round}` : ""}`);
-	}
-	if (run.state === "stalled_protocol_error") {
-		out.push(`PROTOCOL STALL (Tier-3 circuit breaker): the lane ended ${run.stall_count ?? 3} turns in a row without a fade_phase call, so the run is halted and NO lane was loaded.`);
-		out.push("  acts: [c] resume on the code lane · [r] reset the round · [p] pause for a manual edit · /orchestrate status reads state.json");
-	}
-	if (d.flip && d.flip.flips > 0) {
-		out.push("");
-		out.push(`lane flip: ${d.flip.flips} swaps in ${d.flip.window_s}s — requests naming ${d.flip.competing.join(", ") || "the other lane"}; the router answers a queued request by swapping to the entry it names, so this churn is NOT the loop's`);
-		out.push("  acts: bash scripts/ops/omp_flip_probe.sh names the client; .omp/config.yml pins the utility roles off the swappable lane");
-	}
-	out.push("");
-	out.push("tasks (untruncated):");
-	const pool = run.repair_tasks.length > 0 ? run.repair_tasks : run.tasks;
-	for (const t of run.tasks) {
-		const inRepair = pool.some((r) => r.id === t.id);
-		out.push(`  ${t.id} [${t.status ?? "pending"}]${inRepair ? " (in repair)" : ""}  ${t.objective}`);
-		out.push(`      files: ${t.files.join(", ")} · deps: ${t.dependencies.length ? t.dependencies.join(",") : "-"} · round ${t.round}`);
-		out.push(`      acceptance: ${t.acceptance}`);
-		if (t.result) out.push(`      result: ${t.result}`);
-		if (run.checkpoints?.[t.id]) out.push(`      tag: ${run.checkpoints[t.id]}`);
-	}
-	out.push("");
-	out.push("basalt swap latency (newest first):");
-	if (d.swaps.length === 0) out.push("  (no swaps recorded yet)");
-	for (const s of d.swaps) {
-		const moe = s.moe ? (s.moe.state === "unsupported" ? " · MoE relearned" : s.moe.profile_exists ? " · MoE warm start" : " · MoE cold start") : "";
-		const ramp = s.ramp === "map_restored" ? " · MoE Map: Restored" : s.ramp === "hot_steady" ? ` · MoE: Hot Steady State (${Math.round(s.steady_tg)} tok/s)` : s.ramp === "cold_ramp" ? " · MoE: Cold Ramp" : "";
-		out.push(`  ${s.from} -> ${s.to}  ${s.elapsed_s.toFixed(1)} s · first tg ${Math.round(s.first_tg)} -> steady ${Math.round(s.steady_tg)}${ramp}${moe} · ${s.at}`);
-	}
-	out.push("");
-	out.push("memory / engine tiers:");
-	for (const t of d.tiers) out.push(`  ${t.label}: ${t.value}`);
-	out.push("");
-	out.push("last verifier critique:");
-	out.push(...(d.critique ? d.critique.split("\n").map((l) => `  ${l}`) : ["  (none this round)"]));
-	const rej = (run.rejection_history ?? []).slice(-5);
-	if (rej.length > 0) {
-		out.push("");
-		out.push("recent rejections (do not repeat):");
-		for (const r of rej) out.push(`  round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
-	}
-	out.push("");
-	out.push("[s] skip task  [v] verify now  [r] reset round  [p] pause/resume  [c] code  [h] halt  [esc] close");
-	return out.map((l) => shown(l, run));
-}
-
-/**
- * Open the overlay. `onAction` receives the key pressed (s/v/r/p/c/h) so the caller applies the
- * keymap directive. In non-UI modes the lines go to a widget (visible in RPC frames) and no
- * action is awaited.
- */
-export async function openOverlay(ctx: ExtensionContext, data: OverlayData, onAction?: (key: string) => void, widgetOnly = false): Promise<void> {
-	if (widgetOnly || ctx.hasUI !== true) {
-		ctx.ui.setWidget(OVERLAY_WIDGET_KEY, overlayLines(data));
-		return;
-	}
-	try {
-		const action = await ctx.ui.custom<string>((_tui, theme, _kb, done) => new OverlayComponent(data, theme, done), {
-			overlay: true,
-			overlayOptions: { width: "80%", maxHeight: "80%" },
-		});
-		if (action && onAction) onAction(action);
-	} catch {
-		// No overlay backend (older host): the same content as a widget, then closed keys.
-		ctx.ui.setWidget(OVERLAY_WIDGET_KEY, overlayLines(data));
-	}
-}
-
-/** Minimal pi-tui Component: plain lines (no theme math), one-key actions, esc closes. */
-class OverlayComponent {
-	private body: string[];
-	private done: (result: string) => void;
-	private themeFiller: unknown;
-
-	constructor(data: OverlayData, theme: unknown, done: (result: string) => void) {
-		this.body = overlayLines(data);
-		this.themeFiller = theme;
-		this.done = done;
-	}
-	invalidate(): void {
-		// Plain string lines: nothing cached to drop. The host calls this before re-render.
-	}
-
-	render(width: number): string[] {
-		void this.themeFiller;
-		return this.body.map((l) => (l.length > width ? l.slice(0, width - 1) + "…" : l));
-	}
-
-	handleInput(data: string): void {
-		if (data === "\x1b" || data === "q") return this.done("close");
-		if (data === "s" || data === "v" || data === "r" || data === "p" || data === "c" || data === "h") return this.done(data);
-	}
-}

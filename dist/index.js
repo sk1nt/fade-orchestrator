@@ -589,6 +589,7 @@ var LANES_LABEL = `${THINK_LANE} plans and verifies; ${CODE_LANE} codes.`;
 import { hostname, userInfo } from "node:os";
 var OVERLAY_WIDGET_KEY = "fade-overlay";
 var TOP_WIDGET_KEY = "fade-top";
+var ORCH_STATUS_KEY = "fade-orch";
 function redactOn() {
   return process.env.FADE_ORCHESTRATE_REDACT === "1";
 }
@@ -624,33 +625,66 @@ function redact(text, on, repo) {
 function shown(text, run) {
   return redact(text, redactOn(), run.repo);
 }
-function pill(run, suffix) {
-  return shown(renderPill(`${run.lane}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix), run);
+function orchGlyph() {
+  return process.env.FADE_ORCHESTRATE_GLYPH ?? "\u{F06A9}";
 }
-function pillCompact(run, suffix) {
-  return shown(renderPill(`${laneTag(run.lane)}:${SHORT_STATE[run.state] ?? run.state}`, run, suffix), run);
+function chordBytes(key) {
+  const k = key.trim().toLowerCase();
+  const ctrl = /^ctrl\+([a-z])$/.exec(k);
+  if (ctrl) return String.fromCharCode(ctrl[1].charCodeAt(0) - 96);
+  const altShift = /^alt\+shift\+([a-z])$/.exec(k);
+  if (altShift) return `\x1B${altShift[1].toUpperCase()}`;
+  const alt = /^alt\+([a-z])$/.exec(k);
+  if (alt) return `\x1B${alt[1]}`;
+  return void 0;
 }
-function renderPill(tag, run, suffix) {
+function keyLabel(key) {
+  return key.trim().toLowerCase().split("+").map((part) => part === "ctrl" ? "Ctrl" : part === "alt" ? "Alt" : part === "shift" ? "Shift" : part.toUpperCase()).join("+");
+}
+function modelLabel(name) {
+  const paren = name.indexOf("(");
+  if (paren < 0) return name.trim();
+  const base = name.slice(0, paren).trim();
+  if (base === "") return name.trim();
+  const quant = /(IQ\d+[A-Za-z0-9_]*|Q[0-8]_[A-Za-z0-9]+)/i.exec(name);
+  const hw = /\b(dual|tri|quad|single)\b/i.exec(name);
+  const bits = [quant ? quant[1] : "", hw ? hw[1].toLowerCase() : ""].filter(Boolean);
+  return bits.length > 0 ? `${base} (${bits.join(", ")})` : base;
+}
+function ramp(text, phase = 0) {
+  const chars = [...text];
+  if (chars.length === 0) return text;
+  const hslRgb = (h, s, l) => {
+    const k = (n) => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+  };
+  return chars.map((c, i) => {
+    const [r, g, b] = hslRgb((i / Math.max(1, chars.length) * 300 + phase * 12) % 360, 0.85, 0.62);
+    return `\x1B[38;2;${r};${g};${b}m${c}\x1B[0m`;
+  }).join("");
+}
+function statusLines(run, opts = {}) {
+  if (!run) return void 0;
+  if (TERMINAL[run.state] === true) return void 0;
+  if (opts.owned === false) return void 0;
   const total = run.tasks.length;
   const passed = run.tasks.filter((t) => t.status === "passed").length;
   const stall = (run.stall_count ?? 0) > 0 ? ` \xB7 protocol ${run.stall_count}/3` : "";
   const paused = run.paused === true ? " \xB7 paused" : "";
-  return `\u26A1 ${tag} \xB7 R${run.round}/${run.max_rounds} \xB7 T${passed}/${total} \xB7 [Ctrl+O]${stall}${paused}${suffix ? ` \xB7 ${suffix}` : ""}`;
-}
-function topStatus(run, opts = {}) {
-  if (!run) return void 0;
-  if (TERMINAL[run.state] === true) return void 0;
-  if (opts.owned === false) return void 0;
-  const narrow = opts.cols !== void 0 && opts.cols < 72;
-  const line = narrow ? pillCompact(run, opts.suffix) : pill(run, opts.suffix);
-  if (!opts.flip || opts.flip.flips < 1) return [line];
+  const glyph = orchGlyph();
+  const head = glyph === "" ? "" : `${glyph} `;
+  const hint = `[${opts.key ?? "Ctrl+O"}]`;
+  if (opts.swap) {
+    const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
+    const line2 = `${head}Orchestrator: switching ${opts.swap.from}\u2192${opts.swap.to}${pct} \xB7 ${hint}${stall}${paused}`;
+    return [shown(ramp(line2, opts.swap.percent ?? 0), run)];
+  }
+  const line = `${head}Orchestrator: ${shortState(run.state)} R${run.round}/${run.max_rounds} \xB7 T${passed}/${total} \xB7 ${hint}${stall}${paused}${opts.suffix ? ` \xB7 ${opts.suffix}` : ""}`;
+  if (!opts.flip || opts.flip.flips < 1) return [shown(line, run)];
   const who = opts.flip.competing.length > 0 ? opts.flip.competing.join(", ") : "the other lane";
-  return [line, `  lane flip: ${opts.flip.flips} swaps in ${opts.flip.window_s}s \u2014 requests naming ${who} (not ${run.lane})`];
-}
-function laneTag(lane) {
-  const m = /^(.*?)-(.*?)(?:-|$)/.exec(lane);
-  if (m) return `${m[1][0]}${m[2][0]}`;
-  return lane.length > 4 ? lane.slice(0, 2) : lane;
+  return [shown(line, run), shown(`  lane flip: ${opts.flip.flips} swaps in ${opts.flip.window_s}s \u2014 requests naming ${who} (not ${run.lane})`, run)];
 }
 var SHORT_STATE = {
   planning: "plan",
@@ -662,94 +696,9 @@ var SHORT_STATE = {
   stopped: "stop",
   stalled_protocol_error: "stall"
 };
-function overlayLines(d) {
-  const { run } = d;
-  const out = [];
-  out.push(`fade-orchestrator ${run.run_id} \xB7 ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds}${run.tier ? ` \xB7 tier ${run.tier}` : ""}`);
-  out.push(`goal: ${run.goal}`);
-  if (run.paused === true) out.push(`paused: the loop is stopped for manual edits${run.operator_note ? ` \xB7 operator note: ${run.operator_note}` : ""}`);
-  if ((run.protocol_retries ?? 0) > 0) {
-    out.push(`protocol: ${run.protocol_retries} turn(s) ended without fade_phase \xB7 consecutive stalls ${run.stall_count ?? 0}/3${run.synthesized ? ` \xB7 auto-synthesized ${run.synthesized.phase} at round ${run.synthesized.round}` : ""}`);
-  }
-  if (run.state === "stalled_protocol_error") {
-    out.push(`PROTOCOL STALL (Tier-3 circuit breaker): the lane ended ${run.stall_count ?? 3} turns in a row without a fade_phase call, so the run is halted and NO lane was loaded.`);
-    out.push("  acts: [c] resume on the code lane \xB7 [r] reset the round \xB7 [p] pause for a manual edit \xB7 /orchestrate status reads state.json");
-  }
-  if (d.flip && d.flip.flips > 0) {
-    out.push("");
-    out.push(`lane flip: ${d.flip.flips} swaps in ${d.flip.window_s}s \u2014 requests naming ${d.flip.competing.join(", ") || "the other lane"}; the router answers a queued request by swapping to the entry it names, so this churn is NOT the loop's`);
-    out.push("  acts: bash scripts/ops/omp_flip_probe.sh names the client; .omp/config.yml pins the utility roles off the swappable lane");
-  }
-  out.push("");
-  out.push("tasks (untruncated):");
-  const pool = run.repair_tasks.length > 0 ? run.repair_tasks : run.tasks;
-  for (const t of run.tasks) {
-    const inRepair = pool.some((r) => r.id === t.id);
-    out.push(`  ${t.id} [${t.status ?? "pending"}]${inRepair ? " (in repair)" : ""}  ${t.objective}`);
-    out.push(`      files: ${t.files.join(", ")} \xB7 deps: ${t.dependencies.length ? t.dependencies.join(",") : "-"} \xB7 round ${t.round}`);
-    out.push(`      acceptance: ${t.acceptance}`);
-    if (t.result) out.push(`      result: ${t.result}`);
-    if (run.checkpoints?.[t.id]) out.push(`      tag: ${run.checkpoints[t.id]}`);
-  }
-  out.push("");
-  out.push("basalt swap latency (newest first):");
-  if (d.swaps.length === 0) out.push("  (no swaps recorded yet)");
-  for (const s of d.swaps) {
-    const moe = s.moe ? s.moe.state === "unsupported" ? " \xB7 MoE relearned" : s.moe.profile_exists ? " \xB7 MoE warm start" : " \xB7 MoE cold start" : "";
-    const ramp = s.ramp === "map_restored" ? " \xB7 MoE Map: Restored" : s.ramp === "hot_steady" ? ` \xB7 MoE: Hot Steady State (${Math.round(s.steady_tg)} tok/s)` : s.ramp === "cold_ramp" ? " \xB7 MoE: Cold Ramp" : "";
-    out.push(`  ${s.from} -> ${s.to}  ${s.elapsed_s.toFixed(1)} s \xB7 first tg ${Math.round(s.first_tg)} -> steady ${Math.round(s.steady_tg)}${ramp}${moe} \xB7 ${s.at}`);
-  }
-  out.push("");
-  out.push("memory / engine tiers:");
-  for (const t of d.tiers) out.push(`  ${t.label}: ${t.value}`);
-  out.push("");
-  out.push("last verifier critique:");
-  out.push(...d.critique ? d.critique.split("\n").map((l) => `  ${l}`) : ["  (none this round)"]);
-  const rej = (run.rejection_history ?? []).slice(-5);
-  if (rej.length > 0) {
-    out.push("");
-    out.push("recent rejections (do not repeat):");
-    for (const r of rej) out.push(`  round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
-  }
-  out.push("");
-  out.push("[s] skip task  [v] verify now  [r] reset round  [p] pause/resume  [c] code  [h] halt  [esc] close");
-  return out.map((l) => shown(l, run));
+function shortState(state) {
+  return SHORT_STATE[state] ?? state;
 }
-async function openOverlay(ctx, data, onAction, widgetOnly = false) {
-  if (widgetOnly || ctx.hasUI !== true) {
-    ctx.ui.setWidget(OVERLAY_WIDGET_KEY, overlayLines(data));
-    return;
-  }
-  try {
-    const action = await ctx.ui.custom((_tui, theme, _kb, done) => new OverlayComponent(data, theme, done), {
-      overlay: true,
-      overlayOptions: { width: "80%", maxHeight: "80%" }
-    });
-    if (action && onAction) onAction(action);
-  } catch {
-    ctx.ui.setWidget(OVERLAY_WIDGET_KEY, overlayLines(data));
-  }
-}
-var OverlayComponent = class {
-  body;
-  done;
-  themeFiller;
-  constructor(data, theme, done) {
-    this.body = overlayLines(data);
-    this.themeFiller = theme;
-    this.done = done;
-  }
-  invalidate() {
-  }
-  render(width) {
-    void this.themeFiller;
-    return this.body.map((l) => l.length > width ? l.slice(0, width - 1) + "\u2026" : l);
-  }
-  handleInput(data) {
-    if (data === "\x1B" || data === "q") return this.done("close");
-    if (data === "s" || data === "v" || data === "r" || data === "p" || data === "c" || data === "h") return this.done(data);
-  }
-};
 
 // src/keymap.ts
 function actSkip(run, task) {
@@ -830,88 +779,28 @@ function appendTurn(dir, rec) {
   appendFileSync(join2(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}
 `);
 }
-
-// src/moe.ts
-import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
-import { join as join3 } from "node:path";
-var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
-function readServeConfig(path) {
-  if (!path) return void 0;
+function readTurns(dir, n) {
+  let raw;
   try {
-    const raw = JSON.parse(readFileSync3(path, "utf8"));
-    const models = {};
-    for (const m of raw.models ?? []) {
-      const alias = String(m.alias ?? m.model ?? "");
-      if (alias) models[alias] = m;
+    raw = readFileSync2(join2(dir, METRICS_JSONL_FILENAME), "utf8");
+  } catch {
+    return [];
+  }
+  const recs = [];
+  for (const line of raw.split("\n")) {
+    const text = line.trim();
+    if (text === "") continue;
+    try {
+      const rec = JSON.parse(text);
+      if (rec && typeof rec === "object" && typeof rec.pp === "number" && typeof rec.tg === "number") recs.push(rec);
+    } catch {
     }
-    return { models };
-  } catch {
-    return void 0;
   }
-}
-function runningEngineArgs() {
-  try {
-    for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
-      let cmd;
-      try {
-        cmd = readFileSync3(join3("/proc", pid, "cmdline"), "utf8");
-      } catch {
-        continue;
-      }
-      if (/\bbasalt\b/.test(cmd) && /--serve|serve\b/.test(cmd)) return cmd.split("\0").join(" ");
-    }
-  } catch {
-  }
-  return void 0;
-}
-function laneMoe(lane, opts = {}) {
-  const cfg = readServeConfig(opts.configPath);
-  const model = cfg?.models?.[lane];
-  const savePath = model && typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : void 0;
-  const saveCapable = FLASH_NEXT_SAVE_CAPABLE.test(lane) || model && String(model.model ?? "").toLowerCase().includes("qwen");
-  if (!savePath && !saveCapable) {
-    return { lane, state: "unsupported", profile_exists: false, note: "engine has no save path for this pack (Flash-Next only); placement is relearned every swap" };
-  }
-  if (!savePath) {
-    return {
-      lane,
-      state: "configured",
-      profile_exists: false,
-      note: 'save-capable pack: the serve config does not set "expert-profile-save" (operator act: add it at the model alias, then reload the lane)'
-    };
-  }
-  const live = opts.liveCmdline;
-  const isLive = live === void 0 ? true : live.includes("--expert-profile-save") && live.includes(savePath);
-  let exists = false;
-  let age_s;
-  try {
-    const st = statSync(savePath);
-    exists = st.isFile();
-    age_s = (Date.now() - st.mtimeMs) / 1e3;
-  } catch {
-    exists = false;
-  }
-  return {
-    lane,
-    state: isLive ? "live" : "configured",
-    profile_path: savePath,
-    profile_exists: exists,
-    ...age_s !== void 0 ? { profile_age_s: age_s } : {},
-    note: isLive ? void 0 : "configured, NOT live: the running engine was started before the flag existed (reload the lane to apply)"
-  };
-}
-function moeRows(lanes, opts = {}) {
-  const live = opts.liveCmdline ?? runningEngineArgs();
-  return lanes.map((lane) => {
-    const m = laneMoe(lane, { ...opts, liveCmdline: live });
-    const age = m.profile_age_s !== void 0 ? `${(m.profile_age_s / 3600).toFixed(1)} h old` : "no file";
-    const value = m.state === "unsupported" ? "unsupported (Flash-Next only; relearned per swap)" : m.state === "configured" && !m.profile_path ? "not configured (add expert-profile-save, reload lane)" : `${m.state} \xB7 ${m.profile_exists ? age : "no profile yet"}${m.profile_exists ? " \xB7 warm start" : ""}`;
-    return { label: `MoE ${lane}`, value };
-  });
+  return recs.slice(Math.max(0, recs.length - n));
 }
 
 // src/livedata.ts
-import { join as join4 } from "node:path";
+import { join as join3 } from "node:path";
 var METRICS_FILENAME = "metrics_state.json";
 async function fetchJson(url, timeoutMs = 1500) {
   const ac = new AbortController();
@@ -977,13 +866,17 @@ async function fetchMetrics() {
   if (!m && !h) return void 0;
   const mm = m ?? {};
   const hh = h ?? {};
+  const laneKey = (v) => typeof v === "string" && v.length > 0 ? v : void 0;
   const eng = mm.engine ?? {};
   const spill = eng.spill ?? mm.spill;
   const bytes = typeof spill?.bytes === "number" ? spill.bytes : void 0;
   const slots = typeof eng.expert_slots === "number" ? eng.expert_slots : mm.expert_slots?.total;
   const liveQueued = mm.live?.queued ?? mm.live?.slots?.queue_depth;
+  const lane = laneKey(hh.model) ?? laneKey(eng.model) ?? laneKey(mm.model);
+  const quant = [eng.quant, mm.quant].find((q) => typeof q === "string" && q.length > 0 && q !== lane);
+  const bestDecode = typeof mm.best?.decode?.tok_s === "number" ? mm.best.decode.tok_s : void 0;
   const snap = {
-    quant: eng.quant ?? mm.quant,
+    quant: typeof quant === "string" ? quant : void 0,
     engine_version: eng.version ?? mm.engine_version,
     slots,
     spill_experts: spill?.experts,
@@ -993,9 +886,11 @@ async function fetchMetrics() {
     live_slots: mm.live?.slots?.active,
     queue: typeof liveQueued === "number" ? liveQueued : Array.isArray(mm.queue) ? mm.queue.length : mm.queue,
     tok_s: mm.live?.tok_s,
-    loaded: hh.loaded,
-    loading: hh.loading,
-    percent: hh.percent ?? null,
+    best_decode: bestDecode,
+    loaded: lane,
+    packLoaded: typeof hh.loaded === "boolean" ? hh.loaded : void 0,
+    loading: hh.loading === true,
+    percent: typeof hh.percent === "number" ? hh.percent : null,
     requests: Array.isArray(mm.requests) ? mm.requests : void 0,
     at_utc: (/* @__PURE__ */ new Date()).toISOString()
   };
@@ -1004,13 +899,14 @@ async function fetchMetrics() {
 function tiersFromMetrics(s) {
   if (!s) return [{ label: "router", value: `${ROUTER} unreachable` }];
   const rates = (s.requests ?? []).map(rateFromRequest).filter((r) => r !== void 0);
-  const best = rates.length > 0 ? Math.max(...rates) : void 0;
+  const bestRate = Math.max(s.best_decode ?? -Infinity, ...rates.length > 0 ? rates : [-Infinity]);
+  const best = Number.isFinite(bestRate) ? bestRate : void 0;
   return [
-    { label: "engine", value: `${s.engine_version ?? "?"} quant ${s.quant ?? "?"}` },
-    { label: "resident", value: `${s.loaded ?? "?"}${s.loading ? " (loading)" : ""}${s.percent != null ? ` ${s.percent}%` : ""}` },
+    { label: "engine", value: `${s.engine_version ?? "?"}${s.quant ? ` quant ${s.quant}` : ""}` },
+    { label: "resident", value: `${s.loaded ?? (s.packLoaded === true ? "pack (lane unnamed)" : "?")}${s.loading ? " (loading)" : ""}${s.percent != null ? ` ${s.percent}%` : ""}` },
     { label: "expert slots", value: `${s.slots ?? "?"} \xB7 spill ${s.spill_experts ?? "?"}/${s.spill_total ?? "?"}${s.spill_bytes_gb !== void 0 ? ` \xB7 ${s.spill_bytes_gb.toFixed(1)} GB` : ""}` },
     { label: "decode now", value: s.tok_s ? `${Math.round(s.tok_s)} tok/s (queue ${s.queue ?? 0}, ${s.live_state ?? "?"})` : "idle" },
-    { label: "best recent", value: best ? `${Math.round(best)} tok/s` : "no completed requests" },
+    { label: "best recent", value: best !== void 0 ? `${Math.round(best)} tok/s` : "no completed requests" },
     moeCacheRow(s.requests)
   ];
 }
@@ -1019,7 +915,7 @@ function coldHot(tok_s, laneBest) {
   if (tok_s < 0.5) return { label: "idle" };
   return { label: tok_s >= 0.8 * laneBest ? "hot" : "cold", rate: tok_s };
 }
-function startSwapWatch(to, moe) {
+function startSwapWatch(to, moe, onSample) {
   const t0 = Date.now();
   const percentPath = [];
   let sawSwap = false;
@@ -1028,8 +924,11 @@ function startSwapWatch(to, moe) {
     while (!stopped && Date.now() - t0 < 12e4) {
       const h = await fetchJson(`${ROUTER}/health?phase=load:${to.replace(/[^a-z0-9]+/gi, "_")}`, 2e3);
       if (h?.swap) sawSwap = true;
-      if (typeof h?.percent === "number") percentPath.push(h.percent);
-      if (h?.loaded === to && h?.loading === false) break;
+      const pct = typeof h?.percent === "number" ? h.percent : void 0;
+      if (pct !== void 0) percentPath.push(pct);
+      onSample?.(pct);
+      const resident = typeof h?.model === "string" ? h.model : typeof h?.loaded === "string" ? h.loaded : void 0;
+      if (resident !== void 0 && resident === to && (h?.loading === false || h?.loaded === true)) break;
       await new Promise((r) => setTimeout(r, 2e3));
     }
     stopped = true;
@@ -1085,13 +984,516 @@ function laneBestRate(s, lane) {
   return rates.length > 0 ? Math.max(...rates) : void 0;
 }
 function persistMetrics(dir, snap) {
-  writeJson(join4(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
+  writeJson(join3(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
+}
+
+// src/moe.ts
+import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
+import { join as join4 } from "node:path";
+var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
+function readServeConfig(path) {
+  if (!path) return void 0;
+  try {
+    const raw = JSON.parse(readFileSync3(path, "utf8"));
+    const models = {};
+    for (const m of raw.models ?? []) {
+      const alias = String(m.alias ?? m.model ?? "");
+      if (alias) models[alias] = m;
+    }
+    return { models };
+  } catch {
+    return void 0;
+  }
+}
+function runningEngineArgs() {
+  try {
+    for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
+      let cmd;
+      try {
+        cmd = readFileSync3(join4("/proc", pid, "cmdline"), "utf8");
+      } catch {
+        continue;
+      }
+      if (/\bbasalt\b/.test(cmd) && /--serve|serve\b/.test(cmd)) return cmd.split("\0").join(" ");
+    }
+  } catch {
+  }
+  return void 0;
+}
+function laneMoe(lane, opts = {}) {
+  const cfg = readServeConfig(opts.configPath);
+  const model = cfg?.models?.[lane];
+  const savePath = model && typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : void 0;
+  const saveCapable = FLASH_NEXT_SAVE_CAPABLE.test(lane) || model && String(model.model ?? "").toLowerCase().includes("qwen");
+  if (!savePath && !saveCapable) {
+    return { lane, state: "unsupported", profile_exists: false, note: "engine has no save path for this pack (Flash-Next only); placement is relearned every swap" };
+  }
+  if (!savePath) {
+    return {
+      lane,
+      state: "configured",
+      profile_exists: false,
+      note: 'save-capable pack: the serve config does not set "expert-profile-save" (operator act: add it at the model alias, then reload the lane)'
+    };
+  }
+  const live = opts.liveCmdline;
+  const isLive = live === void 0 ? true : live.includes("--expert-profile-save") && live.includes(savePath);
+  let exists = false;
+  let age_s;
+  try {
+    const st = statSync(savePath);
+    exists = st.isFile();
+    age_s = (Date.now() - st.mtimeMs) / 1e3;
+  } catch {
+    exists = false;
+  }
+  return {
+    lane,
+    state: isLive ? "live" : "configured",
+    profile_path: savePath,
+    profile_exists: exists,
+    ...age_s !== void 0 ? { profile_age_s: age_s } : {},
+    note: isLive ? void 0 : "configured, NOT live: the running engine was started before the flag existed (reload the lane to apply)"
+  };
+}
+function moeRows(lanes, opts = {}) {
+  const live = opts.liveCmdline ?? runningEngineArgs();
+  return lanes.map((lane) => {
+    const m = laneMoe(lane, { ...opts, liveCmdline: live });
+    const age = m.profile_age_s !== void 0 ? `${(m.profile_age_s / 3600).toFixed(1)} h old` : "no file";
+    const value = m.state === "unsupported" ? "unsupported (Flash-Next only; relearned per swap)" : m.state === "configured" && !m.profile_path ? "not configured (add expert-profile-save, reload lane)" : `${m.state} \xB7 ${m.profile_exists ? age : "no profile yet"}${m.profile_exists ? " \xB7 warm start" : ""}`;
+    return { label: `MoE ${lane}`, value };
+  });
+}
+
+// src/screendata.ts
+var SCREEN_TURNS = 12;
+var SCREEN_SWAPS = 6;
+function compactNumber(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 2)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e5 ? 0 : 1)}k`;
+  return `${Math.round(n)}`;
+}
+function sparkline(values) {
+  const BARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588";
+  const nums = values.filter((v) => Number.isFinite(v) && v > 0);
+  if (nums.length < 2) return "";
+  const max = Math.max(...nums);
+  if (max <= 0) return "";
+  return nums.map((v) => {
+    const i = Math.min(BARS.length - 1, Math.floor(v / max * (BARS.length - 1)));
+    return BARS[i] ?? "\u2581";
+  }).join("");
+}
+function laneRows(src, metrics) {
+  const resident = metrics?.loaded;
+  const spec = [
+    { lane: src.lanes.think, role: "think" },
+    { lane: src.lanes.code, role: "code" }
+  ];
+  return spec.map((s) => ({
+    lane: s.lane,
+    role: s.role,
+    model: s.lane,
+    resident: resident !== void 0 && resident === s.lane
+  }));
+}
+function turnRows(turns) {
+  if (turns.length === 0) return [];
+  const rows = [];
+  const spark = sparkline(turns.map((t) => t.tg));
+  if (spark !== "") rows.push({ label: "tok/s by turn", value: spark, tone: "dim" });
+  for (const t of turns.slice(-4).reverse()) {
+    const bits = [`pp ${compactNumber(t.pp)}`, `tg ${t.tg}`, ...t.ttft !== void 0 ? [`ttft ${t.ttft.toFixed(2)}s`] : [], ...t.kv_hit_pct !== void 0 ? [`kv ${t.kv_hit_pct}%`] : [], `swap ${Math.round(t.swap_ms / 100) / 10}s`];
+    rows.push({ label: `#${t.turn} R${t.round}${t.phase ? ` ${t.phase}` : ""}`, value: bits.join(" \xB7 ") });
+  }
+  return rows;
+}
+function swapRows(swaps) {
+  return swaps.slice(0, SCREEN_SWAPS).map((s) => {
+    const ramp2 = s.ramp === "map_restored" ? "MoE restored" : s.ramp === "hot_steady" ? "hot steady" : s.ramp === "cold_ramp" ? "cold ramp" : "ramp ?";
+    return {
+      label: `${s.from} \u2192 ${s.to}`,
+      value: `${s.elapsed_s.toFixed(1)}s \xB7 ${Math.round(s.first_tg)}\u2192${Math.round(s.steady_tg)} tok/s \xB7 ${ramp2} \xB7 ${clockOf(s.at)}`
+    };
+  });
+}
+function gateRows(gate) {
+  if (!gate) return [{ label: "gate", value: "no gate run this round", tone: "dim" }];
+  const failing = gate.results.filter((r) => !r.ok);
+  const rows = [{ label: "gate", value: `${gate.passed ? "GREEN" : "RED"} ${failing.length}/${gate.results.length} failing \xB7 ${clockOf(gate.at)}`, tone: gate.passed ? "ok" : "bad" }];
+  for (const f of failing) rows.push({ label: "  red", value: `${f.cmd} \u2192 ${f.expected}`, tone: "bad" });
+  return rows;
+}
+function clockOf(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad2 = (n) => `${n}`.padStart(2, "0");
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+function elapsedSince(startedUtc, now) {
+  if (!startedUtc) return void 0;
+  const t = new Date(startedUtc).getTime();
+  if (Number.isNaN(t)) return void 0;
+  return Math.max(0, Math.round((now.getTime() - t) / 1e3));
+}
+function formatElapsed(seconds) {
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m}m${`${Math.round(seconds % 60)}`.padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h${`${m % 60}`.padStart(2, "0")}m`;
+}
+function nameResidentRow(tiers, metrics, names) {
+  const loaded = typeof metrics?.loaded === "string" ? metrics.loaded : void 0;
+  if (!loaded) return tiers;
+  const label2 = modelLabel(names?.[loaded] ?? loaded);
+  const state = metrics?.loading === true ? " loading" : "";
+  return tiers.map((r) => r.label === "resident" ? { ...r, value: `${label2}${state}`.trim() } : r);
+}
+async function collectScreen(src) {
+  const now = (src.now ?? (() => /* @__PURE__ */ new Date()))();
+  const metrics = src.metrics ?? await fetchMetrics();
+  const swaps = src.swaps ?? readSwaps(src.runDir);
+  const turns = src.turns ?? readTurns(src.runDir, SCREEN_TURNS);
+  const moe = moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath });
+  const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
+  const missing = [];
+  if (!metrics) missing.push(`router ${ROUTER} unreachable \u2014 engine, decode and queue are not measured`);
+  if (swaps.length === 0) missing.push("no swaps recorded");
+  if (turns.length === 0) missing.push("no turn telemetry (the router reported no pp/tg)");
+  const elapsed_s = elapsedSince(src.run.started_utc, now);
+  if (elapsed_s === void 0) missing.push("no run start in the state file");
+  const context = src.context && typeof src.context.tokens === "number" && src.context.percent !== null ? { tokens: src.context.tokens, window: src.context.contextWindow, percent: src.context.percent } : void 0;
+  if (!context) missing.push("no context meter");
+  let critique;
+  const phases = Array.isArray(src.run.phases) ? src.run.phases : [];
+  for (let i = phases.length - 1; i >= 0; i--) {
+    const p = phases[i];
+    if (p?.phase === "verification_done" && typeof p.notes === "string") {
+      critique = p.notes;
+      break;
+    }
+  }
+  return {
+    run: src.run,
+    refreshed_utc: now.toISOString(),
+    elapsed_s,
+    lanes: laneRows(src, metrics),
+    tiers,
+    moe,
+    turns,
+    swaps,
+    context,
+    gate: src.run.gate_last,
+    critique,
+    flip: src.flip,
+    missing
+  };
+}
+
+// src/panel.ts
+var PANEL_REFRESH_MS = Math.max(500, Number(process.env.FADE_ORCHESTRATE_PANEL_REFRESH_MS ?? 2e3));
+var WIDGET_WIDTH = 110;
+var TWO_COLUMN_MIN_WIDTH = 100;
+var STATUS_GLYPH = {
+  passed: "\u2713",
+  failed: "\u2717",
+  blocked: "\u2298",
+  pending: "\xB7",
+  started: "\u2026"
+};
+var TONE = { ok: "success", warn: "warning", bad: "error", dim: "dim" };
+function visibleWidth(s) {
+  return [...s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\]8;;[^\x07\x1b]*(\x07|\x1b\\)/g, "")].length;
+}
+function fit(s, width) {
+  if (width <= 0) return "";
+  if (visibleWidth(s) <= width) return s;
+  const plain = s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  return `${[...plain].slice(0, Math.max(0, width - 1)).join("")}\u2026`;
+}
+function pad(s, width) {
+  const w = visibleWidth(s);
+  return w >= width ? s : `${s}${" ".repeat(width - w)}`;
+}
+var KEY_BAR = ["[\u2191\u2193/j-k] select", "[PgUp/PgDn] scroll", "[s] skip selected", "[v] verify", "[r] reset", "[p] pause", "[c] code", "[h] halt", "[esc] close"];
+function keyBarLines(width) {
+  if (width <= 1) return [""];
+  const lines = [];
+  let line = "";
+  for (const item of KEY_BAR) {
+    const candidate = line.length === 0 ? item : `${line}  ${item}`;
+    if (visibleWidth(candidate) > width) {
+      if (line.length > 0) lines.push(line);
+      line = visibleWidth(item) > width ? fit(item, width) : item;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line.length > 0) lines.push(line);
+  return lines.length > 0 ? lines : [""];
+}
+function label(theme, text, color = "accent") {
+  return theme ? theme.fg(color, theme.bold ? theme.bold(text) : text) : text;
+}
+function metricLines(rows, theme, width, maxLabel = 18) {
+  const labelW = Math.min(maxLabel, Math.max(6, Math.max(...rows.map((r) => visibleWidth(r.label)), 1) + 1));
+  return rows.map((r) => {
+    const value = fit(r.value, Math.max(4, width - labelW));
+    const l = theme && r.tone ? theme.fg(TONE[r.tone] ?? "text", r.label) : r.label;
+    return `  ${pad(fit(l, labelW - 1), labelW)} ${value}`;
+  });
+}
+var arr = (v) => Array.isArray(v) ? v : [];
+function taskBlock(d, view, theme, width) {
+  const run = d.run;
+  const tasks = arr(run.tasks);
+  const repair = arr(run.repair_tasks);
+  const repairing = repair.length > 0;
+  const lines = [];
+  const taskRows = [];
+  const total = tasks.length;
+  const passed = tasks.filter((t) => t.status === "passed").length;
+  lines.push(label(theme, `TASKS ${passed}/${total} passed${repairing ? " \xB7 repair queue active" : ""}`));
+  tasks.forEach((t, i) => {
+    const sel = i === view.sel;
+    const glyph = STATUS_GLYPH[t.status ?? "pending"] ?? "\xB7";
+    const inRepair = repairing && repair.some((r) => r.id === t.id);
+    const head = `${sel ? "\u25B6" : " "} ${glyph} ${t.id}${inRepair ? " (repair)" : ""}`;
+    const tone = t.status === "passed" ? "success" : t.status === "failed" || t.status === "blocked" ? "error" : inRepair ? "warning" : "text";
+    const row = `${pad(fit(head, 18), 18)} ${fit(t.objective, Math.max(4, width - 19))}`;
+    taskRows[i] = lines.length;
+    lines.push(theme ? theme.fg(tone, row) : row);
+    if (!sel) return;
+    const meta = `files: ${(t.files ?? []).join(", ") || "-"} \xB7 deps: ${(t.dependencies ?? []).length ? (t.dependencies ?? []).join(",") : "-"} \xB7 round ${t.round ?? 1}`;
+    lines.push(`    ${fit(meta, Math.max(4, width - 4))}`);
+    lines.push(`    acceptance: ${fit(t.acceptance, Math.max(4, width - 16))}`);
+    if (t.result) lines.push(`    result: ${fit(t.result, Math.max(4, width - 11))}`);
+    const tag = run.checkpoints?.[t.id];
+    if (tag) lines.push(`    tag: ${tag}`);
+  });
+  if (tasks.length === 0) lines.push("  (no plan yet: the loop is still planning)");
+  return { lines, taskRows };
+}
+function phaseBlock(d, theme, width) {
+  const phases = arr(d.run.phases).slice(-6);
+  const lines = [label(theme, "PHASES")];
+  if (phases.length === 0) return [...lines, "  (none accepted yet)"];
+  for (const p of phases) {
+    const row = `  R${p.round} ${p.phase}${p.accepted ? "" : " REFUSED"}  ${p.lane}  ${clockOf(p.at)}`;
+    lines.push(fit(row, width));
+  }
+  return lines;
+}
+function metricBlock(d, theme, width) {
+  const rows = [...d.tiers, ...d.moe];
+  if (d.context) rows.push({ label: "context", value: `${compactNumber(d.context.tokens)} / ${compactNumber(d.context.window)} (${d.context.percent.toFixed(1)}%)` });
+  rows.push(...gateRows(d.gate));
+  rows.push(...turnRows(d.turns));
+  return [label(theme, "ENGINE / ROUTER"), ...metricLines(rows, theme, width)];
+}
+function swapBlock(d, theme, width) {
+  const rows = swapRows(d.swaps);
+  const lines = [label(theme, "LANE SWAPS")];
+  if (rows.length === 0) return [...lines, "  (no swaps recorded yet)"];
+  return [...lines, ...metricLines(rows, theme, width, 22)];
+}
+function tailBlocks(d, theme, width) {
+  const lines = [];
+  lines.push(label(theme, "LAST VERIFIER CRITIQUE"));
+  lines.push(...d.critique ? d.critique.split("\n").map((l) => `  ${fit(l, Math.max(4, width - 2))}`) : ["  (none this round)"]);
+  const rej = (d.run.rejection_history ?? []).slice(-5);
+  if (rej.length > 0) {
+    lines.push(label(theme, "RECENT REJECTIONS (do not repeat)", "warning"));
+    for (const r of rej) lines.push(fit(`  R${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`, width));
+  }
+  if (d.flip && d.flip.flips > 0) {
+    lines.push(label(theme, "LANE FLIP (not the loop's)", "warning"));
+    lines.push(fit(`  ${d.flip.flips} swaps in ${d.flip.window_s}s \u2014 requests naming ${d.flip.competing.join(", ") || "the other lane"}`, width));
+  }
+  if (d.missing.length > 0) {
+    lines.push(label(theme, "NOT MEASURED", "dim"));
+    for (const m of d.missing) lines.push(fit(`  ${m}`, width));
+  }
+  return lines;
+}
+function headerBlock(d, theme, width) {
+  const run = d.run;
+  const resident = d.lanes.find((l) => l.resident);
+  const head = `fade-orchestrator ${run.run_id} \xB7 ${shortState(run.state)} \xB7 round ${run.round}/${run.max_rounds}${run.tier ? ` \xB7 tier ${run.tier}` : ""}${d.elapsed_s !== void 0 ? ` \xB7 ${formatElapsed(d.elapsed_s)}` : ""} \xB7 ${d.refreshed_utc.slice(11, 19)}Z`;
+  const lines = [label(theme, fit(head, width))];
+  lines.push(fit(`goal: ${run.goal}`, width));
+  if (run.paused === true) {
+    lines.push(theme ? theme.fg("warning", fit(`paused: the loop is stopped for manual edits${run.operator_note ? ` \xB7 note: ${run.operator_note}` : ""}`, width)) : fit(`paused: the loop is stopped for manual edits${run.operator_note ? ` \xB7 note: ${run.operator_note}` : ""}`, width));
+  }
+  if (run.state === "stalled_protocol_error") {
+    lines.push(theme ? theme.fg("error", fit(`PROTOCOL STALL: the lane ended ${run.stall_count ?? 3} turns in a row without a fade_phase call; the run is halted and NO lane was loaded \u2014 [c] resume on the code lane, [r] reset the round`, width)) : fit(`PROTOCOL STALL: the lane ended ${run.stall_count ?? 3} turns in a row without a fade_phase call; the run is halted and NO lane was loaded \u2014 [c] resume on the code lane, [r] reset the round`, width));
+  }
+  const laneRow = d.lanes.map((l) => `${l.model}=${l.role}${l.resident ? " \u25C6resident" : ""}`).join(" \xB7 ");
+  lines.push(fit(`lanes: ${laneRow}`, width));
+  if ((run.protocol_retries ?? 0) > 0) {
+    lines.push(fit(`protocol: ${run.protocol_retries} turn(s) ended without fade_phase \xB7 consecutive stalls ${run.stall_count ?? 0}/3${run.synthesized ? ` \xB7 auto-synthesized ${run.synthesized.phase} at round ${run.synthesized.round}` : ""}`, width));
+  }
+  return lines;
+}
+function panelLines(d, width, view = { sel: 0 }, theme) {
+  const w = Math.max(40, Math.floor(width));
+  const inner = w - 4;
+  const header = headerBlock(d, theme, inner);
+  const tasks = taskBlock(d, { sel: Math.max(0, Math.min(view.sel, Math.max(0, arr(d.run.tasks).length - 1))) }, theme, inner);
+  const phases = phaseBlock(d, theme, inner);
+  const metrics = metricBlock(d, theme, inner);
+  const swaps = swapBlock(d, theme, inner);
+  const tail = tailBlocks(d, theme, inner);
+  const left = [...tasks.lines, "", ...phases];
+  const lines = [];
+  const row = (text) => `\u2502 ${pad(fit(text, inner), inner)} \u2502`;
+  lines.push(`\u250C${"\u2500".repeat(w - 2)}\u2510`);
+  for (const h of header) lines.push(row(h));
+  lines.push(`\u251C${"\u2500".repeat(w - 2)}\u2524`);
+  const taskRowOffset = lines.length;
+  if (w >= TWO_COLUMN_MIN_WIDTH) {
+    const leftW = Math.max(40, Math.floor((w - 4) * 0.56));
+    const rightW = w - 4 - leftW - 2;
+    const right = metrics;
+    const rows = Math.max(left.length, right.length);
+    for (let i = 0; i < rows; i++) {
+      const l = pad(fit(left[i] ?? "", leftW), leftW);
+      const r = fit(right[i] ?? "", rightW);
+      lines.push(`\u2502 ${l}  ${r}${" ".repeat(Math.max(0, rightW - visibleWidth(r)))} \u2502`);
+    }
+  } else {
+    for (const l of left) lines.push(row(l));
+    lines.push(row(""));
+    for (const m of metrics) lines.push(row(m));
+  }
+  lines.push(`\u251C${"\u2500".repeat(w - 2)}\u2524`);
+  for (const s of swaps) lines.push(row(s));
+  for (const t of tail) lines.push(row(t));
+  lines.push(`\u251C${"\u2500".repeat(w - 2)}\u2524`);
+  for (const k of keyBarLines(inner)) lines.push(row(k));
+  lines.push(`\u2514${"\u2500".repeat(w - 2)}\u2518`);
+  const taskRows = tasks.taskRows.map((i) => taskRowOffset + i);
+  const out = lines.map((l) => redact(l, redactOn(), d.run.repo));
+  return { lines: out, taskRows };
+}
+var CLOSE_KEYS = { "\x1B": true, q: true, "": true };
+var ACTION_KEYS = { s: true, v: true, r: true, p: true, c: true, h: true };
+var PanelComponent = class {
+  data;
+  provider;
+  theme;
+  tui;
+  done;
+  sel = 0;
+  offset = 0;
+  timer;
+  rendering = false;
+  body = [];
+  taskRows = [];
+  /** The next render must bring the SELECTED task on screen (j/k and a refresh set it; g/G/PgUp/PgDn clear it). */
+  follow = true;
+  constructor(data, provider, theme, tui, done, refreshMs = PANEL_REFRESH_MS) {
+    this.data = data;
+    this.provider = provider;
+    this.theme = theme;
+    this.tui = tui;
+    this.done = done;
+    this.timer = setInterval(() => void this.refresh(), refreshMs);
+    this.timer.unref?.();
+  }
+  /** The provider is the router read; never let a slow tick overlap the next one. */
+  async refresh() {
+    if (this.rendering) return;
+    this.rendering = true;
+    try {
+      const next = await this.provider();
+      if (next.run.run_id === this.data.run.run_id) this.data = next;
+      this.follow = true;
+      this.tui.requestRender();
+    } catch {
+    } finally {
+      this.rendering = false;
+    }
+  }
+  invalidate() {
+    this.body = [];
+  }
+  getHeight() {
+    return Math.max(8, (this.tui.terminal.rows || 24) - 2);
+  }
+  render(width) {
+    const r = panelLines(this.data, width, { sel: this.sel }, this.theme);
+    this.body = r.lines;
+    this.taskRows = r.taskRows;
+    const h = this.getHeight();
+    const row = this.taskRows[this.sel];
+    if (this.follow && row !== void 0) {
+      if (row < this.offset) this.offset = row;
+      else if (row >= this.offset + h) this.offset = row - h + 1;
+    }
+    this.follow = false;
+    const maxOffset = Math.max(0, this.body.length - h);
+    if (this.offset > maxOffset) this.offset = maxOffset;
+    return this.body.slice(this.offset, this.offset + h);
+  }
+  handleInput(data) {
+    const all = arr(this.data.run.tasks);
+    const tasks = all.length;
+    const h = this.getHeight();
+    if (CLOSE_KEYS[data] === true) return this.done(JSON.stringify({ key: "close" }));
+    if (ACTION_KEYS[data] === true) {
+      const t = all[this.sel];
+      return this.done(JSON.stringify({ key: data, ...t ? { taskId: t.id } : {} }));
+    }
+    if (data === "j" || data === "\x1B[B") {
+      this.sel = Math.min(Math.max(0, tasks - 1), this.sel + 1);
+      this.follow = true;
+      return;
+    }
+    if (data === "k" || data === "\x1B[A") {
+      this.sel = Math.max(0, this.sel - 1);
+      this.follow = true;
+      return;
+    }
+    if (data === "\x1B[6~") this.offset = Math.min(Math.max(0, this.body.length - h), this.offset + h);
+    else if (data === "\x1B[5~") this.offset = Math.max(0, this.offset - h);
+    else if (data === "G") this.offset = Math.max(0, this.body.length - h);
+    else if (data === "g") this.offset = 0;
+  }
+  dispose() {
+    if (this.timer !== void 0) clearInterval(this.timer);
+    this.timer = void 0;
+  }
+};
+async function openPanel(ctx, provider, onAction, headless = process.env.FADE_ORCHESTRATE_HEADLESS === "1") {
+  const initial = await provider();
+  if (ctx.hasUI !== true || headless) {
+    ctx.ui.setWidget(OVERLAY_WIDGET_KEY, panelLines(initial, WIDGET_WIDTH, { sel: 0 }).lines, { placement: "aboveEditor" });
+    return;
+  }
+  const raw = await ctx.ui.custom(
+    (tui, theme, _kb, done) => new PanelComponent(initial, provider, theme, tui, done),
+    {
+      overlay: true,
+      // Near-full-screen, like the host's own panels; a function so a resize re-resolves.
+      overlayOptions: () => ({ width: "96%", maxHeight: "94%", anchor: "top-center", margin: { top: 1, left: 1, right: 1, bottom: 1 } })
+    }
+  );
+  if (!raw) return;
+  let action;
+  try {
+    action = JSON.parse(raw);
+  } catch {
+    action = void 0;
+  }
+  if (action && action.key !== "close" && onAction) onAction(action);
 }
 
 // src/index.ts
 var GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3e3);
 var GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 6e4);
-var FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "ctrl+o";
+var FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+shift+f";
+var SURFACE = process.env.FADE_ORCHESTRATE_SURFACE === "status" ? "status" : "widget";
 var MUTATING_TOOLS = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
 var MAIN_SESSION_DIR = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_/;
 var isDelegatedSession = () => {
@@ -1109,11 +1511,17 @@ function fadeOrchestrate(pi) {
   let metrics;
   let laneBest = 0;
   let metricsTimer;
+  let inputUnsub;
+  let panelOpen = false;
+  let conflictReported = false;
+  let chordResolved = false;
+  let probeHasAnswered = false;
   let turnSeq = 0;
   let turnPhase;
   let turnSwapMs = 0;
   let verifierTools;
   let flipBadge;
+  let swapPill;
   const refreshMetrics = async () => {
     const s = await fetchMetrics();
     if (!s) return;
@@ -1183,8 +1591,14 @@ function fadeOrchestrate(pi) {
     }
   };
   const ensurePhaseTool = async () => {
-    const active = pi.getActiveTools();
-    if (!active.includes("fade_phase")) await pi.setActiveTools([...active, "fade_phase"]);
+    try {
+      const active = pi.getActiveTools();
+      if (active.includes("fade_phase")) return true;
+      await pi.setActiveTools([...active, "fade_phase"]);
+      return true;
+    } catch {
+      return false;
+    }
   };
   const statePath = () => runDir ? join5(runDir, STATE_FILENAME) : "<unset>";
   const persist = () => {
@@ -1196,15 +1610,29 @@ function fadeOrchestrate(pi) {
     const r = refreshChecks(run, live);
     if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} \u2014 ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
   };
+  let statusWritten = false;
+  const clearSurface = (ctx) => {
+    ctx.ui.setWidget(TOP_WIDGET_KEY, void 0, { placement: "aboveEditor" });
+    if (statusWritten) {
+      statusWritten = false;
+      ctx.ui.setStatus(ORCH_STATUS_KEY, void 0);
+    }
+  };
   const paint = (ctx) => {
     if (!run) {
-      ctx.ui.setWidget(TOP_WIDGET_KEY, void 0);
+      clearSurface(ctx);
       ctx.ui.setWidget(OVERLAY_WIDGET_KEY, void 0);
       return;
     }
-    const cols = typeof process.stdout.columns === "number" ? process.stdout.columns : void 0;
-    const lines = topStatus(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), cols });
-    ctx.ui.setWidget(TOP_WIDGET_KEY, lines);
+    const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(FADE_KEY) });
+    if (!lines) {
+      clearSurface(ctx);
+      return;
+    }
+    if (SURFACE === "status") {
+      statusWritten = true;
+      ctx.ui.setStatus(ORCH_STATUS_KEY, lines.map((l) => l.trim()).join(" \xB7 "));
+    } else ctx.ui.setWidget(TOP_WIDGET_KEY, lines, { placement: "aboveEditor" });
   };
   const fail = (ctx, reason) => {
     if (run) {
@@ -1245,11 +1673,18 @@ function fadeOrchestrate(pi) {
     }
     pi.setThinkingLevel(THINKING[lane]);
     const from = run?.lane ?? "";
+    swapPill = { from, to: modelLabel(model.name ?? lane) };
+    paint(ctx);
     const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
-    const watch = startSwapWatch(lane, moe);
+    const watch = startSwapWatch(lane, moe, (percent) => {
+      if (!swapPill) return;
+      swapPill = { ...swapPill, percent };
+      paint(ctx);
+    });
     ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router\u2026`);
     const loaded = await loadLane(lane);
     ctx.ui.setWorkingMessage();
+    swapPill = void 0;
     if (!loaded.ok) {
       watch.cancel();
       fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
@@ -1269,41 +1704,126 @@ function fadeOrchestrate(pi) {
       pi.sendUserMessage(text);
     }, 0);
   };
-  const lastCritique = () => {
-    const phases = run?.phases ?? [];
-    for (let i = phases.length - 1; i >= 0; i--) if (phases[i].phase === "verification_done") return phases[i].notes;
-    return void 0;
+  const panelProvider = (ctx) => {
+    if (!run || !runDir) return void 0;
+    const state = run;
+    const dir = runDir;
+    return async () => {
+      const s = await fetchMetrics();
+      if (s) {
+        metrics = s;
+        persistMetrics(dir, s);
+      }
+      return collectScreen({
+        run: state,
+        runDir: dir,
+        lanes: { think: THINK_LANE, code: CODE_LANE },
+        names: { [THINK_LANE]: ctx.modelRegistry.find(PROVIDER, THINK_LANE)?.name, [CODE_LANE]: ctx.modelRegistry.find(PROVIDER, CODE_LANE)?.name },
+        context: ctx.getContextUsage(),
+        metrics,
+        flip: flipBadge,
+        ...process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}
+      });
+    };
   };
-  const showOverlay = async (ctx) => {
-    if (!run || !runDir) {
+  const actOnPanel = (ctx, a) => {
+    if (!run) return;
+    const dir = a.key === "s" ? actSkip(run, a.taskId) : a.key === "v" ? actVerify(run) : a.key === "r" ? actReset(run) : a.key === "p" ? actPause(run) : a.key === "c" ? actCode(run) : a.key === "h" ? actHalt(run) : void 0;
+    if (!dir) return;
+    persist();
+    paint(ctx);
+    ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+    if (!run.paused && pending) {
+      const deferred = pending;
+      pending = void 0;
+      void switchLane(deferred.lane, ctx);
+    }
+    if (dir.next) void switchLane(dir.next, ctx);
+  };
+  const showPanel = async (ctx) => {
+    const provider = panelProvider(ctx);
+    if (!provider) {
       ctx.ui.notify("orchestrate: no run active", "info");
       return;
     }
     try {
-      const s = await fetchMetrics();
-      if (s) {
-        metrics = s;
-        if (runDir) persistMetrics(runDir, s);
-      }
-      const tiers = [...tiersFromMetrics(metrics), ...moeRows([THINK_LANE, CODE_LANE], { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG })];
-      const data = { run, swaps: readSwaps(runDir), tiers, critique: lastCritique(), flip: flipBadge };
-      await openOverlay(ctx, data, (key) => {
-        if (!run) return;
-        const dir = key === "s" ? actSkip(run) : key === "v" ? actVerify(run) : key === "r" ? actReset(run) : key === "p" ? actPause(run) : key === "c" ? actCode(run) : key === "h" ? actHalt(run) : void 0;
-        if (!dir) return;
-        persist();
-        paint(ctx);
-        ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
-        if (!run.paused && pending) {
-          const deferred = pending;
-          pending = void 0;
-          void switchLane(deferred.lane, ctx);
-        }
-        if (dir.next) void switchLane(dir.next, ctx);
-      }, process.env.FADE_ORCHESTRATE_HEADLESS === "1");
+      await openPanel(ctx, provider, (a) => actOnPanel(ctx, a), process.env.FADE_ORCHESTRATE_HEADLESS === "1");
     } catch (e) {
-      ctx.ui.notify(`orchestrate: overlay failed: ${String(e instanceof Error ? e.message : e)}`, "error");
+      const where = e instanceof Error && typeof e.stack === "string" ? ` @ ${e.stack.split("\n").slice(1, 4).map((l) => l.trim()).join(" | ")}` : "";
+      ctx.ui.notify(`orchestrate: panel failed: ${String(e instanceof Error ? e.message : e)}${where}`, "error");
     }
+  };
+  let conflictProbe;
+  try {
+    conflictProbe = Reflect.get(pi, "getShortcutConflict");
+  } catch {
+    conflictProbe = void 0;
+  }
+  const hostConflict = (key) => {
+    if (typeof conflictProbe !== "function") return void 0;
+    try {
+      const answer = conflictProbe.call(pi, key);
+      probeHasAnswered = true;
+      return answer;
+    } catch {
+      return void 0;
+    }
+  };
+  const CHORD = chordBytes(FADE_KEY);
+  const FALLBACK_KEY = process.env.FADE_ORCHESTRATE_FALLBACK_KEY ?? "alt+shift+i";
+  const openPanelGuarded = async (ctx) => {
+    if (panelOpen) return;
+    panelOpen = true;
+    try {
+      await showPanel(ctx);
+    } finally {
+      panelOpen = false;
+    }
+  };
+  const HOST_HELD_CHORDS = {
+    "ctrl+c": true,
+    "ctrl+d": true,
+    "ctrl+g": true,
+    "ctrl+l": true,
+    "ctrl+o": true,
+    "ctrl+r": true,
+    "ctrl+s": true,
+    "ctrl+t": true,
+    "ctrl+y": true,
+    "ctrl+z": true,
+    "ctrl+.": true,
+    "alt+a": true,
+    "alt+b": true,
+    "alt+d": true,
+    "alt+f": true,
+    "alt+g": true,
+    "alt+h": true,
+    "alt+i": true,
+    "alt+k": true,
+    "alt+l": true,
+    "alt+m": true,
+    "alt+n": true,
+    "alt+o": true,
+    "alt+p": true,
+    "alt+r": true,
+    "alt+y": true,
+    "alt+shift+c": true,
+    "alt+shift+k": true,
+    "alt+shift+l": true,
+    "alt+shift+p": true,
+    "alt+shift+v": true
+  };
+  const resolveChord = (ctx) => {
+    if (!CHORD || chordResolved) return;
+    const conflict = hostConflict(FADE_KEY);
+    const owner = conflict?.keybindings?.[0] ?? conflict?.owner;
+    const held = conflict !== void 0 || !probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true;
+    chordResolved = true;
+    if (conflictReported) return;
+    conflictReported = true;
+    const text = held ? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) \u2014 the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z` : `orchestrate: ${keyLabel(FADE_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
+    const at = setTimeout(() => ctx.ui.notify(text, "info"), 500);
+    at.unref?.();
   };
   const applyPhase = (phase, payload) => {
     if (!run) throw new Error("unreachable: no run");
@@ -1502,12 +2022,21 @@ ${SCHEMA_HINT}` : text);
       ctx.ui.notify(`lanes: ${st.health} \xB7 ${rows.join(" \xB7 ")}`, "info");
     }
   });
-  pi.registerShortcut(FADE_KEY, {
-    description: "fade orchestrator overlay: tasks, swap history, tiers, critique (s/v/r/c/h)",
-    handler: async (ctx) => {
-      await showOverlay(ctx);
+  const registerChord = (key, description) => {
+    try {
+      pi.registerShortcut(key, {
+        description,
+        handler: async (ctx) => {
+          await openPanelGuarded(ctx);
+        }
+      });
+    } catch {
     }
-  });
+  };
+  registerChord(FADE_KEY, `fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h) [${keyLabel(FADE_KEY)}]`);
+  if (!hostConflict(FALLBACK_KEY)) {
+    registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
+  }
   pi.registerCommand("orchestrate", {
     description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
     handler: async (args, ctx) => {
@@ -1527,7 +2056,7 @@ ${SCHEMA_HINT}` : text);
         return;
       }
       if (first === "overlay") {
-        await showOverlay(ctx);
+        await openPanelGuarded(ctx);
         return;
       }
       if (first === "handover") {
@@ -1566,7 +2095,7 @@ ${SCHEMA_HINT}` : text);
           persist();
         }
         pending = void 0;
-        ctx.ui.setWidget(TOP_WIDGET_KEY, void 0);
+        clearSurface(ctx);
         ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
         if (raw.includes("--clear")) {
           try {
@@ -1656,6 +2185,14 @@ ${SCHEMA_HINT}` : text);
   pi.on("session_start", async (_event, ctx) => {
     if (isDelegatedSession()) return;
     await ensurePhaseTool();
+    if (CHORD && !inputUnsub) {
+      inputUnsub = ctx.ui.onTerminalInput((data) => {
+        if (data !== CHORD || panelOpen) return void 0;
+        void openPanelGuarded(ctx);
+        return { consume: true };
+      });
+    }
+    resolveChord(ctx);
     const repo = ctx.cwd;
     const active = readJson(join5(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
     const state = readJson(join5(repo, "var", "omp-orchestrate", STATE_FILENAME));
@@ -1678,6 +2215,7 @@ ${SCHEMA_HINT}` : text);
     }
   });
   pi.on("agent_start", async (_event, ctx) => {
+    if (!await ensurePhaseTool()) setTimeout(() => void ensurePhaseTool(), 500);
     paint(ctx);
     void refreshMetrics().then(() => paint(ctx));
   });
@@ -1781,8 +2319,12 @@ ${SCHEMA_HINT}`);
     return { block: true, reason: `fade_orchestrate: the verifier lane is read-only \u2014 ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
   });
   pi.on("session_shutdown", async (_event, ctx) => {
-    ctx.ui.setWidget(TOP_WIDGET_KEY, void 0);
+    clearSurface(ctx);
     stopMetricsTimer();
+    if (inputUnsub) {
+      inputUnsub();
+      inputUnsub = void 0;
+    }
   });
 }
 export {
