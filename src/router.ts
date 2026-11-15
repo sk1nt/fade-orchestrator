@@ -36,7 +36,7 @@ export async function listLanes(): Promise<{ health: string; models: RouterLane[
 	}
 }
 
-export type RouterHealth = { model?: string; loaded?: boolean | string; loading?: boolean; percent?: number | null; swap?: { from?: string; to?: string; phase?: string } };
+export type RouterHealth = { model?: string; loaded?: boolean | string; loading?: boolean; percent?: number | null; swap?: { from?: string; to?: string; phase?: string; waiting?: number; elapsed_s?: number } };
 
 /** The router's own health line: `loading` is true while a swap is in flight. */
 export async function laneHealth(): Promise<RouterHealth | undefined> {
@@ -63,7 +63,7 @@ export const SETTLE_MAX_MS = 120_000;
  *    row (`verification_done needs_repair` → code, next round's `planning_done` → code), and
  *    a second load of a resident pack re-reads 52 GiB for nothing.
  */
-export async function loadLane(lane: string): Promise<{ ok: boolean; detail: string; elapsed_s: number }> {
+export async function loadLane(lane: string): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
 	for (let waited = 0; waited < SETTLE_MAX_MS; waited += SETTLE_POLL_MS) {
 		if ((await laneHealth())?.loading !== true) break;
 		const { promise: settle, resolve: settleDone } = Promise.withResolvers<void>();
@@ -71,7 +71,12 @@ export async function loadLane(lane: string): Promise<{ ok: boolean; detail: str
 		await settle;
 	}
 	const resident = (await listLanes()).models.find((m) => m.status === "loaded")?.id;
-	if (resident === lane) return { ok: true, detail: "already resident; no swap issued", elapsed_s: 0 };
+	const flip = flipState(resident, FLIP_WINDOW_MS);
+	const guarded = flipGuarded(flip);
+	// The resident entry is never reloaded, and while the guard is firing the refusal says so with
+	// the churn named: this is the call site where a flip would be paid, so it is where the
+	// operator has to see it.
+	if (resident === lane) return { ok: true, detail: `already resident; no swap issued${flipNote(flip)}`, elapsed_s: 0, guarded, flip };
 	const t0 = Date.now();
 	try {
 		const r = await fetch(`${ROUTER}/v1/load`, {
@@ -81,9 +86,9 @@ export async function loadLane(lane: string): Promise<{ ok: boolean; detail: str
 			signal: AbortSignal.timeout(240_000),
 		});
 		const text = await r.text();
-		return { ok: r.ok, detail: `http ${r.status} ${text.length > 300 ? `${text.slice(0, 300)}...` : text}`, elapsed_s: (Date.now() - t0) / 1000 };
+		return { ok: r.ok, detail: `http ${r.status} ${text.length > 300 ? `${text.slice(0, 300)}...` : text}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	} catch (e) {
-		return { ok: false, detail: msg(e), elapsed_s: (Date.now() - t0) / 1000 };
+		return { ok: false, detail: `${msg(e)}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}
 }
 
@@ -180,3 +185,88 @@ export async function routerBusy(): Promise<RouterBusy> {
 	const resident = health?.model ?? (typeof health?.loaded === "string" ? health.loaded : undefined) ?? "?";
 	return { busy: false, running, waiting, reason: `idle: ${resident} resident, no swap, no open request${metrics === undefined ? ", /metrics unread" : ""}; ${counters}` };
 }
+
+/**
+ * Y21: the FLIP GUARD. A swap is 13-25 s of 52-130 GiB, so a churning lane is the most expensive
+ * failure this box has. Measured 2026-11-15 04:00-05:34 (fade-basalt-gpu1 journal): ~40
+ * alternating `swap deepseek -> flash-next (1 waiting)` / `swap flash-next -> deepseek (1
+ * waiting)` lines, one per turn, while an orchestration run held the thinking lane. Every one of
+ * them came from a client that is NOT the orchestrator: OMP's title generator and Mnemopi's
+ * memory completion both resolve through `@smol`, and once the cloud leg hit a ChatGPT usage
+ * limit both fell back onto `strata-flash/flash-next` (log lines `title-generator: start …
+ * provider=strata-flash id=flash-next` and `Mnemopi: memory completion model failed; trying the
+ * next configured fallback`). The router answers a queued request by swapping to the entry that
+ * request names, so the orchestrator cannot prevent the swap — it can NAME it, refuse to pay a
+ * reload of its own, and surface the churn before an operator reads it as a hung run. Each
+ * in-flight swap the router reports is recorded once; a swap whose target is not the resident
+ * lane, inside the window, is a flip. The window and the trigger count are configuration so a rig
+ * can run a whole window in milliseconds.
+ */
+export const FLIP_WINDOW_MS = Number(process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS ?? 120_000);
+export const FLIP_MIN_SWAPS = Number(process.env.FADE_ORCHESTRATE_FLIP_MIN_SWAPS ?? 2);
+
+/** One swap the router reported, as observed by this process. */
+export interface RouterSwapRow {
+	from: string;
+	to: string;
+	at: number;
+	/** The number in the router's own `swap <from> -> <to> (N waiting)` line, when it carries one. */
+	waiting?: number;
+}
+
+export interface FlipState {
+	/** Swaps inside the window that moved the router AWAY from `resident`. */
+	flips: number;
+	window_s: number;
+	/** The entries the competing requests named, deduplicated. */
+	competing: string[];
+	rows: RouterSwapRow[];
+}
+
+const swapLog: RouterSwapRow[] = [];
+let lastSwapSig = "";
+
+/** The entry the router is holding right now, or `undefined` when it names none. */
+export async function residentLane(): Promise<string | undefined> {
+	return (await listLanes()).models.find((m) => m.status === "loaded")?.id;
+}
+
+/**
+ * Read the router's health line and record any swap it is mid-way through — once per swap: the
+ * signature is `from->to`, and a completed swap clears `swap`, which re-arms the recorder so the
+ * same pair seen again after a settle counts as the second flip it is. Then answer the guard
+ * question for the lane that is resident now.
+ */
+export async function observeSwaps(windowMs = FLIP_WINDOW_MS): Promise<FlipState> {
+	const h = await laneHealth();
+	const s = h?.swap;
+	if (s && s.to) {
+		const sig = `${s.from ?? "?"}->${s.to}`;
+		if (sig !== lastSwapSig) swapLog.push({ from: s.from ?? "?", to: s.to, at: Date.now(), waiting: finite(s.waiting) });
+		lastSwapSig = sig;
+	} else {
+		lastSwapSig = "";
+	}
+	return flipState(await residentLane(), windowMs);
+}
+
+/** The guard's answer for `resident` over `windowMs`, from the swaps already observed. */
+export function flipState(resident: string | undefined, windowMs = FLIP_WINDOW_MS): FlipState {
+	const horizon = Date.now() - windowMs;
+	const rows = swapLog.filter((r) => r.at >= horizon);
+	while (swapLog.length > 0 && swapLog[0]!.at < horizon) swapLog.shift();
+	while (swapLog.length > 50) swapLog.shift();
+	const away = rows.filter((r) => resident === undefined || r.to !== resident);
+	return {
+		flips: away.length,
+		window_s: Math.round(windowMs / 1000),
+		competing: [...new Set(away.map((r) => r.to))],
+		rows,
+	};
+}
+
+/** True once the window holds enough churn to call it a flip. */
+export const flipGuarded = (f: FlipState): boolean => f.flips >= FLIP_MIN_SWAPS;
+
+/** The clause a load detail carries when the guard is active, so the cost is never silent. */
+export const flipNote = (f: FlipState): string => (flipGuarded(f) ? ` — FLIP GUARD: ${f.flips} swaps in ${f.window_s}s, requests naming ${f.competing.join(", ") || "the other lane"}` : "");

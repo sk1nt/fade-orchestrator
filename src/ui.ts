@@ -1,18 +1,18 @@
 /**
  * The compact pill and the Ctrl+O overlay.
  *
- * Main pane: ONE status line in the footer block, carrying the FULL lane name —
+ * Main pane: ONE status line at the TOP, above the editor, carrying the FULL lane name —
  * `⚡ <lane>:<state> · R<round>/<max> · T<passed>/<total> · [Ctrl+O]` — and NOTHING multi-line
  * above the editor while a run is live (the monolith painted a 6+ line task dump there; during
  * long coding runs that dump ate the transcript).
  *
- * Footer placement (operator order 2026-11-15: "put this text up where DeepSeek-v4.1 … is, it
- * should fit fine"): the built-in footer renders `pwd`, then the stats row whose RIGHT side is
- * the model identifier, then ONE line of extension statuses (`footer.js`: `getExtensionStatuses()`
- * joined and truncated to the terminal width). `ctx.ui.setStatus` writes that extension line — it
- * is the footer row the extension owns, immediately under the model identifier, and it is full
- * terminal width, so the FULL lane name goes there and the 2-character tag survives only as the
- * narrow-terminal fallback (`pillCompact`).
+ * Placement (operator order 2026-11-15, second act: "I want the status for orchestrate to exist at
+ * the top and it shouldn't always be there, only when in use … no footer for now"): the row lives
+ * in `ctx.ui.setWidget(TOP_WIDGET_KEY, …)`, which the host docks above the editor. The footer
+ * extension-status row (`ctx.ui.setStatus`) is NOT written at all — no footer for now. And the
+ * widget is written ONLY while a run is in use: `topStatus` answers `undefined` for no run, for a
+ * terminal state (`complete`/`failed`/`stopped`) and for a run this session does not own, and the
+ * caller clears the widget in every one of those cases.
  *
  * Overlay: `ctx.ui.custom(..., {overlay:true})` with keyboard focus. Keys: s skip, v verify,
  * r reset, h halt, c code, esc/q close. Outside interactive mode (RPC/print, `ctx.hasUI` false)
@@ -21,6 +21,7 @@
 import { hostname, userInfo } from "node:os";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { RunState } from "./core.ts";
+import { TERMINAL } from "./core.ts";
 import type { SwapRow } from "./history.ts";
 
 export interface TierRow {
@@ -32,11 +33,16 @@ export interface OverlayData {
 	run: RunState;
 	swaps: SwapRow[];
 	tiers: TierRow[];
+	/** Y21: the lane churn the flip guard observed, rendered as its own paragraph. */
+	flip?: FlipBadge;
 	/** The previous round's verifier critique (notes + failing checks), verbatim. */
 	critique?: string;
 }
 
 export const OVERLAY_WIDGET_KEY = "fade-overlay";
+
+/** The top-of-editor status widget. `TOP_WIDGET_KEY` is the ONLY surface the pill is drawn on. */
+export const TOP_WIDGET_KEY = "fade-top";
 
 /**
  * `FADE_ORCHESTRATE_REDACT=1` makes the bar safe to screenshot: no username, no home path, no
@@ -100,7 +106,7 @@ function shown(text: string, run: RunState): string {
 }
 
 /**
- * The footer status line: lane, state, round, task tally, the overlay key, the protocol-stall
+ * The status line: lane, state, round, task tally, the overlay key, the protocol-stall
  * badge when the Tier-1 gate is counting, and the tok/s suffix last.
  */
 export function pill(run: RunState, suffix?: string): string {
@@ -118,6 +124,39 @@ function renderPill(tag: string, run: RunState, suffix?: string): string {
 	const stall = (run.stall_count ?? 0) > 0 ? ` · protocol ${run.stall_count}/3` : "";
 	const paused = run.paused === true ? " · paused" : "";
 	return `⚡ ${tag} · R${run.round}/${run.max_rounds} · T${passed}/${total} · [Ctrl+O]${stall}${paused}${suffix ? ` · ${suffix}` : ""}`;
+}
+
+/**
+ * Y21: the lane churn the guard saw, as the surface renders it. Produced from the router client's
+ * `FlipState` by the wiring layer; kept as a plain shape here so the renderer has no transport
+ * dependency and the rig can drive it directly.
+ */
+export interface FlipBadge {
+	flips: number;
+	window_s: number;
+	competing: string[];
+}
+
+/**
+ * The top-of-editor status lines, and the single place the "only when in use" rule lives.
+ *
+ * `undefined` — the caller must CLEAR the widget — when there is no run, when the run is terminal
+ * (`complete`/`failed`/`stopped`, including a run adopted from disk at session_start: a finished
+ * run never advertises), and when this session does not own the run. A live run yields the pill
+ * line, plus a flip line naming the competing entries when the guard is firing.
+ */
+export function topStatus(
+	run: RunState | undefined,
+	opts: { suffix?: string; flip?: FlipBadge; owned?: boolean; cols?: number } = {},
+): string[] | undefined {
+	if (!run) return undefined;
+	if (TERMINAL[run.state] === true) return undefined;
+	if (opts.owned === false) return undefined;
+	const narrow = opts.cols !== undefined && opts.cols < 72;
+	const line = narrow ? pillCompact(run, opts.suffix) : pill(run, opts.suffix);
+	if (!opts.flip || opts.flip.flips < 1) return [line];
+	const who = opts.flip.competing.length > 0 ? opts.flip.competing.join(", ") : "the other lane";
+	return [line, `  lane flip: ${opts.flip.flips} swaps in ${opts.flip.window_s}s — requests naming ${who} (not ${run.lane})`];
 }
 
 /**
@@ -171,6 +210,11 @@ export function overlayLines(d: OverlayData): string[] {
 	if (run.state === "stalled_protocol_error") {
 		out.push(`PROTOCOL STALL (Tier-3 circuit breaker): the lane ended ${run.stall_count ?? 3} turns in a row without a fade_phase call, so the run is halted and NO lane was loaded.`);
 		out.push("  acts: [c] resume on the code lane · [r] reset the round · [p] pause for a manual edit · /orchestrate status reads state.json");
+	}
+	if (d.flip && d.flip.flips > 0) {
+		out.push("");
+		out.push(`lane flip: ${d.flip.flips} swaps in ${d.flip.window_s}s — requests naming ${d.flip.competing.join(", ") || "the other lane"}; the router answers a queued request by swapping to the entry it names, so this churn is NOT the loop's`);
+		out.push("  acts: bash scripts/ops/omp_flip_probe.sh names the client; .omp/config.yml pins the utility roles off the swappable lane");
 	}
 	out.push("");
 	out.push("tasks (untruncated):");

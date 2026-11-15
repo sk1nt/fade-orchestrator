@@ -17,7 +17,7 @@ import { unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, PROVIDER, ROUTER, THINK_LANE, THINKING, listLanes, loadLane, routerBusy, type RouterBusy } from "./router.ts";
+import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipGuarded, flipState, listLanes, loadLane, observeSwaps, routerBusy, type RouterBusy } from "./router.ts";
 import {
 	ACTIVE_FILENAME,
 	DEFAULT_ROUNDS,
@@ -28,7 +28,6 @@ import {
 	STATE_FILENAME,
 	STATE_KEY,
 	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
-	STATUS_KEY,
 	TERMINAL,
 	briefings,
 	readJson,
@@ -39,7 +38,7 @@ import {
 	type RunState,
 	type Task,
 } from "./core.ts";
-import { OVERLAY_WIDGET_KEY, openOverlay, pill, pillCompact, type OverlayData } from "./ui.ts";
+import { OVERLAY_WIDGET_KEY, TOP_WIDGET_KEY, openOverlay, topStatus, type FlipBadge, type OverlayData } from "./ui.ts";
 import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keymap.ts";
 import { appendTurn, readSwaps, turnRecordOrNull } from "./history.ts";
 import { laneMoe, moeRows } from "./moe.ts";
@@ -100,6 +99,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let turnSwapMs = 0;
 	/** The active-tool set captured when the verifier sandbox closed; restored when the code lane loads. */
 	let verifierTools: string[] | undefined;
+	/** Y21: the lane churn the flip guard observed, as the surfaces render it. `undefined` when
+	 *  the window is quiet, so a healthy run never advertises a flip. */
+	let flipBadge: FlipBadge | undefined;
 
 	const refreshMetrics = async (): Promise<void> => {
 		const s = await fetchMetrics();
@@ -117,10 +119,30 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			metricsTimer = undefined;
 		}
 	};
+	// The metrics tick is also the flip watcher's poll, so its cadence is configuration: the host
+	// default is 30 s, the rigs drive 2 s to watch a whole guard window in seconds.
+	const METRICS_INTERVAL_MS = Math.max(250, Number(process.env.FADE_ORCHESTRATE_METRICS_INTERVAL_MS ?? 30_000));
 	const startMetricsTimer = (): void => {
 		stopMetricsTimer();
-		metricsTimer = setInterval(() => void refreshMetrics(), 30_000);
+		metricsTimer = setInterval(() => {
+			void refreshMetrics();
+			void watchFlips();
+		}, METRICS_INTERVAL_MS);
 		void refreshMetrics();
+		void watchFlips();
+	};
+	/**
+	 * Y21: read the router's swap line, then answer the guard question for the lane THIS RUN
+	 * holds — not the router's transient resident entry, which mid-swap names the lane being
+	 * unloaded and would read the loop's own swap as a flip. The watch is read-only: the churn
+	 * belongs to another client, so the loop pays nothing for it and only names it.
+	 */
+	const watchFlips = async (): Promise<void> => {
+		await observeSwaps();
+		const f = flipState(run?.lane, FLIP_WINDOW_MS);
+		const next = flipGuarded(f) ? { flips: f.flips, window_s: f.window_s, competing: f.competing } : undefined;
+		if ((next?.flips ?? 0) === (flipBadge?.flips ?? 0)) return;
+		flipBadge = next;
 	};
 	// Pill suffix: the measured ramp reads cold (deepseek ~91 against a ~130 steady = 0.70), a
 	// loaded lane reads hot; idle reads as nothing.
@@ -193,22 +215,20 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 
 	const paint = (ctx: ExtensionContext): void => {
 		if (!run) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			ctx.ui.setWidget(STATUS_KEY, undefined);
+			ctx.ui.setWidget(TOP_WIDGET_KEY, undefined);
 			ctx.ui.setWidget(OVERLAY_WIDGET_KEY, undefined);
 			return;
 		}
-		// ONE footer pill — the multi-line task dump above the editor is retired. The detail
-		// view is the overlay (Ctrl+O / `/orchestrate overlay`); the transcript stays clean
-		// during long coding runs, which is the whole point of running the loop visibly.
-		const suffix = pillSuffix();
-		// The host truncates the status row at the terminal width (`footer.js`: `truncateToWidth`),
-		// so the FULL lane name is the default and the 2-character tag is only the narrow-terminal
-		// fallback — the operator's placement order is that the pill reads like the model identifier
-		// on the row above, which is itself longer than this line.
+		// ONE status line at the TOP of the editor, and ONLY while a run is in use (operator order
+		// 2026-11-15: "I want the status for orchestrate to exist at the top and it shouldn't
+		// always be there, only when in use … no footer for now"). `topStatus` answers `undefined`
+		// for no run, for a terminal run (including a run adopted from disk at session_start) and
+		// for a run this session does not own, and every one of those CLEARS the widget. The footer
+		// row (`ctx.ui.setStatus`) is never written. The detail view stays the overlay
+		// (Ctrl+O / `/orchestrate overlay`), so the transcript stays clean during long coding runs.
 		const cols = typeof process.stdout.columns === "number" ? process.stdout.columns : undefined;
-		ctx.ui.setStatus(STATUS_KEY, cols !== undefined && cols < 72 ? pillCompact(run, suffix) : pill(run, suffix));
-		ctx.ui.setWidget(STATUS_KEY, undefined);
+		const lines = topStatus(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), cols });
+		ctx.ui.setWidget(TOP_WIDGET_KEY, lines);
 	};
 
 	const fail = (ctx: ExtensionContext, reason: string): void => {
@@ -322,7 +342,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				if (runDir) persistMetrics(runDir, s);
 			}
 			const tiers = [...tiersFromMetrics(metrics), ...moeRows([THINK_LANE, CODE_LANE], { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG })];
-			const data: OverlayData = { run, swaps: readSwaps(runDir), tiers, critique: lastCritique() };
+			const data: OverlayData = { run, swaps: readSwaps(runDir), tiers, critique: lastCritique(), flip: flipBadge };
 			await openOverlay(ctx, data, (key) => {
 				if (!run) return;
 				const dir =
@@ -662,8 +682,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					persist();
 				}
 				pending = undefined;
-				ctx.ui.setStatus(STATUS_KEY, undefined);
-				ctx.ui.setWidget(STATUS_KEY, undefined);
+				ctx.ui.setWidget(TOP_WIDGET_KEY, undefined);
 				ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
 					try {
@@ -911,8 +930,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
-		ctx.ui.setWidget(STATUS_KEY, undefined);
+		ctx.ui.setWidget(TOP_WIDGET_KEY, undefined);
 		stopMetricsTimer();
 	});
 }

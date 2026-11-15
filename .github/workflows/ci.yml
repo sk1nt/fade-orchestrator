@@ -25,5 +25,19 @@ jobs:
         run: test -s dist/index.js
       - name: Unit tests
         run: npm test
-      # The RPC rig (test/rpc_rig.mjs) needs the omp CLI and is run on the host that
-      # owns a basalt router; CI proves the type contract and the pure layers.
+      # The gate rig drives the whole phase protocol against a FAKE router on an ephemeral port:
+      # no omp CLI, no basalt, no provider — so it is a real CI gate, not a host-only rig. It is
+      # the file that proves the single-load-at-agent_end rule, the verifier sandbox, the turn
+      # ledger and the Y21 flip guard.
+      - name: Gate rig (fake router, no host needed)
+        run: npm run test:gate
+      # The operator retired the footer status row (2026-11-15: "no footer for now") and the
+      # monolith's multi-line dump above the editor. Both retirements are load-bearing for the
+      # transcript, so a regression has to fail CI, not just review.
+      - name: The footer writer never ships
+        run: |
+          test -z "$(grep -rnE '\.setStatus\(' src/ || true)"
+          grep -q 'setWidget(TOP_WIDGET_KEY' src/index.ts
+          grep -q 'export const TOP_WIDGET_KEY' src/ui.ts
+      # The RPC rig (test/rpc_rig.mjs) needs the omp CLI and a live provider, so it runs on the
+      # host that owns a basalt router: FADE_ORCHESTRATE_LIVE_SMOKE=1 node test/rpc_rig.mjs

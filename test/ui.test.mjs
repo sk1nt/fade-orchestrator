@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// ui.test.mjs — the footer pill's contract. The operator's placement order (2026-11-15: "put this
-// text up where DeepSeek-v4.1 … is, it should fit fine") is that the pill carries the FULL lane
-// name: the host renders setStatus() text on the footer's extension-status row at full terminal
-// width, directly under the stats row whose right side is the model identifier, and that
-// identifier is longer than this line — so the full name fits. laneTag/pillCompact survive ONLY as
-// the narrow-terminal fallback, where the host truncates the row with "…".
+// ui.test.mjs — the status line's contract. The operator's placement order (2026-11-15, second
+// act: "I want the status for orchestrate to exist at the top and it shouldn't always be there,
+// only when in use … no footer for now") is that the pill rides a widget docked ABOVE the editor,
+// carries the FULL lane name, and is rendered ONLY while a run is in use: `topStatus` answers
+// `undefined` for no run, for a terminal run and for a run this session does not own, and the
+// caller clears the widget on every one of those. The footer's extension-status row
+// (`ctx.ui.setStatus`) is not written at all. laneTag/pillCompact survive ONLY as the
+// narrow-terminal fallback, where the host truncates the line with "…".
 import os from "node:os";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { laneTag, openOverlay, OVERLAY_WIDGET_KEY, overlayLines, pill, pillCompact, redact, statusTag, statusTagCompact } from "../.test-build/ui.mjs";
+import { laneTag, openOverlay, OVERLAY_WIDGET_KEY, overlayLines, pill, pillCompact, redact, statusTag, statusTagCompact, topStatus, TOP_WIDGET_KEY } from "../.test-build/ui.mjs";
 const task = (id, status) => ({ id, objective: `${id} objective`, files: [`${id}.ts`], acceptance: `${id} acceptance`, dependencies: [], round: 1, status });
 const run = (over = {}) => ({
 	lane: "flash-next",
@@ -206,4 +208,49 @@ test("redact: off is the default, and the rendered bytes are today's, verbatim",
 	assert.deepEqual(withFlag(undefined, () => overlayLines(overlayData())), bare, "unset is off: identical bytes");
 	assert.equal(withFlag(undefined, () => pill(run({ lane: "deepseek", repo: REPO }))), "⚡ deepseek:code · R1/6 · T2/3 · [Ctrl+O]");
 	assert.equal(withFlag("0", () => statusTagCompact(run({ lane: "deepseek", repo: REPO }))), "de:code");
+});
+
+// ---- the TOP status widget: the "only when in use" rule, and the flip line ----
+
+test("topStatus: a live run renders the pill line at the top, with the FULL lane name", () => {
+	const lines = topStatus(run({ state: "planning", lane: "deepseek" }));
+	assert.deepEqual(lines, ["⚡ deepseek:plan · R1/6 · T2/3 · [Ctrl+O]"]);
+});
+
+test("topStatus: a terminal run renders NOTHING — a finished run never advertises", () => {
+	for (const state of ["stopped", "complete", "failed"]) {
+		assert.equal(topStatus(run({ state })), undefined, `${state} must clear the widget`);
+	}
+});
+
+test("topStatus: no run and a run this session does not own render NOTHING", () => {
+	assert.equal(topStatus(undefined), undefined);
+	assert.equal(topStatus(run(), { owned: false }), undefined, "a foreign/stale adopted run never paints");
+	assert.equal(topStatus(run(), { owned: true })?.length, 1, "the same run, owned, paints one line");
+});
+
+test("topStatus: the flip badge adds a line naming the competing entry; a quiet run adds none", () => {
+	const quiet = topStatus(run({ lane: "deepseek" }));
+	assert.equal(quiet.length, 1, "a quiet run is one line");
+	const churn = topStatus(run({ lane: "deepseek" }), { flip: { flips: 2, window_s: 120, competing: ["flash-next"] } });
+	assert.equal(churn.length, 2);
+	assert.match(churn[1], /lane flip: 2 swaps in 120s — requests naming flash-next \(not deepseek\)/);
+});
+
+test("topStatus: a narrow terminal falls back to the 2-character lane tag", () => {
+	assert.equal(topStatus(run(), { cols: 60 })[0], "⚡ fn:code · R1/6 · T2/3 · [Ctrl+O]");
+	assert.equal(topStatus(run(), { cols: 100 })[0], "⚡ flash-next:code · R1/6 · T2/3 · [Ctrl+O]");
+});
+
+test("topStatus: the widget key is the top dock, and it is the only surface the pill renders on", () => {
+	assert.equal(TOP_WIDGET_KEY, "fade-top");
+});
+
+test("overlay: the flip paragraph appears only when the guard fired, and names the acts", () => {
+	const data = { run: run(), swaps: [], tiers: [{ label: "engine", value: "basalt" }], critique: undefined };
+	const quiet = overlayLines(data);
+	assert.ok(!quiet.some((l) => l.includes("lane flip")), "a quiet run's overlay says nothing about flips");
+	const churn = overlayLines({ ...data, flip: { flips: 3, window_s: 120, competing: ["flash-next"] } });
+	assert.ok(churn.some((l) => l.includes("lane flip: 3 swaps in 120s — requests naming flash-next")), churn.join("\n"));
+	assert.ok(churn.some((l) => l.includes("omp_flip_probe.sh")), "the overlay names the tool that finds the client");
 });

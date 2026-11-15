@@ -21,7 +21,10 @@
 //  10. the turn ledger writes one JSONL line per turn from the router's own numbers, and NO line
 //      when the router reports no pp/tg (never a fabricated zero),
 //  11. the verifier lane's active set carries no writers and a verifier edit/task is BLOCKED,
-//  12. an accepted verification tags `omp-ckpt/<run>/T<n>-passed` in the repo.
+//  12. an accepted verification tags `omp-ckpt/<run>/T<n>-passed` in the repo,
+//  13. Y21 the FLIP GUARD: swaps the router reports AWAY from the resident lane are counted as a
+//      flip and named, a quiet lane reports none, and a reload of the resident lane inside the
+//      guard window issues ZERO `POST /v1/load` and says why.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
@@ -44,6 +47,9 @@ mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
 const reqLog = [];
 let resident = "flash-next";
 let metricsOn = true;
+/** Y21: the swap the router is mid-way through, as its own `/health` line reports it. `null`
+ *  between swaps, exactly as the real router clears `swap` when a swap lands. */
+let swapLine = null;
 const server = http.createServer(async (req, res) => {
   reqLog.push(`${req.method} ${req.url}`);
   let body = "";
@@ -52,7 +58,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(obj));
   };
-  if (req.url.startsWith("/health")) return send(200, { status: "ok", loaded: resident, loading: false, percent: null, swap: null });
+  if (req.url.startsWith("/health")) return send(200, { status: "ok", loaded: resident, loading: swapLine !== null, percent: null, swap: swapLine });
   if (req.url === "/v1/models")
     return send(200, {
       data: [
@@ -494,6 +500,67 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("no load is paid inside the phase call itself", loads() === l1, `loads=${loads() - l1}`);
 	await hooks.agent_end({}, ctx);
 	ok("the verifier swap is paid once for the refreshed green tree", loads() - l1 === 1, `loads=${loads() - l1}`);
+}
+
+// 19. Y21: the FLIP GUARD. The churn this guards is NOT the loop's: the 2026-11-15 measurement
+// (docs/ops/OMP_FLIP_DIAGNOSIS_20261115.md) is ~40 alternating swaps in 94 minutes, every one of
+// them issued by an OMP auxiliary client (title generator, Mnemopi memory completion) that resolved
+// onto `flash-next` after the cloud `@smol` leg hit a usage limit. The router answers a queued
+// request by swapping to the entry that request names, so the orchestrator cannot prevent it — it
+// can NAME it, and it must never pay a reload of a lane that is already resident while the churn
+// runs. The router module is imported fresh here so its swap log is this block's own.
+{
+  const rt = await import("../.test-build/router.mjs");
+  const l19 = loads();
+
+  // A quiet lane reports no flip.
+  swapLine = null;
+  const quiet = await rt.observeSwaps();
+  ok("a quiet lane reports no flip", quiet.flips === 0 && quiet.competing.length === 0, JSON.stringify(quiet));
+
+  // Two swaps away from the resident lane, with a settle between them (the router's `swap` clears
+  // when a swap lands, which is what re-arms the recorder): that is a flip, and it names the
+  // entry the competing requests asked for.
+  resident = "deepseek";
+  swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 1 };
+  await rt.observeSwaps();
+  swapLine = null;
+  await rt.observeSwaps();
+  swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 3 };
+  await rt.observeSwaps();
+  swapLine = null;
+  const churned = await rt.observeSwaps();
+  ok("two swaps away from the resident lane report a flip", churned.flips === 2, JSON.stringify(churned));
+  ok("the flip names the competing entry", churned.competing.length === 1 && churned.competing[0] === "flash-next", JSON.stringify(churned.competing));
+  ok("the guard is engaged", rt.flipGuarded(churned) === true, JSON.stringify(churned.flips));
+
+  // The same window judged for the lane the swaps LANDED on reads NO flip: the guard counts the
+  // swaps that moved away from the lane the run holds, never the raw swap count. And the recorder
+  // is once-per-swap: the same pair seen again with no settle between is one row, not two.
+  const before = (await rt.observeSwaps()).rows.length;
+  swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 1 };
+  await rt.observeSwaps();
+  await rt.observeSwaps();
+  const deduped = await rt.observeSwaps();
+  ok("three polls of one in-flight swap add exactly ONE row", deduped.rows.length === before + 1, `${before} -> ${deduped.rows.length}`);
+  swapLine = null;
+  resident = "flash-next";
+  const landed = await rt.observeSwaps();
+  ok("the lane the swaps landed on reads no flip", landed.flips === 0, JSON.stringify(landed));
+  resident = "deepseek";
+
+  // A reload of the RESIDENT lane inside the guard window pays nothing and says why.
+  resident = "deepseek";
+  swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 1 };
+  await rt.observeSwaps();
+  swapLine = null;
+  const refused = await rt.loadLane("deepseek");
+  ok("a reload of the resident lane issues ZERO POST /v1/load", loads() === l19, `extra=${loads() - l19}`);
+  ok("the refusal carries the guard's evidence", refused.ok === true && refused.guarded === true && /FLIP GUARD/.test(refused.detail), JSON.stringify(refused.detail));
+
+  // The clause is silent on a quiet lane, so a healthy run's detail never carries it.
+  const quietNote = rt.flipNote(quiet);
+  ok("a quiet lane carries no guard clause", quietNote === "", JSON.stringify(quietNote));
 }
 
 server.close();
