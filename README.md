@@ -141,13 +141,17 @@ wherever the host's shortcut table declines it).
   the steady row ships no escape codes at all. The line is **cleared** — the widget removed — on a
   terminal run (`complete`/`failed`/`stopped`, including a run adopted from disk at `session_start`)
   and when this session does not own the run.
+  The bracket names the chord that **opens the screen**: the configured chord while the host's probe
+  reports it FREE, the fallback chord when the host holds the configured one — never the held key
+  itself.
 - **Model names are abbreviated, and named exactly once.** The form is
   `<model> (<QUANT>, <GPU count>)` — `flash-next (IQ3_S, dual)`, `deepseek (IQ1_M, dual)`; version,
   family word and the RAM/SSD tier are dropped, because the quant and the GPU count are the two
   facts that change the loop's economics. The single place the name rides on the screen is the
   engine column's `resident` row; the panel's lane line carries the lane KEYS with the `◆resident`
-  marker, and the status line names no model at all (the host's model segment is the model's
-  surface). Printing the same model twice was the operator's objection, so the surfaces are split:
+  marker, and the steady status line names no model at all (the host's model segment is the model's
+  surface; the switching row names the incoming lane, because that is what the switch is about).
+  Printing the same model twice was the operator's objection, so the surfaces are split:
   one line for the loop's state, one row for the engine's identity.
 - **`Alt+Shift+F`** — the orchestration screen, in the shape of the host's own agents panel. The key
   is the chord the host's own conflict probe reports FREE: `ctrl+o` (the operator's first ask) is

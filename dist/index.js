@@ -167,6 +167,10 @@ var TERMINAL = { complete: true, failed: true, stopped: true };
 var PHASE_FOR_STATE = { planning: "planning_done", coding: "coding_done", repair: "coding_done", verifying: "verification_done" };
 var MAX_REJECTIONS = 50;
 function normalizeRun(st) {
+  if (!Array.isArray(st.tasks)) st.tasks = [];
+  if (!Array.isArray(st.repair_tasks)) st.repair_tasks = [];
+  if (!Array.isArray(st.phases)) st.phases = [];
+  if (!Array.isArray(st.checks)) st.checks = [];
   if (!Array.isArray(st.rejection_history)) st.rejection_history = [];
   if (typeof st.schema_retries !== "number") st.schema_retries = 0;
   if (typeof st.protocol_retries !== "number") st.protocol_retries = 0;
@@ -669,13 +673,14 @@ function statusLines(run, opts = {}) {
   if (!run) return void 0;
   if (TERMINAL[run.state] === true) return void 0;
   if (opts.owned === false) return void 0;
-  const total = run.tasks.length;
-  const passed = run.tasks.filter((t) => t.status === "passed").length;
+  const tasks = Array.isArray(run.tasks) ? run.tasks : [];
+  const total = tasks.length;
+  const passed = tasks.filter((t) => t.status === "passed").length;
   const stall = (run.stall_count ?? 0) > 0 ? ` \xB7 protocol ${run.stall_count}/3` : "";
   const paused = run.paused === true ? " \xB7 paused" : "";
   const glyph = orchGlyph();
   const head = glyph === "" ? "" : `${glyph} `;
-  const hint = `[${opts.key ?? "Ctrl+O"}]`;
+  const hint = `[${opts.key ?? "Alt+Shift+F"}]`;
   if (opts.swap) {
     const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
     const line2 = `${head}Orchestrator: switching ${opts.swap.from}\u2192${opts.swap.to}${pct} \xB7 ${hint}${stall}${paused}`;
@@ -1516,6 +1521,7 @@ function fadeOrchestrate(pi) {
   let conflictReported = false;
   let chordResolved = false;
   let probeHasAnswered = false;
+  let chordHeld = false;
   let turnSeq = 0;
   let turnPhase;
   let turnSwapMs = 0;
@@ -1624,7 +1630,7 @@ function fadeOrchestrate(pi) {
       ctx.ui.setWidget(OVERLAY_WIDGET_KEY, void 0);
       return;
     }
-    const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(FADE_KEY) });
+    const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(chordHeld ? FALLBACK_KEY : FADE_KEY) });
     if (!lines) {
       clearSurface(ctx);
       return;
@@ -1819,6 +1825,7 @@ function fadeOrchestrate(pi) {
     const owner = conflict?.keybindings?.[0] ?? conflict?.owner;
     const held = conflict !== void 0 || !probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true;
     chordResolved = true;
+    chordHeld = held;
     if (conflictReported) return;
     conflictReported = true;
     const text = held ? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) \u2014 the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z` : `orchestrate: ${keyLabel(FADE_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;

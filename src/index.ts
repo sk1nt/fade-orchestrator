@@ -118,6 +118,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  during extension loading, where the probe throws). */
 	let chordResolved = false;
 	let probeHasAnswered = false;
+	/** True once the disclosure's probe says the configured chord is HELD. The row's key hint reads
+	 *  this: a row that advertises `[Ctrl+O]` while ctrl+o runs the host's action is a row that
+	 *  advertises a dead key (verifier review 2026-11-15 — the HELD rig state captured exactly that
+	 *  on screen while its own assertion read "ctrl+o opens nothing"). The row must name the chord
+	 *  that opens the screen, which in the held state is the fallback. */
+	let chordHeld = false;
 	let turnSeq = 0;
 	let turnPhase: string | undefined;
 	let turnSwapMs = 0;
@@ -291,7 +297,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// `FADE_ORCHESTRATE_SURFACE=status` opts into the status bar for a config that placed the
 		// `status` segment right after the model. The detail view stays the panel, and the row's key
 		// hint is the configured chord's label, so the row never advertises a key it does not honor.
-		const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(FADE_KEY) });
+		const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(chordHeld ? FALLBACK_KEY : FADE_KEY) });
 		if (!lines) {
 			clearSurface(ctx);
 			return;
@@ -546,6 +552,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const owner = (conflict?.keybindings?.[0] ?? conflict?.owner) as string | undefined;
 		const held = conflict !== undefined || (!probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true);
 		chordResolved = true;
+		chordHeld = held;
 		if (conflictReported) return;
 		conflictReported = true;
 		const text = held

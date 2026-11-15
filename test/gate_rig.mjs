@@ -34,6 +34,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildTestBundle } from "./build.mjs";
 
+// The rig must not inherit the CALLER's session identity — the same hygiene `test/rpc_rig.mjs` and
+// `test/pty_rig.mjs` already carry, and the same trap: `isDelegatedSession` (src/index.ts:94) reads
+// a session file nested inside a dated parent dir as a delegated subagent, which is the shape of a
+// `task` agent's `PI_SESSION_FILE`. Inherited, the rig's seeded run is never adopted and every
+// `fade_phase` is refused — measured 2026-11-15 by the verifier lane: `npm run test:gate` exited 1
+// with `fade_phase: no orchestrated run is active` in an agent shell and 0 with the two variables
+// unset. CI is green only because CI has no such environment, which makes the gate non-hermetic in
+// exactly the lane that runs the plan's checks.
+delete process.env.PI_SESSION_FILE;
+delete process.env.PI_SESSION_ID;
+
 // The rig IS the acceptance command (`node test/gate_rig.mjs`), so it builds the bundle it imports
 // instead of trusting whatever `.test-build/` some earlier run left behind — the 2026-11-15 pre-swap
 // gate died on `ERR_MODULE_NOT_FOUND .test-build/router.mjs` for exactly that reason.

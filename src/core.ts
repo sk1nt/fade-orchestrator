@@ -38,6 +38,17 @@ export const MAX_REJECTIONS = 50;
  * clobbered. A pre-gate file resumes as a fresh, unpaused run with zero protocol debt.
  */
 export function normalizeRun(st: RunState): RunState {
+	// The arrays the surfaces deref are defaulted HERE, at the read boundary, because they are
+	// measured missing in real files and every consumer that derefs one crashes a surface: a state
+	// written mid-plan had no `phases` (the panel threw), a hand-seeded state had no `repair_tasks`
+	// (the panel threw), and `tasks`/`checks` are read raw by the row (`src/ui.ts`), the briefing
+	// builder (`core.ts` 286/337/343/344) and the gate (`index.ts` 756/1081). Defaulting the
+	// protocol counters alone left that class alive on every surface but the panel (verifier review
+	// 2026-11-15). A value already carried in the file is never clobbered.
+	if (!Array.isArray(st.tasks)) st.tasks = [];
+	if (!Array.isArray(st.repair_tasks)) st.repair_tasks = [];
+	if (!Array.isArray(st.phases)) st.phases = [];
+	if (!Array.isArray(st.checks)) st.checks = [];
 	if (!Array.isArray(st.rejection_history)) st.rejection_history = [];
 	if (typeof st.schema_retries !== "number") st.schema_retries = 0;
 	if (typeof st.protocol_retries !== "number") st.protocol_retries = 0;

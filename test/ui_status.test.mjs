@@ -40,34 +40,34 @@ const withGlyph = (value, fn) => {
 
 test("statusLines: an empty planning run reads exactly the operator's line", () => {
 	const lines = statusLines(run({ state: "planning", tasks: [] }));
-	assert.deepEqual(lines, ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Ctrl+O]"]);
+	assert.deepEqual(lines, ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]"]);
 });
 
 test("statusLines: the state, the round budget and the task tally all ride", () => {
-	assert.deepEqual(statusLines(run()), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Ctrl+O]"]);
-	assert.deepEqual(statusLines(run({ state: "verifying", round: 4, max_rounds: 6 })), ["󰚩 Orchestrator: ver R4/6 · T2/3 · [Ctrl+O]"]);
-	assert.deepEqual(statusLines(run({ state: "repair", lane: "deepseek" })), ["󰚩 Orchestrator: fix R1/6 · T2/3 · [Ctrl+O]"]);
+	assert.deepEqual(statusLines(run()), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Alt+Shift+F]"]);
+	assert.deepEqual(statusLines(run({ state: "verifying", round: 4, max_rounds: 6 })), ["󰚩 Orchestrator: ver R4/6 · T2/3 · [Alt+Shift+F]"]);
+	assert.deepEqual(statusLines(run({ state: "repair", lane: "deepseek" })), ["󰚩 Orchestrator: fix R1/6 · T2/3 · [Alt+Shift+F]"]);
 });
 
 test("statusLines: the glyph is a Nerd Font codepoint and is overridable for a terminal without one", () => {
 	assert.equal(withGlyph(undefined, orchGlyph), "󰚩");
-	assert.deepEqual(withGlyph("⚡", () => statusLines(run({ tasks: [], state: "planning" }))), ["⚡ Orchestrator: plan R1/6 · T0/0 · [Ctrl+O]"]);
+	assert.deepEqual(withGlyph("⚡", () => statusLines(run({ tasks: [], state: "planning" }))), ["⚡ Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]"]);
 	// An empty glyph drops the glyph AND its space: the line still starts on the word.
-	assert.deepEqual(withGlyph("", () => statusLines(run({ tasks: [], state: "planning" }))), ["Orchestrator: plan R1/6 · T0/0 · [Ctrl+O]"]);
+	assert.deepEqual(withGlyph("", () => statusLines(run({ tasks: [], state: "planning" }))), ["Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]"]);
 });
 
 test("statusLines: the Tier-1 protocol badge rides only while the stall counter runs", () => {
-	assert.deepEqual(statusLines(run({ stall_count: 1 })), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Ctrl+O] · protocol 1/3"]);
-	assert.deepEqual(statusLines(run({ stall_count: 3 })), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Ctrl+O] · protocol 3/3"]);
+	assert.deepEqual(statusLines(run({ stall_count: 1 })), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Alt+Shift+F] · protocol 1/3"]);
+	assert.deepEqual(statusLines(run({ stall_count: 3 })), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Alt+Shift+F] · protocol 3/3"]);
 	assert.ok(!statusLines(run({ stall_count: 0 }))[0].includes("protocol"), "a clean run must not advertise a stall");
 });
 
 test("statusLines: a paused run says so, so a parked loop is never read as a hung one", () => {
-	assert.deepEqual(statusLines(run({ paused: true })), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Ctrl+O] · paused"]);
+	assert.deepEqual(statusLines(run({ paused: true })), ["󰚩 Orchestrator: code R1/6 · T2/3 · [Alt+Shift+F] · paused"]);
 });
 
 test("statusLines: the measured decode suffix rides last", () => {
-	assert.deepEqual(statusLines(run({ tasks: [], state: "planning" }), { suffix: "hot 130t/s" }), ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Ctrl+O] · hot 130t/s"]);
+	assert.deepEqual(statusLines(run({ tasks: [], state: "planning" }), { suffix: "hot 130t/s" }), ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F] · hot 130t/s"]);
 });
 
 test("statusLines: the flip guard adds a second line naming the competing entries; a quiet router adds none", () => {
@@ -120,7 +120,15 @@ test("keyLabel: the row names the chord the way a keycap does", () => {
 
 test("statusLines: the key hint is the configured chord's label, never a literal", () => {
 	assert.deepEqual(statusLines(run({ tasks: [], state: "planning" }), { key: "Alt+Shift+F" }), ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]"]);
-	assert.deepEqual(statusLines(run({ tasks: [], state: "planning" })), ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Ctrl+O]"], "the default stays Ctrl+O, so a caller that passes nothing keeps the old row");
+	assert.deepEqual(statusLines(run({ tasks: [], state: "planning" }), { key: "Alt+Shift+I" }), ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+I]"], "the HELD state passes the fallback chord: the row names the chord that OPENS the screen, and the pty rig proved the old row advertising `[Ctrl+O]` in exactly that state while its own assertion read \"ctrl+o opens nothing\"");
+	assert.deepEqual(statusLines(run({ tasks: [], state: "planning" })), ["󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]"], "the default is the delivered chord — `Ctrl+O` is the chord the host holds and this extension never binds, so defaulting to it would advertise a dead key");
+});
+
+test("statusLines: a disk state with no `tasks` renders T0/0 — the row is painted on every tick", () => {
+	// The crash class the rpc rig measured for the panel (a state with no `phases`, then no
+	// `repair_tasks`): a JSON file is not the type. The row runs inside a host callback on every
+	// metrics tick, so an absent array must read as an empty plan, never as a throw.
+	assert.deepEqual(statusLines({ state: "coding", round: 1, max_rounds: 6 }), ["󰚩 Orchestrator: code R1/6 · T0/0 · [Alt+Shift+F]"]);
 });
 
 // ---- the short labels the panel's rows use ----
@@ -162,7 +170,7 @@ test("the switching row is multicolored, and the incoming model is named exactly
 	const lines = statusLines(run({ lane: "deepseek" }), { swap: { from: "deepseek", to: "flash-next (IQ3_S, dual)", percent: 47 } });
 	const raw = lines[0];
 	const plain = raw.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
-	assert.equal(plain, "󰚩 Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Ctrl+O]");
+	assert.equal(plain, "󰚩 Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+Shift+F]");
 	const colors = raw.match(/\x1b\[38;2;\d+;\d+;\d+m/g) ?? [];
 	assert.ok(colors.length >= 20, `the row is not multicolored (${colors.length} color runs)`);
 	assert.equal(plain.match(/flash-next/g).length, 1, "the model name rides once");
@@ -222,7 +230,7 @@ test("redact: the row is screenshot-safe with the flag on, state/round/tally int
 	const r = run({ lane: "deepseek", repo: REPO });
 	const lines = withFlag("1", () => statusLines(r, { suffix: `130t/s · ${REPO} by ${USER} on ${HOST}` }));
 	lines.forEach(assertNoIdentity);
-	assert.equal(lines[0], "󰚩 Orchestrator: code R1/6 · T2/3 · [Ctrl+O] · 130t/s · <path> by <user> on <host>", "the round/task tally survives");
+	assert.equal(lines[0], "󰚩 Orchestrator: code R1/6 · T2/3 · [Alt+Shift+F] · 130t/s · <path> by <user> on <host>", "the round/task tally survives");
 });
 
 test("redact: off is the default, and the rendered bytes are today's, verbatim", () => {

@@ -3,7 +3,7 @@
  *
  * Main pane: ONE status line at the TOP, docked above the editor, in the operator's own words
  * (2026-11-15: "use a nerdfont … and just say Orchestrator: plan R1/6 T0/0"):
- *   󰚩 Orchestrator: plan R1/6 · T0/0 · [Ctrl+O]
+ *   󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]
  * and NOTHING multi-line above the editor while a run is live (the monolith painted a 6+ line task
  * dump there; during long coding runs that dump ate the transcript).
  *
@@ -218,14 +218,19 @@ export function statusLines(
 	if (!run) return undefined;
 	if (TERMINAL[run.state] === true) return undefined;
 	if (opts.owned === false) return undefined;
-	const total = run.tasks.length;
-	const passed = run.tasks.filter((t) => t.status === "passed").length;
+	// A state read off disk can lack the arrays (the class measured in the rpc rig); the row is the
+	// one surface painted on every tick, so a missing `tasks` must not throw inside a host callback.
+	const tasks = Array.isArray(run.tasks) ? run.tasks : [];
+	const total = tasks.length;
+	const passed = tasks.filter((t) => t.status === "passed").length;
 	const stall = (run.stall_count ?? 0) > 0 ? ` · protocol ${run.stall_count}/3` : "";
 	const paused = run.paused === true ? " · paused" : "";
 	const glyph = orchGlyph();
 	const head = glyph === "" ? "" : `${glyph} `;
-	// The open-key hint rides the configured chord, never a literal, so the row and the key agree.
-	const hint = `[${opts.key ?? "Ctrl+O"}]`;
+	// The key hint is the configured chord's label, passed in by the caller: the row and the key can
+	// never disagree, and the default is the delivered chord — `Ctrl+O` is the chord the host holds
+	// and this extension never binds, so a row that defaulted to it would advertise a dead key.
+	const hint = `[${opts.key ?? "Alt+Shift+F"}]`;
 	if (opts.swap) {
 		const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
 		const line = `${head}Orchestrator: switching ${opts.swap.from}→${opts.swap.to}${pct} · ${hint}${stall}${paused}`;

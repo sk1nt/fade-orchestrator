@@ -33,12 +33,21 @@ jobs:
         run: npm run test:gate
       # The delivered status surface is ONE compact line on the top widget (the footer row and
       # the monolith's multi-line dump above the editor are both retired, operator 2026-11-15),
-      # and the Alt+F panel is the detail screen. The line's placement is load-bearing for the
-      # transcript, so a regression has to fail CI, not just review.
+      # and the Alt+Shift+F panel is the detail screen. The line's placement is load-bearing for
+      # the transcript, so a regression has to fail CI, not just review.
       - name: The status line ships on the top widget
         run: |
-          test -z "$(grep -rnE '\.setStatus\(' src/ || true)"
           grep -q 'setWidget(TOP_WIDGET_KEY' src/index.ts
           grep -q 'export const TOP_WIDGET_KEY' src/ui.ts
+          # Every `setStatus` in the ONE writer (`src/index.ts`) must be GUARDED. The status BAR is
+          # the documented opt-in (FADE_ORCHESTRATE_SURFACE=status, README + docs/OVERLAY.md), proved
+          # on a real terminal by the pty rig ("FADE_ORCHESTRATE_SURFACE=status puts the same text on
+          # the host's status surface") and asserted as the negative by the rpc rig (zero status-bar
+          # rows on the default surface). A write outside those guards is the regression this step
+          # is for. The blanket ban this step carried went RED the day the opt-in shipped — the file
+          # legitimately calls setStatus twice (src/index.ts:279 behind `statusWritten`, :307 inside
+          # the SURFACE branch), and a CI gate that forbids a documented path is a false gate. A
+          # grep over `src/ui.ts` is not usable here: that file names setStatus in prose only.
+          bash -c 'guards=$(grep -n -E "if \(statusWritten\)|SURFACE === .status." src/index.ts | cut -d: -f1); test -n "$guards" || { echo "no status-surface guard found"; exit 1; }; for l in $(grep -n "setStatus(ORCH_STATUS_KEY" src/index.ts | cut -d: -f1); do ok=0; for g in $guards; do if [ "$l" -gt "$g" ] && [ $((l - g)) -le 8 ]; then ok=1; fi; done; if [ "$ok" != 1 ]; then echo "unguarded setStatus at line $l"; exit 1; fi; done; echo "setStatus guarded: $(grep -c "setStatus(ORCH_STATUS_KEY" src/index.ts) call sites, guards at $(echo $guards | tr " " ,)"'
       # The RPC rig (test/rpc_rig.mjs) needs the omp CLI and a live provider, so it runs on the
       # host that owns a basalt router: FADE_ORCHESTRATE_LIVE_SMOKE=1 node test/rpc_rig.mjs

@@ -36,14 +36,25 @@ surface, and printing it twice names the model twice).
 `<model> (<QUANT>, <GPU count>)` — `flash-next (IQ3_S, dual)`, `deepseek (IQ1_M, dual)`. Version,
 family word and the RAM/SSD tier are dropped: the quant and the GPU count are the two facts that
 change the loop's economics (decode rate, spill, swap cost), and the row is 100 columns wide. The
-name then rides in **exactly one place on the screen** — the engine column's `resident` row, named
-by `nameResidentRow()` in `src/screendata.ts`. The panel's lane line carries the lane KEYS with the
-`◆resident` marker, and the status line names no model. A name carrying no quant and no GPU count
-passes its base segment through, so an unknown model is never masked.
+name then rides in **one place per surface**: on the panel it is the engine column's `resident` row,
+named by `nameResidentRow()` in `src/screendata.ts`; on the status line it appears **only while a
+lane is loading**, as the subject of the switch (`switching deepseek→flash-next (IQ3_S, dual) 47%`),
+and the steady line names no model at all — so a surface never repeats the name, and the transient
+row and the durable engine column are different surfaces. The panel's lane line carries the lane
+KEYS with the `◆resident` marker. A name carrying no quant and no GPU count passes its base segment
+through, so an unknown model is never masked.
 
 `FADE_ORCHESTRATE_SURFACE=status` opts into the host's status-bar surface (`setStatus`) instead of
 the top widget. The default ships the widget: the footer row is the host's and the operator retired
 the pill there.
+
+**The row names the chord it honors.** The key hint is `keyLabel(chordHeld ? FALLBACK_KEY :
+FADE_KEY)` (`src/index.ts`): the configured chord when the host's probe reports it FREE, the
+fallback chord when the host holds the configured one. The first cut of this feature painted
+`[Ctrl+O]` in the held state, advertising a key that opened nothing while the pty rig's own
+assertion in that state read "ctrl+o opens nothing" — the row and the key disagreeing on the same
+screen. The pty rig now asserts the label in BOTH states (`[Alt+Shift+F]` free, `[Alt+Shift+I]`
+held), and `statusLines()` defaults to the delivered chord, never to `Ctrl+O`.
 
 ## The panel's key: `alt+shift+f`, the listener, the fallback
 

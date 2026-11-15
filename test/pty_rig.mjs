@@ -285,6 +285,9 @@ for (const state of ["DEFAULT", "HELD"]) {
 		if (state === "DEFAULT") {
 			const disclosed = strip(await untilText("opens the orchestration screen", 20_000));
 			ok(`[${tag}] the disclosure names the key and the fallback`, /Alt\+Shift\+F opens the orchestration screen/.test(disclosed) && disclosed.includes("Alt+Shift+I"), disclosed.slice(-380));
+			// The row and the key must agree: in the free state the row advertises the configured chord.
+			const shown = strip(scrollback());
+			ok(`[${tag}] the row advertises the chord that opens the screen`, /T\d+\/\d+ · \[Alt\+Shift\+F\]/.test(shown), shown.slice(-300));
 			tmux("send-keys", "-t", SESSION, "-H", "1b", "46");
 			const opened = strip(await until("ENGINE / ROUTER", 20_000));
 			ok(`[${tag}] ESC F opens the screen`, opened.includes("ENGINE / ROUTER"), opened.slice(0, 300));
@@ -300,6 +303,11 @@ for (const state of ["DEFAULT", "HELD"]) {
 		} else {
 			const disclosed = strip(await untilText("is held by the host", 20_000));
 			ok(`[${tag}] the disclosure names the conflict, the fallback and the way to move the key`, /Ctrl\+O is held by the host/.test(disclosed) && disclosed.includes("Alt+Shift+I") && disclosed.includes("FADE_ORCHESTRATE_KEY"), disclosed.slice(-380));
+			// The row's key hint follows the chord that is HONORED. The first version of this feature
+			// painted `[Ctrl+O]` in this state while its own assertion read "ctrl+o opens nothing" —
+			// a row advertising a dead key (verifier review 2026-11-15). The row must name the fallback.
+			const shown = strip(scrollback());
+			ok(`[${tag}] the row advertises the fallback, not the host's chord`, /T\d+\/\d+ · \[Alt\+Shift\+I\]/.test(shown) && !/T\d+\/\d+ · \[Ctrl\+O\]/.test(shown), shown.slice(-300));
 			// Same proof as the DEFAULT state: the extension opened nothing on the host's chord.
 			tmux("send-keys", "-t", SESSION, "C-o");
 			await sleep(2500);
