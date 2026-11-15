@@ -1,0 +1,29 @@
+{
+  "name": "fade-orchestrator",
+  "version": "0.1.0",
+  "description": "OMP extension: one session, two basalt router lanes — a thinking pack plans and verifies, a fast pack codes, driven by the fade_phase contract.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "bash build.sh",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run test:build && node --test \"test/*.test.mjs\"",
+    "test:build": "npx esbuild src/keymap.ts src/livedata.ts src/history.ts src/core.ts src/moe.ts --bundle --format=esm --platform=node --outdir=.test-build --out-extension:.js=.mjs && npx esbuild src/index.ts --bundle --format=esm --platform=node --outfile=.test-build/index.mjs"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "esbuild": "^0.24",
+    "typescript": "^5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sk1nt/fade-orchestrator.git"
+  }
+}

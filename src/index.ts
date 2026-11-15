@@ -1,0 +1,604 @@
+/**
+ * fade_orchestrate: one OMP session, two basalt lanes. (Wiring; the router client is
+ * ./router.ts, the schema/validators/briefings are ./core.ts. The 2026-11-15 split from the
+ * 601-line monolith is behavior-freeze: every string, rule and ordering is carried over.)
+ *
+ * The loop is a phase contract, not tool sandboxing: the thinking lane answers with
+ * `fade_phase`, and the tool validates, records the phase and ends the turn. `agent_end` is the
+ * only `setModel`/load site (the host defers model switches while streaming, and a load issued
+ * into a turn's queued requests flips the lane back — the 2026-11-14 ping-pong).
+ *
+ *   /orchestrate [--rounds N] <goal>   start a run (default 6 rounds, max 6)
+ *   /orchestrate status                state, lane, round, tasks, phase log, path
+ *   /orchestrate stop [--clear]        mark the run stopped (leave the resident lane)
+ *   /lanes                             live router census: both entries + health
+ */
+import { unlinkSync } from "node:fs";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Type } from "typebox";
+import { CODE_LANE, PROVIDER, ROUTER, THINK_LANE, THINKING, listLanes, loadLane } from "./router.ts";
+import {
+	ACTIVE_FILENAME,
+	DEFAULT_ROUNDS,
+	MAX_ROUNDS,
+	MAX_TASKS,
+	PHASE_FOR_STATE,
+	STATE_FILENAME,
+	STATE_KEY,
+	SCHEMA_HINT, adaptiveRounds, normalizeRun, pushRejection, runGate,
+	STATUS_KEY,
+	TERMINAL,
+	briefings,
+	readJson,
+	validateChecks,
+	validateTasks,
+	writeJson,
+	type PhaseLog,
+	type RunState,
+	type Task,
+} from "./core.ts";
+import { OVERLAY_WIDGET_KEY, openOverlay, pill, type OverlayData } from "./ui.ts";
+import { actCode, actHalt, actReset, actSkip, actVerify } from "./keymap.ts";
+import { readSwaps } from "./history.ts";
+import { laneMoe, moeRows } from "./moe.ts";
+import { handoverText } from "./core.ts";
+import { coldHot, fetchMetrics, laneBestRate, persistMetrics, startSwapWatch, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
+
+// The overlay key. Ctrl+O is the app's "toggle tool output" binding on this host (measured in
+// the keybindings table: app.tools.expand defaultKeys ctrl+o) — the operator asked for Ctrl+O,
+// so it is the default and the takeover is disclosed; set FADE_ORCHESTRATE_KEY to keep the
+// built-in (e.g. "ctrl+g").
+const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "ctrl+o";
+
+export default function fadeOrchestrate(pi: ExtensionAPI): void {
+	let run: RunState | undefined;
+	let runDir: string | undefined;
+	let pending: { lane: string; phase: string } | undefined;
+	let settledNotified = false;
+	let metrics: MetricsSnapshot | undefined;
+	let laneBest = 0;
+	let metricsTimer: NodeJS.Timeout | undefined;
+
+	const refreshMetrics = async (): Promise<void> => {
+		const s = await fetchMetrics();
+		if (!s) return;
+		metrics = s;
+		if (runDir) persistMetrics(runDir, s);
+		if (run) {
+			const b = laneBestRate(s, run.lane);
+			if (b && b > laneBest) laneBest = b;
+		}
+	};
+	const stopMetricsTimer = (): void => {
+		if (metricsTimer !== undefined) {
+			clearInterval(metricsTimer);
+			metricsTimer = undefined;
+		}
+	};
+	const startMetricsTimer = (): void => {
+		stopMetricsTimer();
+		metricsTimer = setInterval(() => void refreshMetrics(), 30_000);
+		void refreshMetrics();
+	};
+	// Pill suffix: the measured ramp reads cold (deepseek ~91 against a ~130 steady = 0.70), a
+	// loaded lane reads hot; idle reads as nothing.
+	const pillSuffix = (): string | undefined => {
+		if (!metrics) return undefined;
+		const ch = coldHot(metrics.tok_s, laneBest);
+		if (ch.label === "idle" || ch.rate === undefined) return undefined;
+		return `${ch.label} ${Math.round(ch.rate)}t/s`;
+	};
+
+	// Measured on this host: registerTool() puts fade_phase in the registry (/tools lists it) but
+	// NOT in the active set the model is offered, so every phase briefing must activate it first.
+	const ensurePhaseTool = async (): Promise<void> => {
+		const active = pi.getActiveTools();
+		if (!active.includes("fade_phase")) await pi.setActiveTools([...active, "fade_phase"]);
+	};
+
+	const statePath = (): string => (runDir ? join(runDir, STATE_FILENAME) : "<unset>");
+	const persist = (): void => {
+		if (run && runDir) writeJson(statePath(), run);
+	};
+
+	const paint = (ctx: ExtensionContext): void => {
+		if (!run) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			ctx.ui.setWidget(STATUS_KEY, undefined);
+			ctx.ui.setWidget(OVERLAY_WIDGET_KEY, undefined);
+			return;
+		}
+		// ONE footer pill — the multi-line task dump above the editor is retired. The detail
+		// view is the overlay (Ctrl+O / `/orchestrate overlay`); the transcript stays clean
+		// during long coding runs, which is the whole point of running the loop visibly.
+		ctx.ui.setStatus(STATUS_KEY, pill(run, pillSuffix()));
+		ctx.ui.setWidget(STATUS_KEY, undefined);
+	};
+
+	const fail = (ctx: ExtensionContext, reason: string): void => {
+		if (run) {
+			run.state = "failed";
+			run.reason = reason;
+			persist();
+			paint(ctx);
+		}
+		ctx.ui.notify(`fade_orchestrate: ${reason}`, "error");
+	};
+
+	// The lane switch as one callable unit: `agent_end` (the phase contract's single load site)
+	// and the overlay's v/c keys run the SAME sequence — setModel, setThinkingLevel, the
+	// settle-then-load router call, persist, paint, briefing. No queued-request window exists
+	// while a slash command runs, so calling it from a command is the same boundary discipline.
+	const switchLane = async (lane: string, ctx: ExtensionContext): Promise<void> => {
+		const model = ctx.modelRegistry.find(PROVIDER, lane);
+		if (!model) {
+			fail(ctx, `model ${PROVIDER}/${lane} is not in the registry`);
+			return;
+		}
+		const switched = await pi.setModel(model);
+		if (switched !== true && (switched as unknown as { switched?: boolean } | null)?.switched !== true) {
+			fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
+			return;
+		}
+		pi.setThinkingLevel(THINKING[lane]);
+		// Swap watch: samples /health (phase, percent) while the pack loads, then reads the
+		// first-completion and steady decode rates off /metrics and appends a history row —
+		// the durable measurement behind batch-verification-into-one-residency decisions.
+		const from = run?.lane ?? "";
+		// Optimal MoE loading, measured per swap (moe.ts): the Flash-Next pack saves its learned
+		// adaptive-tier placement and starts from it; the profile's existence + age BEFORE this
+		// swap is what decides "warm start" vs the 91 tok/s cold ramp.
+		const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
+		const watch = startSwapWatch(lane, moe);
+		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
+		const loaded = await loadLane(lane);
+		ctx.ui.setWorkingMessage();
+		if (!loaded.ok) {
+			watch.cancel();
+			fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
+			return;
+		}
+		if (from && runDir && from !== lane) void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
+		if (run) run.lane = lane;
+		persist();
+		paint(ctx);
+		setTimeout(async () => {
+			await ensurePhaseTool();
+			const text =
+				run!.state === "repair"
+					? briefings.repair(run!)
+					: lane === CODE_LANE && run!.gate_last && run!.gate_last.passed === false
+						? briefings.gate(run!)
+						: lane === CODE_LANE
+							? briefings.code(run!)
+							: briefings.verify(run!);
+			pi.sendUserMessage(text);
+		}, 0);
+	};
+
+	const lastCritique = (): string | undefined => {
+		const phases = run?.phases ?? [];
+		for (let i = phases.length - 1; i >= 0; i--) if (phases[i].phase === "verification_done") return phases[i].notes;
+		return undefined;
+	};
+
+	const showOverlay = async (ctx: ExtensionContext): Promise<void> => {
+		if (!run || !runDir) {
+			ctx.ui.notify("orchestrate: no run active", "info");
+			return;
+		}
+		try {
+			const s = await fetchMetrics();
+			if (s) {
+				metrics = s;
+				if (runDir) persistMetrics(runDir, s);
+			}
+			const tiers = [...tiersFromMetrics(metrics), ...moeRows([THINK_LANE, CODE_LANE], { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG })];
+			const data: OverlayData = { run, swaps: readSwaps(runDir), tiers, critique: lastCritique() };
+			await openOverlay(ctx, data, (key) => {
+				if (!run) return;
+				const dir = key === "s" ? actSkip(run) : key === "v" ? actVerify(run) : key === "r" ? actReset(run) : key === "c" ? actCode(run) : key === "h" ? actHalt(run) : undefined;
+				if (!dir) return;
+				persist();
+				paint(ctx);
+				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+				if (dir.next) void switchLane(dir.next, ctx);
+			}, process.env.FADE_ORCHESTRATE_HEADLESS === "1");
+		} catch (e) {
+			ctx.ui.notify(`orchestrate: overlay failed: ${String(e instanceof Error ? e.message : e)}`, "error");
+		}
+	};
+
+	/** Apply one validated phase; returns the lane to load and the resulting state. */
+	const applyPhase = (phase: string, payload: Record<string, unknown>): { next: string; nextState: string } => {
+		if (!run) throw new Error("unreachable: no run");
+		// `run` is a mutable `let`; the closures below lose the guard's narrowing, so the state is
+		// captured for the whole phase application — which is the atomicity the phase contract
+		// wants anyway: one validated phase, one consistent snapshot.
+		const st: RunState = run;
+		st.phases.push({ phase, lane: st.lane, accepted: true, round: st.round, at: new Date().toISOString(), notes: typeof payload.notes === "string" ? payload.notes : undefined });
+		if (phase === "planning_done") {
+			st.tasks = (payload.tasks as Task[]).map((t) => ({ ...t, round: st.round }));
+			st.checks = payload.checks as [string, string][];
+			st.tier = st.tasks.length <= 2 ? "S" : st.tasks.length <= 4 ? "M" : "L";
+			// Adaptive budget: a 2-task plan reserves 3 rounds, a 6-task plan 5 — swaps are the
+			// unit of cost here (13-25 s per pack load), so the budget tracks the plan size.
+			st.max_rounds = adaptiveRounds(st.tasks.length, st.max_rounds);
+			st.repair_tasks = [];
+			st.state = "coding";
+			return { next: CODE_LANE, nextState: "coding" };
+		}
+		if (phase === "coding_done") {
+			for (const d of payload.done as Array<{ id: string; status: string; result?: string }>) {
+				const task = st.tasks.find((t) => t.id === d.id) ?? st.repair_tasks.find((t) => t.id === d.id);
+				if (task) {
+					task.status = d.status;
+					task.result = d.result;
+				}
+			}
+			st.state = "verifying";
+			return { next: THINK_LANE, nextState: "verifying" };
+		}
+		const accepted = String(payload.verdict) === "accepted";
+		st.phases[st.phases.length - 1].accepted = accepted;
+		if (accepted) {
+			st.state = "complete";
+			return { next: THINK_LANE, nextState: "complete" };
+		}
+		pushRejection(
+			st,
+			"verification",
+			typeof payload.notes === "string" ? payload.notes : "needs_repair",
+			Array.isArray(payload.tasks) ? (payload.tasks as Array<{ id: string }>).map((t) => t.id).join(",") : undefined,
+		);
+		if (st.round + 1 > st.max_rounds) {
+			st.state = "failed";
+			st.reason = `round budget exhausted (${st.max_rounds}) with verdict needs_repair`;
+			return { next: THINK_LANE, nextState: "failed" };
+		}
+		st.round += 1;
+		st.repair_tasks = (payload.tasks as Task[]).map((t) => ({ ...t, round: st.round, status: undefined, result: undefined }));
+		st.state = "repair";
+		return { next: CODE_LANE, nextState: "repair" };
+	};
+
+	pi.registerTool({
+		name: "fade_phase",
+		label: "fade phase",
+		description:
+			'Report one completed orchestration phase and end the turn so the orchestrator can switch lanes. ' +
+			'phase=planning_done payload={"tasks":[{"id","objective","files","acceptance","dependencies"}],"checks":[["cmd","expected"]]}; ' +
+			'phase=coding_done payload={"done":[{"id","status","result"}]}; ' +
+			'phase=verification_done payload={"verdict":"accepted"|"needs_repair","checks":[["cmd","observed"]],"notes":"...","tasks":[...]}. ' +
+			"payload is that JSON object serialized to a string. Invalid phase, payload or ordering is refused with the rule named.",
+		parameters: Type.Object({
+			phase: Type.String({ description: "planning_done | coding_done | verification_done" }),
+			payload: Type.String({ description: "the phase JSON object, as a string" }),
+		}),
+		// `essential` ships the schema in the request catalog; `discoverable` (the default) is
+		// mounted behind xd:// and the phase contract cannot be answered that way.
+		// omp 18.20's registerTool takes `loadMode`; the 0.73.1 peer types predate it.
+		// @ts-expect-error loadMode is accepted at runtime (essential = shipped in the catalog).
+		loadMode: "essential",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Schema auto-repair: every refusal is recorded; from the second refusal the exact
+			// payload schemas ride back in the error text, so the model self-corrects instead of
+			// probing blind. The rejection history is the durable record of what was refused.
+			let payload: Record<string, unknown>;
+			try {
+			if (!run) throw new Error("fade_phase: no orchestrated run is active (start one with /orchestrate <goal>)");
+			if (TERMINAL[run.state] === true) throw new Error(`fade_phase: run ${run.run_id} is already ${run.state}`);
+			if (run.round > run.max_rounds) throw new Error(`fade_phase: round ${run.round} exceeds max_rounds ${run.max_rounds}`);
+			const allowed = PHASE_FOR_STATE[run.state];
+			if (!allowed) throw new Error(`fade_phase: state ${run.state} takes no phase`);
+			if (params.phase !== allowed) throw new Error(`fade_phase: state ${run.state} takes phase ${allowed}, not ${params.phase}`);
+			try {
+				payload = JSON.parse(params.payload) as Record<string, unknown>;
+			} catch {
+				throw new Error("fade_phase: payload is not valid JSON");
+			}
+			if (typeof payload !== "object" || payload === null || Array.isArray(payload)) throw new Error("fade_phase: payload must be a JSON object");
+			const allowedKeys: Record<string, Set<string>> = {
+				planning_done: new Set(["tasks", "checks"]),
+				coding_done: new Set(["done"]),
+				verification_done: new Set(["verdict", "checks", "notes", "tasks"]),
+			};
+			for (const key of Object.keys(payload)) {
+				if (!allowedKeys[params.phase].has(key)) throw new Error(`fade_phase: ${params.phase} does not take key "${key}"`);
+			}
+			if (params.phase === "planning_done") {
+				const tasks = validateTasks(payload.tasks);
+				if (tasks.error) throw new Error(`fade_phase: ${tasks.error}`);
+				const checks = validateChecks(payload.checks);
+				if (checks.error) throw new Error(`fade_phase: ${checks.error}`);
+			}
+			if (params.phase === "coding_done") {
+				if (!Array.isArray(payload.done) || payload.done.length === 0) throw new Error("fade_phase: coding_done needs a non-empty done[]");
+				const ids = new Set(run.tasks.concat(run.repair_tasks).map((t) => t.id));
+				for (const entry of payload.done as Array<Record<string, unknown>>) {
+					if (typeof entry.id !== "string" || !ids.has(entry.id)) throw new Error(`fade_phase: done entry ${JSON.stringify(entry.id)} is not a task of this run`);
+					if (!["passed", "failed", "blocked"].includes(String(entry.status))) throw new Error(`fade_phase: ${entry.id} status must be passed|failed|blocked`);
+				}
+			}
+			if (params.phase === "verification_done") {
+				if (!["accepted", "needs_repair"].includes(String(payload.verdict))) throw new Error("fade_phase: verdict must be accepted or needs_repair");
+				if (payload.checks !== undefined) {
+					const checks = validateChecks(payload.checks);
+					if (checks.error) throw new Error(`fade_phase: ${checks.error}`);
+				}
+				if (String(payload.verdict) === "needs_repair") {
+					if (!Array.isArray(payload.tasks) || payload.tasks.length === 0) throw new Error("fade_phase: needs_repair requires a non-empty tasks[]");
+					const tasks = validateTasks(payload.tasks);
+					if (tasks.error) throw new Error(`fade_phase: ${tasks.error}`);
+				}
+			}
+			} catch (e) {
+				const text = e instanceof Error ? e.message : String(e);
+				if (run) {
+					run.schema_retries += 1;
+					pushRejection(run, "schema", text);
+					persist();
+					throw new Error(run.schema_retries >= 2 ? `${text}\n${SCHEMA_HINT}` : text);
+				}
+				throw new Error(text);
+			}
+			// The lane is `applyPhase`'s decision, so the state machine and the load can never
+			// disagree — and the swap is NOT issued here. This turn is about to abort with its
+			// chat requests still queued at the router, and a load issued into that queue makes
+			// the router swap to the entry the QUEUED requests name (the 21:55-21:58 ping-pong).
+			// `agent_end` is the single load site, after the turn is closed.
+			const applied = applyPhase(params.phase, payload);
+			// T4 pre-swap gate: on coding_done, before paying the verifier swap (13-25 s pack
+			// load), run the plan's own checks on the code lane. Red keeps the coding lane
+			// resident (loadLane on the resident entry costs 0 s), records the rejection, and
+			// sends the gate briefing with the observed tails — self-repair without a swap.
+			if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
+				const gate = runGate(run.checks, run.repo);
+				run.gate_last = gate;
+				if (!gate.passed) {
+					const failing = gate.results.filter((r) => !r.ok);
+					pushRejection(run, "task", `pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
+					run.state = "coding";
+					persist();
+					paint(ctx);
+					pending = { lane: CODE_LANE, phase: "gate" };
+					settledNotified = false;
+					ctx.abort();
+					return {
+						content: [{ type: "text", text: `pre-swap gate RED (${failing.length}/${gate.results.length} failing); the verifier swap was not paid; fix and re-report coding_done` }],
+						details: { gate: "red", failing: failing.map((f) => f.cmd) },
+					};
+				}
+			}
+			persist();
+			paint(ctx);
+			pending = applied.nextState === "failed" || applied.nextState === "complete" ? undefined : { lane: applied.next, phase: params.phase };
+			settledNotified = false;
+			ctx.abort();
+			return {
+				content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
+				details: { phase: params.phase, state: applied.nextState, next_lane: pending?.lane ?? null },
+			};
+		},
+	});
+
+	pi.registerCommand("lanes", {
+		description: `Live basalt router census on ${ROUTER}: both entries' load state and /health`,
+		handler: async (_args, ctx) => {
+			const st = await listLanes();
+			if (st.error) {
+				ctx.ui.notify(`lanes: router unreachable at ${ROUTER}: ${st.error}`, "error");
+				ctx.ui.setWidget("lanes", [`router: ${ROUTER} unreachable`, st.error]);
+				return;
+			}
+			const rows = st.models.map((m) => `${m.id} ${m.status}`);
+			ctx.ui.setWidget("lanes", [`router: ${ROUTER} · health ${st.health}`, ...rows]);
+			ctx.ui.notify(`lanes: ${st.health} · ${rows.join(" · ")}`, "info");
+		},
+	});
+
+	pi.registerShortcut(FADE_KEY as Parameters<typeof pi.registerShortcut>[0], {
+		description: "fade orchestrator overlay: tasks, swap history, tiers, critique (s/v/r/c/h)",
+		handler: async (ctx) => {
+			await showOverlay(ctx);
+		},
+	});
+	pi.registerCommand("orchestrate", {
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | code | halt | stop [--clear]`,
+		handler: async (args, ctx) => {
+			const raw = args.trim();
+			const first = raw.split(/\s+/)[0] ?? "";
+			if (first === "status") {
+				if (!run) {
+					ctx.ui.notify("orchestrate: no run active", "info");
+					return;
+				}
+				const done = run.tasks.filter((t) => t.status === "passed").length;
+				ctx.ui.notify(
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · ${statePath()}`,
+					"info",
+				);
+				paint(ctx);
+				return;
+			}
+			if (first === "overlay") {
+				await showOverlay(ctx);
+				return;
+			}
+			if (first === "handover") {
+				if (!run) {
+					ctx.ui.notify("orchestrate: no run active", "info");
+					return;
+				}
+				// Condensed, STABLE-FIRST handover (core.handover): the new lane or a resumed
+				// session gets goal + phase contract + task definitions as an invariant prefix
+				// (high conversation-cache hit) and statuses/rejections/diff as the volatile tail.
+				pi.sendUserMessage(handoverText(run));
+				ctx.ui.notify("orchestrate: condensed handover sent", "info");
+				return;
+			}
+			if (first === "skip" || first === "verify" || first === "reset" || first === "halt" || first === "code") {
+				if (!run) {
+					ctx.ui.notify("orchestrate: no run active", "info");
+					return;
+				}
+				const dir =
+					first === "skip" ? actSkip(run, raw.split(/\s+/)[1]) : first === "verify" ? actVerify(run) : first === "reset" ? actReset(run) : first === "halt" ? actHalt(run) : actCode(run);
+				persist();
+				paint(ctx);
+				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+				if (dir.next) await switchLane(dir.next, ctx);
+				return;
+			}
+			if (first === "stop") {
+				if (!run) {
+					ctx.ui.notify("orchestrate: no run active", "info");
+					return;
+				}
+				if (TERMINAL[run.state] !== true) {
+					run.state = "stopped";
+					persist();
+				}
+				pending = undefined;
+				ctx.ui.setStatus(STATUS_KEY, undefined);
+				ctx.ui.setWidget(STATUS_KEY, undefined);
+				ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
+				if (raw.includes("--clear")) {
+					try {
+						unlinkSync(join(runDir!, ACTIVE_FILENAME));
+					} catch {}
+					run = undefined;
+				}
+				return;
+			}
+			if (run && TERMINAL[run.state] !== true) {
+				ctx.ui.notify(`orchestrate: run ${run.run_id} is still ${run.state}; /orchestrate stop first`, "warning");
+				return;
+			}
+			let rounds = DEFAULT_ROUNDS;
+			let goal = raw;
+			const roundsMatch = /^--rounds\s+(\S+)\s*/.exec(raw);
+			if (roundsMatch) {
+				rounds = Number(roundsMatch[1]);
+				if (!Number.isInteger(rounds) || rounds < 1 || rounds > MAX_ROUNDS) {
+					ctx.ui.notify(`orchestrate: --rounds takes a whole number 1..${MAX_ROUNDS}`, "warning");
+					return;
+				}
+				goal = raw.slice(roundsMatch[0].length).trim();
+			}
+			if (goal === "" || goal.startsWith("--")) {
+				ctx.ui.notify("orchestrate: usage /orchestrate [--rounds N] <goal>", "warning");
+				return;
+			}
+			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
+			const loaded = await loadLane(THINK_LANE);
+			ctx.ui.setWorkingMessage();
+			if (!loaded.ok) {
+				ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
+				return;
+			}
+			const census = await listLanes();
+			const resident = census.models.find((m) => m.status === "loaded");
+			if (!census.error && resident?.id !== THINK_LANE) {
+				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
+				return;
+			}
+			const runId = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
+			const repo = ctx.cwd;
+			runDir = join(repo, "var", "omp-orchestrate");
+			run = {
+				key: STATE_KEY,
+				run_id: runId,
+				goal,
+				repo,
+				max_rounds: rounds,
+				round: 1,
+				state: "planning",
+				lane: THINK_LANE,
+				checks: [],
+				tasks: [],
+				phases: [],
+				repair_tasks: [],
+				rejection_history: [],
+				schema_retries: 0,
+				started_utc: new Date().toISOString(),
+			};
+			settledNotified = false;
+			writeJson(join(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+			persist();
+			const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
+			if (!model) {
+				fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
+				return;
+			}
+			const switched = await pi.setModel(model);
+			if (switched !== true && (switched as unknown as { switched?: boolean } | null)?.switched !== true) {
+				fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
+				return;
+			}
+			pi.setThinkingLevel(THINKING[THINK_LANE]);
+			paint(ctx);
+			startMetricsTimer();
+			await ensurePhaseTool();
+			pi.sendUserMessage(briefings.plan(run));
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		await ensurePhaseTool();
+		const repo = ctx.cwd;
+		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
+		const state = readJson<RunState>(join(repo, "var", "omp-orchestrate", STATE_FILENAME));
+		if (!active || !state) return;
+		runDir = join(repo, "var", "omp-orchestrate");
+		run = normalizeRun(state);
+		settledNotified = false;
+		paint(ctx);
+		startMetricsTimer();
+		if (TERMINAL[state.state] === true) {
+			ctx.ui.notify(`orchestrate: run ${state.run_id} is ${state.state} (${statePath()})`, "info");
+		} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+			setTimeout(() => {
+				const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+				if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
+			}, 250);
+			ctx.ui.notify("orchestrate: resumed with the condensed handover (FADE_ORCHESTRATE_AUTO_RESUME=1)", "info");
+		} else {
+			ctx.ui.notify("orchestrate: run mid-flight — /orchestrate handover sends the condensed state", "info");
+		}
+	});
+
+	pi.on("agent_start", async (_event, ctx) => {
+		paint(ctx);
+		void refreshMetrics().then(() => paint(ctx));
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!run) return;
+		const next = pending;
+		pending = undefined;
+		if (!next) {
+			paint(ctx);
+			if (TERMINAL[run.state] === true && !settledNotified) {
+				settledNotified = true;
+				ctx.ui.notify(briefings.final(run), "info");
+			} else if (TERMINAL[run.state] !== true) {
+				ctx.ui.notify(`orchestrate: turn ended without a fade_phase call; ${run.state} did not advance (round ${run.round})`, "warning");
+			}
+			return;
+		}
+		// THE SINGLE LOAD SITE, at the turn boundary: the previous turn is closed, so nothing is
+		// queued at the router naming the lane we are leaving — that queue is what flipped the
+		// lane back 0-2 s after every swap (the 21:55-21:58 ping-pong). `loadLane` settles an
+		// in-flight swap and refuses to reload the resident entry, so a round that wants the
+		// lane already resident pays 0 s.
+		await switchLane(next.lane, ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		ctx.ui.setStatus(STATUS_KEY, undefined);
+		ctx.ui.setWidget(STATUS_KEY, undefined);
+		stopMetricsTimer();
+	});
+}
