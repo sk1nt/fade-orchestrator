@@ -20,6 +20,7 @@ import {
 	checkpointName,
 	classifyTurnEnd,
 	countRejections,
+	critiquesFor,
 	diffStat,
 	gateSummary,
 	handover,
@@ -33,12 +34,14 @@ import {
 	readJson,
 	refreshChecks,
 	roundWindow,
+	roundsForTasks,
 	runGate,
 	sameTaskPlan,
 	synthesizeCodingDone,
 	tagCheckpoint,
 	validateChecks,
 	validateDone,
+	validateTasks,
 	writeJson,
 } from "../.test-build/core.mjs";
 
@@ -575,4 +578,129 @@ test("sameTaskPlan: a plan act re-declares the checks, never the plan", () => {
 	assert.equal(sameTaskPlan(plan, [...plan].reverse()), true, "order is not the plan");
 	assert.equal(sameTaskPlan(plan, [{ ...plan[0], objective: "changed" }, plan[1]]), false);
 	assert.equal(sameTaskPlan(plan, [plan[0]]), false, "dropping a task is not a plan act");
+});
+
+// ---- T2: Y8 plan-declared round caps, Y4 per-task negative memory, Y14 compact repair prompt ----
+
+const tierTask = (id, complexity) => ({
+	id,
+	objective: `${id}: obj`,
+	files: [`src/${id.toLowerCase()}.ts`],
+	acceptance: `npm test -- ${id}`,
+	dependencies: [],
+	round: 1,
+	...(complexity ? { complexity } : {}),
+});
+const rej = (round, kind, task_id, reason) => ({ round, at: `2026-11-15T0${round}:00:00.000Z`, kind, task_id, reason });
+
+test("Y8: the plan declares the cap — trivial 2, standard 4, deep 6, the max over the plan, --rounds the ceiling", () => {
+	assert.equal(roundsForTasks([tierTask("T1", "trivial"), tierTask("T2", "trivial")], 6), 2, "a plan of trivial edits reserves TWO rounds");
+	assert.equal(roundsForTasks([tierTask("T1", "standard")], 6), 4, "standard is four");
+	assert.equal(roundsForTasks([tierTask("T1", "deep")], 6), 6, "deep is six");
+	assert.equal(roundsForTasks([tierTask("T1", "trivial"), tierTask("T2", "deep")], 6), 6, "the deepest task sets the cap");
+	assert.equal(roundsForTasks([tierTask("T1", "deep")], 3), 3, "the operator's --rounds budget is the ceiling");
+	assert.equal(roundsForTasks([tierTask("T1"), tierTask("T2")], 6), 3, "an unannotated plan keeps the measured count curve");
+	assert.equal(roundsForTasks([tierTask("T1"), tierTask("T2"), tierTask("T3"), tierTask("T4"), tierTask("T5"), tierTask("T6")], 6), 5);
+});
+
+test("Y8: validateTasks carries a declared complexity and refuses a non-name by name", () => {
+	const ok = validateTasks([{ id: "T1", objective: "o", files: ["a.ts"], acceptance: "a", dependencies: [], complexity: "trivial" }]);
+	assert.equal(ok.error, undefined, ok.error ?? "");
+	assert.equal(ok.tasks?.[0].complexity, "trivial");
+	const bad = validateTasks([{ id: "T1", objective: "o", files: ["a.ts"], acceptance: "a", dependencies: [], complexity: "fast" }]);
+	assert.match(bad.error ?? "", /complexity must be trivial\|standard\|deep/, "the refusal names the allowed set");
+});
+
+test("Y8: the loop reads the plan's cap — the window header and the nudge both say R/2", () => {
+	const run = mkRun({ max_rounds: roundsForTasks([tierTask("T1", "trivial")], 6), round: 2, state: "coding", repair_tasks: [], tasks: [winTask("T1")] });
+	assert.match(briefings.window(run), /round 2\/2/, "the coder sees the plan's budget, not the flat 6");
+	assert.match(briefings.nudge(run), /round 2\/2/, "and so does the protocol nudge");
+});
+
+test("Y4: a task rejected twice is briefed with ITS OWN critique, counted, and told the diff was tried", () => {
+	const run = mkRun({
+		round: 3,
+		state: "repair",
+		repair_tasks: [
+			{ id: "T1", objective: "fix the widget", files: ["w.ts"], acceptance: "npm test -- w", dependencies: [], round: 3 },
+			{ id: "T2", objective: "the docs", files: ["d.md"], acceptance: "read d.md", dependencies: [], round: 3 },
+		],
+		rejection_history: [
+			rej(1, "verification", "T1", "T1: the acceptance command exits 1 on w.ts"),
+			rej(2, "verification", "T1", "T1: same diff, the test still exits 1"),
+			rej(2, "task", "T2", "T2: no acceptance output in the report"),
+		],
+	});
+	const p = briefings.repair(run);
+	assert.match(p, /BY TASK:/, "the critique arrives grouped by task, not as a transcript");
+	assert.match(p, /T1 — rejected 2× \(latest round 2, verification\)/, "the count and the newest round are named");
+	assert.ok(p.includes("T1: same diff, the test still exits 1"), "the newest critique for T1 rides verbatim");
+	assert.match(p, /the same diff was already tried; change the CAUSE/, "the anti-oscillation instruction rides on the count");
+	assert.match(p, /T2 — rejected 1×/, "the other task gets its own line");
+	assert.ok(p.includes("T2: no acceptance output in the report"));
+});
+
+test("Y4: a task with no history earns no critique line (the block is data, not boilerplate)", () => {
+	const p = briefings.repair(mkRun({ round: 2, rejection_history: [] }));
+	assert.ok(!p.includes("BY TASK:"), "no rejections, no critique block");
+});
+
+test("Y4: the coding window carries the critique of the tasks IN the window, on the round that re-briefs them", () => {
+	const run = winRun([winTask("T1"), winTask("T2")], { round: 2, rejection_history: [rej(1, "verification", "T1", "T1: the cache key is stale")] });
+	const w = briefings.window(run);
+	assert.match(w, /Rejected before — the verifier's critique/, "round 2 names the rejections the window inherits");
+	assert.ok(w.includes("T1: the cache key is stale"));
+	const first = winRun([winTask("T1"), winTask("T2")], { round: 1, rejection_history: [rej(1, "verification", "T1", "T1: the cache key is stale")] });
+	assert.ok(!briefings.window(first).includes("Rejected before"), "the FIRST window of a round has nothing to inherit");
+});
+
+test("Y4: critiquesFor reads the history BY TASK ID, newest last, and ignores schema/gate refusals", () => {
+	const lines = critiquesFor(
+		mkRun({
+			rejection_history: [
+				rej(1, "schema", "T1", "payload is not JSON"),
+				rej(1, "verification", "T1", "T1: gate red on the plugin suite"),
+				rej(2, "verification", "T1", "T1: gate red again, same diff"),
+			],
+		}),
+		["T1", "T2"],
+	);
+	assert.equal(lines.length, 1, "T2 earned nothing, so it earns no line");
+	assert.match(lines[0], /T1 — rejected 2×/, "a schema refusal is not a verifier critique");
+	assert.ok(lines[0].includes("T1: gate red again, same diff"), "the newest critique is the one quoted");
+});
+
+test("Y14: the repair prompt is the compact set — diff stat, checklist, last rejections, no prior-round tool logs", () => {
+	const run = mkRun({
+		round: 3,
+		repair_tasks: [{ id: "T1", objective: "fix", files: ["w.ts"], acceptance: "npm test -- w", dependencies: [], round: 3 }],
+		rejection_history: [rej(2, "verification", "T1", "T1: red gate")],
+	});
+	const p = briefings.repair(run);
+	assert.match(p, /^Working tree: /m, "the diff stat answers where the tree is");
+	assert.ok(p.includes("Checklist: T1: npm test -- w"), "the checklist is one line, not the transcript");
+	assert.match(p, /no prior-round tool logs/);
+	assert.ok(!/stdout|traceback|full log/i.test(p), "no prior-round log dumps ride");
+	assert.ok(p.length < 2500, `the repair prompt stays compact: ${p.length} chars`);
+	const h = handover(run);
+	assert.ok(h.stable.join("\n").includes("Task definitions:"), "the stable prefix (goal, contract, task definitions) leads");
+	assert.ok(h.volatile.join("\n").includes("Working tree:"), "the volatile tail goes last");
+});
+
+test("Y7: a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and the prompt names all 3 ids", () => {
+	const run = winRun([winTask("T1"), winTask("T2"), winTask("T3")]);
+	assert.equal(ids(roundWindow(run).readyNow), "T1,T2,T3", "three tasks, one window, zero cuts");
+	const v = validateDone(run, [
+		{ id: "T1", status: "passed", result: "npm test: 3 pass" },
+		{ id: "T2", status: "passed", result: "npm test: 2 pass" },
+		{ id: "T3", status: "passed", result: "npm test: 1 pass" },
+	]);
+	assert.equal(v.error, undefined, v.error ?? "");
+	assert.match(
+		briefings.window(run),
+		/ONE coding_done payload: \{"done":\[\{"id":"T1".*\{"id":"T2".*\{"id":"T3"/,
+		"the contract the lane is briefed with names every id of the window",
+	);
+	assert.equal(applyDone(run, v.done).length, 3, "one payload marks the whole window");
+	assert.equal(ids(roundWindow(run).readyNow), "", "the round has no second window left to pay");
 });

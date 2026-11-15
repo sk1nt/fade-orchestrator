@@ -147,11 +147,12 @@ test("the engine's decode_tok_s wins over per-token durations; the prefix-cache 
 	assert.equal(rateFromRequest({ decode_tok_s: 130, durations: [1, 0.002, 0.002, 0.002] }), 130);
 	assert.equal(rateFromRequest({ decode_tok_s: 0, durations: [1, 0.01, 0.01, 0.01] }), 100);
 	const row = moeCacheRow([
-		{ hit_rate: 0.449, reused: 509 },
+		// newest-first, the /metrics order: the newest request is index 0.
 		{ hit_rate: 0.823, reused: 1113, prompt_tokens: 1352 },
+		{ hit_rate: 0.449, reused: 509 },
 	]);
-	assert.match(row.value, /81\.5% hit over 2 req|82\.3/);
-	assert.match(row.value, /last 82\.3%/);
+	assert.match(row.value, /63\.6% hit over 2 req/);
+	assert.match(row.value, /last 82\.3% \(1113 tok reused\)/);
 	assert.equal(moeCacheRow([]).value, "no hit_rate reported");
 });
 
@@ -236,4 +237,19 @@ test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt li
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+// The measured 2026-11-15 live shapes: spill_experts ABSENT (the 0.4.0 /metrics has no spill_used
+// key — null, NOT a zero), ssd_share null on every request, pcie_share reported (~0.54).
+test("an absent spill reading is named, never zeroed, with the slots total riding", () => {
+	const rows = tiersFromMetrics({ quant: "IQ1_M", slots: 2200, spill_total: 15360, requests: [], at_utc: "x" });
+	const row = rows.find((r) => r.label === "expert slots");
+	assert.equal(row.value, "2200 · spill ?/15360");
+});
+
+test("the prefix-cache row prints measured shares and NAMES absent ones", () => {
+	const live = moeCacheRow([{ hit_rate: 0.8, reused: 204348, ssd_share: null, pcie_share: 0.54 }]);
+	assert.match(live.value, /80\.0% hit over 1 req · last 80\.0% \(204348 tok reused\) · pcie 54\.0% · ssd not reported/);
+	const none = moeCacheRow([{ hit_rate: 0.5, reused: 1, ssd_share: null, pcie_share: null }]);
+	assert.match(none.value, /pcie not reported · ssd not reported/);
 });

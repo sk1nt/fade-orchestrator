@@ -135,6 +135,29 @@ export function adaptiveRounds(nTasks: number, budget: number): number {
 }
 
 /**
+ * Y8 adaptive round budgets, declared by the PLAN. The spec's tiers are trivial 2 / standard 4 /
+ * deep 6; the flat 6 the loop shipped with reserved five repair swaps for a two-line edit, and a
+ * swap is 13-25 s and 52-130 GiB. A task declares `complexity` in `planning_done`, and the run's
+ * cap is the MAXIMUM tier it declares — one deep task buys six rounds, a plan of trivial edits
+ * buys two.
+ */
+export type Complexity = "trivial" | "standard" | "deep";
+export const TIER_ROUNDS: Record<Complexity, number> = { trivial: 2, standard: 4, deep: 6 };
+export const isComplexity = (v: unknown): v is Complexity => v === "trivial" || v === "standard" || v === "deep";
+
+/**
+ * The run's round cap: the tiers the plan declares win (the max over its tasks); a plan that
+ * declares none falls back to the measured task-count curve in `adaptiveRounds`; the operator's
+ * `--rounds` budget is the ceiling in BOTH cases (an explicit budget outranks the plan). Floor 2:
+ * one round is code + verify, so a run that cannot repair once is not a loop.
+ */
+export function roundsForTasks(tasks: Task[], budget: number): number {
+	const declared = tasks.map((t) => t.complexity).filter(isComplexity);
+	if (declared.length === 0) return adaptiveRounds(tasks.length, budget);
+	return Math.min(budget, Math.max(2, ...declared.map((c) => TIER_ROUNDS[c])));
+}
+
+/**
  * Emitted verbatim into the tool error after the second schema rejection (auto-repair hint).
  * Y7: the `coding_done` example shows TWO entries on purpose — the batch shape is what the lane
  * is taught, and the shape it sees in the hint is the shape it writes.
@@ -332,6 +355,23 @@ export function tagCheckpoint(repo: string, run: RunState, taskId: string): { ta
 }
 
 /**
+ * Y4 negative memory: the critiques THIS task has already been given, with the count and the round
+ * the newest landed. The named failure is rounds 2–6 oscillating between two broken fixes, and the
+ * cure is per-task: a coder that sees a flat transcript of everything the verifier ever said does
+ * not know which critique is about the file it is editing, and re-issues the same diff.
+ */
+export function critiquesFor(run: RunState, ids: string[]): string[] {
+	const out: string[] = [];
+	for (const id of ids) {
+		const hits = (run.rejection_history ?? []).filter((r) => (r.task_id === id || `${r.reason}`.includes(id)) && (r.kind === "verification" || r.kind === "task"));
+		if (hits.length === 0) continue;
+		const last = hits[hits.length - 1];
+		out.push(`  ${id} — rejected ${hits.length}× (latest round ${last.round}, ${last.kind}): ${last.reason}${hits.length > 1 ? "  ⇐ the same diff was already tried; change the CAUSE, not the wording" : ""}`);
+	}
+	return out;
+}
+
+/**
  * Condensed handover — the "get on topic faster" contract. The prompt is built STABLE FIRST:
  * goal, phase contract, task definitions; the volatile tail (statuses, gate tails, rejections,
  * diff stat) goes last. Basalt's conversation cache reuses a request's prefix (measured
@@ -389,6 +429,8 @@ export interface Task {
 	round: number;
 	status?: string;
 	result?: string;
+	/** Y8: the plan's own complexity tier, declared at `planning_done`; it sets the run's cap. */
+	complexity?: Complexity;
 }
 
 export interface PhaseLog {
@@ -498,12 +540,13 @@ export function validateTasks(raw: unknown): { tasks?: Task[]; error?: string } 
 		if (!Array.isArray(t.files) || t.files.length === 0) return { error: `${id}: files must be a non-empty array` };
 		for (const f of t.files) if (!isRepoRelative(f as string)) return { error: `${id}: file ${JSON.stringify(f)} is not repo-relative` };
 		if (typeof t.acceptance !== "string" || t.acceptance.trim() === "") return { error: `${id}: acceptance is required` };
+		if (t.complexity !== undefined && !isComplexity(t.complexity)) return { error: `${id}: complexity must be trivial|standard|deep (got ${JSON.stringify(t.complexity)})` };
 		const deps = t.dependencies ?? [];
 		if (!Array.isArray(deps)) return { error: `${id}: dependencies must be an array` };
 		for (const d of deps) {
 			if (typeof d !== "string" || !seen.has(d)) return { error: `${id}: dependency ${JSON.stringify(d)} must name an earlier task` };
 		}
-		tasks.push({ id, objective: String(t.objective), files: t.files as string[], acceptance: String(t.acceptance), dependencies: deps as string[], round: 0 });
+		tasks.push({ id, objective: String(t.objective), files: t.files as string[], acceptance: String(t.acceptance), dependencies: deps as string[], round: 0, ...(isComplexity(t.complexity) ? { complexity: t.complexity } : {}) });
 	}
 	return { tasks };
 }
@@ -694,6 +737,9 @@ export const briefings = {
 		const inWindow = new Set(readyNow.map((t) => t.id));
 		const blockedIds = new Set(blocked.map((b) => b.id));
 		const deferred = open.filter((t) => !inWindow.has(t.id) && !blockedIds.has(t.id)).map((t) => t.id);
+		// Y4: a re-briefed window (round > 1) carries the critique PER TASK, so the lane knows
+		// which rejection belongs to the file it is about to edit.
+		const critiques = run.round > 1 ? critiquesFor(run, readyNow.map((t) => t.id)) : [];
 		const entry = (id: string) => `{"id":"${id}","status":"passed"|"failed"|"blocked","result":"what the acceptance command observed"}`;
 		return [
 			`Phase 1 (coding) — ONE WINDOW, round ${run.round}/${run.max_rounds} · T${readyNow.length}/${open.length} · lane ${run.lane} · orchestrated run ${run.run_id}.`,
@@ -712,6 +758,9 @@ export const briefings = {
 				? `NOT in this window, unmet dependencies — do not start them and never name one in coding_done: ${blocked.map((b) => `${b.id} blocked by ${b.blockedBy.join(", ")}`).join("; ")}.`
 				: `Nothing is blocked by a dependency.`,
 			deferred.length > 0 ? `Ready but past the ${MAX_WINDOW_TASKS}-task window cap (the NEXT window's work, leave it alone now): ${deferred.join(", ")}.` : "",
+			critiques.length > 0 ? `Rejected before — the verifier's critique for the tasks of THIS window, by task id; a task rejected twice has already had this diff tried, so change the cause:` : "",
+			...critiques,
+			`Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections — nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
 			`Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
 		].filter(Boolean).join("\n");
 	},
@@ -725,14 +774,23 @@ export const briefings = {
 		].join("\n"),
 	repair: (run: RunState): string => {
 		const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
+		const ids = (run.repair_tasks ?? []).map((t) => t.id);
+		const critiques = critiquesFor(run, ids);
+		const checklist = (run.repair_tasks ?? []).map((t) => `${t.id}: ${t.acceptance}`);
 		return [
 			`Phase 1 (repair), round ${run.round} of orchestrated run ${run.run_id}.`,
 			`Goal: ${run.goal}`,
 			`Repair tasks: ${JSON.stringify(run.repair_tasks)}`,
+			// Y4: the critique the task itself earned, with its count — the anti-oscillation line.
+			...(critiques.length > 0 ? ["Rejected before — the verifier's words, BY TASK:", ...critiques] : []),
 			...(prior.length > 0 ? ["Previously rejected — fix the cause, do not repeat the attempt:", ...prior.map((p) => `  ${p}`)] : []),
+			// Y14 compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
+			`Working tree: ${diffStat(run.repo)}`,
+			checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
+			`Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections — no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
 			`Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
 			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
-		].join("\n");
+		].filter(Boolean).join("\n");
 	},
 	gate: (run: RunState): string => {
 		const results = run.gate_last?.results ?? [];

@@ -95,15 +95,18 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
 | `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane) |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements |
-| `FADE_ORCHESTRATE_KEY` | `alt+shift+f` | the screen's key, chosen by measurement. The host's runtime conflict probe answers **FREE** for `alt+shift+f` (ESC + `F`, byte-distinct from every control code) — and answers `keybinding tui.editor.cursorWordRight` for `alt+f`, which a strings-extracted copy of the host's default-key table had suggested was free (measured 2026-11-15: the pty rig watched ESC `f` move the word, never open a panel). `ctrl+o` is `app.tools.expand` and the host **acts** on its own bindings. The extension registers the chord as a shortcut AND takes the byte at the raw-input layer; it never moves a host binding |
-| `FADE_ORCHESTRATE_FALLBACK_KEY` | `alt+shift+i` | the registered companion chord (ESC + uppercase `I`, also probe-reported FREE). Registered only where the host's conflict probe accepts the chord, and it is what opens the screen if `FADE_ORCHESTRATE_KEY` is pointed at a chord the host holds |
+| `FADE_ORCHESTRATE_KEY` | `alt+f` | the screen's key. The host's own table **binds** `alt+f` (`tui.editor.cursorWordRight`), so `registerShortcut` is **refused** for it and the extension claims the **raw byte**: `onTerminalInput` consumes `ESC f` (`1b 66`) before the host's binding runs, and the pty rig proves the panel opens while `cursorWordRight` does not (the same rig earlier watched ESC `f` move the word, 2026-11-15). `ctrl+o` is `app.tools.expand` and the host **acts** on its own bindings; the pty rig presses `C-o` and requires the extension to open nothing. Free single-alt chords in the measured 38-action table: `alt+c/e/j/q/s/t/u/v/w/x/z`. No host binding is ever moved |
+| `FADE_ORCHESTRATE_FALLBACK_KEY` | `alt+shift+i` | the registered companion chord (ESC + uppercase `I`, probe-reported FREE). Registered as a shortcut where the host's probe accepts it, and taken at the raw-input layer like the primary chord; it is what opens the screen when `FADE_ORCHESTRATE_KEY` points at a chord the host holds |
 | `FADE_ORCHESTRATE_SURFACE` | unset | the status line's surface. Default = the host's **top widget** (`placement: aboveEditor`); `status` opts into the host's status-bar row |
 | `FADE_ORCHESTRATE_PANEL_REFRESH_MS` | `2000` | the open screen's refresh tick (floor 500 ms); the tick is `unref`'d and cleared on close |
 | `FADE_ORCHESTRATE_GLYPH` | `󰚩` | the status line's leading glyph; an empty value drops it (a terminal without a Nerd Font) |
-| `FADE_ORCHESTRATE_REDACT` | unset | `1` strips the repo path, account, `/home/…`, `~` and this hostname from every rendered line, so a screenshot is safe |
+| `FADE_ORCHESTRATE_REDACT` | unset | `1` — or `/orchestrate --demo-redact`, `--demo-redact=off` to put it back — strips the repo path, account, `/home/…`, `~` and this hostname from every rendered **line**, so a screenshot is safe. **Display-only**: `state.json`, `metrics.jsonl` and `swap_history.json` are written verbatim, and a fresh session starts unredacted (gate rig block 21, `test/panel.test.mjs`, `test/rpc_rig.mjs`) |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the screen as a widget (110 columns) instead of an overlay component (RPC/print hosts) |
 | `FADE_ORCHESTRATE_BASALT_CONFIG` | unset | the basalt serve config JSON; enables the per-lane MoE placement panel (`expert-profile-save`) |
 | `FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS` | `300000` | the pre-swap gate's per-command wall budget; the rig class measured 180.8 s (`node test/rpc_rig.mjs`), so a 120 s constant could never leave the round |
+| `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | Y9: the fast path's bound — a gate-green round that touched ≤ 1 file and < 15 changed lines on the FIRST try completes with ZERO lane loads; the same round on a 20-line diff pays exactly one swap (gate rig block 22 prices both sides) |
+| `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | Y10: the pre-unload floor. A router that reports free VRAM under it — or zero/negative, an error state, a loaded context that names no model, a swap still in flight, or no answer at all — **refuses** the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
+| `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the health line the window ENDS on is the gate's evidence. The rigs shrink it so the hung-context class is proved in milliseconds |
 
 ## Publish and tree parity
 
@@ -124,20 +127,21 @@ extension **loads** (the `fade_orchestrate.ts` symlink resolves into it); the sp
 
 The operator gets **one line** all day and **one screen** on demand. Both are specified in
 [`docs/OVERLAY.md`](docs/OVERLAY.md) — layout, metrics, keys, the surface switch, the measured
-reason the screen is on `Alt+Shift+F` and not `Ctrl+O` (nor `Alt+F`), and how the chord is disclosed at startup. The
+reason the screen rides `Alt+F` at the raw-input layer while `Ctrl+O` stays the host's, and how that is
+disclosed at startup. The
 chord is wired twice on purpose: registered as a shortcut (`pi.registerShortcut(FADE_KEY)`, so the
 host parses it) **and** taken at the raw-input layer (`onTerminalInput`, so the byte is consumed
 wherever the host's shortcut table declines it).
 
-- `/orchestrate [--rounds N] <goal>` — start a run (preflights the router: think lane must load).
+- `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run (preflights the router: think lane must load).
 - `/orchestrate status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`
 - `/lanes` — live router census (both entries' status + `/health`).
 - **The status line** — one row on the top widget, above the editor, only while a run is live:
-  `󰚩 Orchestrator: code R1/6 · T2/5 · [Alt+Shift+F]`, with `· protocol <n>/3` while the Tier-1 counter
+  `󰚩 Orchestrator: code R1/6 · T2/5 · [Alt+F]`, with `· protocol <n>/3` while the Tier-1 counter
   runs, `· paused` while the loop is parked and a tok/s suffix when the router reports one. While a
   lane is loading, the state segment becomes the switch and the row turns **multicolored** — a
   per-character hue ramp whose phase rides the load percent, so it visibly moves on every sample:
-  `Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+Shift+F]`. Color means *working*:
+  `Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]`. Color means *working*:
   the steady row ships no escape codes at all. The line is **cleared** — the widget removed — on a
   terminal run (`complete`/`failed`/`stopped`, including a run adopted from disk at `session_start`)
   and when this session does not own the run.
@@ -153,12 +157,13 @@ wherever the host's shortcut table declines it).
   surface; the switching row names the incoming lane, because that is what the switch is about).
   Printing the same model twice was the operator's objection, so the surfaces are split:
   one line for the loop's state, one row for the engine's identity.
-- **`Alt+Shift+F`** — the orchestration screen, in the shape of the host's own agents panel. The key
-  is the chord the host's own conflict probe reports FREE: `ctrl+o` (the operator's first ask) is
-  `app.tools.expand`, and a built-in binding is ACTED ON, not skipped — a raw `C-o` printed
-  `Tool output expansion: enabled` and never reached the extension (measured); `alt+o` is
-  `app.links.hint`; `alt+f` is `tui.editor.cursorWordRight`. `alt+shift+i` is the registered fallback
-  and `/orchestrate overlay` the command path. The screen: a header
+- **`Alt+F`** — the orchestration screen, in the shape of the host's own agents panel. The host's table
+  binds `alt+f` to `tui.editor.cursorWordRight`, so the SHORTCUT is refused and the extension takes the
+  byte: `onTerminalInput` consumes `ESC f` and the host's action does not run (pty rig, 2026-11-15).
+  `ctrl+o` (the operator's first ask) is `app.tools.expand`, and a built-in binding is ACTED ON, not
+  skipped — a raw `C-o` printed `Tool output expansion: enabled` and never reached the extension
+  (measured); `alt+o` is `app.links.hint`. `alt+shift+i` is the registered fallback and
+  `/orchestrate overlay` the command path. The screen: a header
   (run, state, round, tier, age, refresh clock, the lane KEYS with the `◆resident` fact), a **selectable**
   task list whose selected task carries its files, deps, acceptance, result and checkpoint tag, the
   phase rail with the lane that produced each phase, the engine column (engine version — the router
@@ -171,7 +176,11 @@ wherever the host's shortcut table declines it).
   WRAPS rather than clips, because a key the operator cannot see is a key they will not press. It
   re-reads on a 2 s tick, so the numbers move while you watch. The keystroke is taken at the
   raw-input layer and **no host binding is moved**: the pty rig presses `ctrl+o` and requires the
-  host's own toggle to fire (its notify count increasing) while the panel stays closed.
+  host's own toggle to fire (its notify count increasing) while the panel stays closed. `esc` closes the
+  screen in EVERY encoding the host's parser recognizes — the legacy byte, the Kitty keyboard-protocol
+  CSI-u sequence (`ESC [ 2 7 u`) and xterm's `modifyOtherKeys` — because a panel comparing only `\x1b`
+  is dead on kitty, wezterm, ghostty and foot, where ESC arrives as CSI-u; tmux's `screen` terminal has
+  no Kitty protocol, which is why the old rig passed with ESC dead at the desk.
 
 State lives in `<cwd>/var/omp-orchestrate/`: `ACTIVE.json`, `state.json` (schema v2: rejection
 history by kind — `verification` / `schema` / `task` / `protocol` — tier, schema retries, gate
@@ -253,25 +262,44 @@ Ways to load it:
 - every lane-switch briefing already carries the previous round's results, rejections and the
   last verifier critique.
 
+## The closed rows, and the command that proves each
+
+| Row | What it ships | Proof |
+|---|---|---|
+| Y3 | the pre-swap gate owns the swap: a RED gate issues ZERO `POST /v1/load` and lands a task rejection; a GREEN gate pays exactly ONE lane load | `node test/gate_rig.mjs` (blocks 4-5) |
+| Y4 | the verifier's words reach the NEXT round per task: the repair and window briefings carry that task's own rejections, never the run's whole history | `node test/core.test.mjs` |
+| Y7 | one repair round carries the whole task window (the 3-task cap is honored), so a repair is one dispatch, not one per task | `node test/core.test.mjs` |
+| Y8 | the round budget is the PLAN's: a `complexity` tier per task (`trivial` 2 / `standard` 4 / `deep` 6) sets the cap, the measured count curve is the fallback, `--rounds` is the ceiling | `node test/core.test.mjs` |
+| Y9 | the fast path: gate green + ≤ 1 file + < 15 changed lines + first try ⇒ the round completes with ZERO lane loads; the same round on a 20-line diff pays exactly one swap, and a rejected round is not a first try | `node test/gate_rig.mjs` (block 22) |
+| Y10 | the pre-unload gate: an error state, zero/low free VRAM, a loaded context naming no model, a swap in flight, or an unreachable router REFUSES the lane load with the class named, and no byte is sent | `node test/load_hostile.mjs` |
+| Y14 | the repair prompt is compact: diff stat + the checklist + the rejections, and the prior rounds' tool logs are NOT replayed into it | `node test/core.test.mjs` |
+| Y19 | `--demo-redact` masks the repo path, account, home and hostname on every rendered line, leaves the durable files verbatim, and is reversible (`--demo-redact=off`) | `node test/gate_rig.mjs` (block 21), `node test/panel.test.mjs`, `node test/rpc_rig.mjs` |
+
 ## Tests
 
 ```bash
-npm test                 # 117 unit tests: keymap, state v2, gate, MoE, history, livedata,
-                         # the screen's renderer, the screen's data contract, the status line
+npm test                 # 138 unit tests: keymap, state v2, gate, MoE, history, livedata, the
+                         # screen's renderer (every ESC encoding closes), the screen's data
+                         # contract, the status line
 npm run test:gate        # fake-pi + stub router: the whole phase protocol, the pre-swap gate
-                         # (zero loads on red), the top-widget surface, the Alt+Shift+F listener
+                         # (zero loads on red), the Alt+F raw listener, the Y9 fast path, the
+                         # --demo-redact surface, the top-widget surface
+node test/load_hostile.mjs # Y10: a hostile /health (error state, zero/low VRAM, no model, swap
+                         # in flight, unreachable) issues ZERO POST /v1/load with the class named
 npm run test:pty         # the real terminal: tmux + the omp binary + the live extension,
                          # FADE_ORCHESTRATE_LIVE_SMOKE=1 (host-only: it needs omp and tmux)
 node test/rpc_rig.mjs    # headless proof through `omp --mode rpc`: the line, the screen's
-                         # content, skip/halt persistence (needs the omp CLI; runs ~90 s)
+                         # content, the redaction OFF half, skip/halt persistence (needs the omp
+                         # CLI; runs ~90 s)
 ```
 
 The rigs drive the command surface with the router pointed at a closed port: the status line must
 render with nothing networked, and the screen must name every number it cannot measure. RPC carries
-no raw keystrokes, so the chord itself is proved twice: by the fake-host rig (the chord is registered
-as a shortcut and the `ESC F` listener consumes and opens, the fallback chord is the one registered)
-and by the pty rig (the bytes sent to a real 150×45 terminal, the panel on screen, Escape closing,
-halt clearing, and `ctrl+o` proven to stay the host's).
+no raw keystrokes, so the chord is proved twice: by the fake-host rig (the host's table REFUSES an
+`alt+f` registration — the rig models that refusal — and the `ESC f` listener consumes the byte and
+opens, while the fallback chord is the one registered) and by the pty rig (the bytes sent to a real
+150×45 terminal, the panel on screen, `ESC f` opening, the legacy Escape AND the injected Kitty
+CSI-u escape closing, halt clearing, and `ctrl+o` proven to stay the host's).
 
 **Run root = git working tree.** `/orchestrate` roots a run at the session cwd and reads that
 directory with git (`status --porcelain`, `diff --stat`, checkpoint tags). Outside a working tree
@@ -294,11 +322,12 @@ identity (`--no-session`), which is what the rig is measuring.
 ## Layout
 
 ```
-src/index.ts      extension wiring: tool, commands, hooks, lane switching, the panel's key listener
-src/core.ts       state machine data half: schema v2, validation, briefings, gate runner
-src/router.ts     basalt router client (listLanes/laneHealth/loadLane, lane config from env)
+src/index.ts      extension wiring: tool, commands, hooks, lane switching, the panel's raw-key listener
+src/core.ts       state machine data half: schema v2, validation, briefings (Y4 per-task critique,
+                  Y14 compact repair), the gate runner, the Y7 window
+src/router.ts     basalt router client: listLanes/laneHealth/loadLane + the Y10 pre-unload gate
 src/ui.ts         the status line, the model label, the ramp, the redactor
-src/panel.ts      the Alt+Shift+F screen: layout, scroll, keys, both surfaces
+src/panel.ts      the Alt+F screen: layout, scroll, keys (every ESC encoding), both surfaces
 src/screendata.ts the screen's data contract: every row, and the name of every missing number
 src/keymap.ts     s/v/r/c/h actions, pure over RunState
 src/livedata.ts   /metrics + /health readers, swap watcher, cold/hot

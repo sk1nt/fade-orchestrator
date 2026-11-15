@@ -1,4 +1,4 @@
-# The status line and the Alt+Shift+F screen
+# The status line and the Alt+F screen
 
 What the operator sees, where it is placed, and why it is placed there. Every statement below is
 implemented in `src/ui.ts` (the line), `src/panel.ts` (the screen), `src/screendata.ts` (its data
@@ -10,7 +10,7 @@ One line, docked on the host's **top widget** (`setWidget(TOP_WIDGET_KEY, lines,
 "aboveEditor" })`), present only while a run is live:
 
 ```
-󰚩 Orchestrator: code R1/6 · T2/5 · [Alt+Shift+F]
+󰚩 Orchestrator: code R1/6 · T2/5 · [Alt+F]
 ```
 
 - `<glyph>` is a Nerd Font private-use codepoint, overridable with `FADE_ORCHESTRATE_GLYPH`
@@ -23,7 +23,7 @@ One line, docked on the host's **top widget** (`setWidget(TOP_WIDGET_KEY, lines,
   **multicolored** — a per-character hue ramp (`ramp()` in `src/ui.ts`) whose phase rides the load
   percent, so each /health sample repaints a moving row. Color means *working*: the steady line
   ships no escape codes. The incoming model is named exactly once, abbreviated:
-  `󰚩 Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+Shift+F]`;
+  `󰚩 Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]`;
 - a lane flip the guard saw adds a second line naming the competing entries.
 
 The line **clears** — the widget is removed, not blanked — when there is no run, when the run is
@@ -53,10 +53,10 @@ FADE_KEY)` (`src/index.ts`): the configured chord when the host's probe reports 
 fallback chord when the host holds the configured one. The first cut of this feature painted
 `[Ctrl+O]` in the held state, advertising a key that opened nothing while the pty rig's own
 assertion in that state read "ctrl+o opens nothing" — the row and the key disagreeing on the same
-screen. The pty rig now asserts the label in BOTH states (`[Alt+Shift+F]` free, `[Alt+Shift+I]`
+screen. The pty rig now asserts the label in BOTH states (`[Alt+F]` delivered, `[Alt+Shift+I]`
 held), and `statusLines()` defaults to the delivered chord, never to `Ctrl+O`.
 
-## The panel's key: `alt+shift+f`, the listener, the fallback
+## The panel's key: `alt+f` at the raw-input layer, the fallback, the escape encodings
 
 The key was chosen by measurement, twice, because the first measurement was not enough.
 
@@ -66,26 +66,34 @@ terminal (2026-11-15): sending `C-o` printed `Tool output expansion: enabled` an
 `onTerminalInput` listener never received `0x0f`; registering the chord is refused with
 `Extension shortcut conflicts with built-in shortcut`.
 
-**`alt+f` is out, and that is the instructive one.** A strings-extracted copy of the host's
-default-key table (38 actions) does not list `alt+f`, and it looked free. The host's own runtime
-answers differently: `getShortcutConflict("alt+f")` → `keybinding tui.editor.cursorWordRight`. The
-pty rig then watched `ESC f` move the cursor word in a real terminal and open nothing. The
-strings table is a copy; the host's probe is the authority — a chord must be probed at runtime.
+**`alt+f` is DELIVERED, at the raw-input layer, and that is the instructive one.** A
+strings-extracted copy of the host's default-key table (38 actions) does not list `alt+f`, and it
+looked free. The host's own runtime answers differently: `getShortcutConflict("alt+f")` →
+`keybinding tui.editor.cursorWordRight` — the host **binds** it, so `registerShortcut("alt+f")` is
+**refused**. The chord is therefore claimed at the byte level: `ctx.ui.onTerminalInput` consumes
+`ESC f` (`1b 66`) before the host's binding acts, and the pty rig proves BOTH halves — the panel
+opens, and the host's word-move does not run. (The measurement that settled it: the same rig first
+watched `ESC f` move the cursor word and open nothing.) The strings table is a copy; the host's
+probe is the authority — and when the host holds a chord the answer is to take the byte, never to
+move the host's binding.
 
-**The key is `alt+shift+f`** (ESC + `F`), which the probe answers **FREE**, and `alt+shift+i`
-(ESC + `I`) is the registered fallback, also FREE. `alt+<letter>` is **byte-distinct** from every
-control code; `ctrl+shift+<letter>` is NOT a distinct keystroke — shift is invisible inside a control
-code, measured in the pty rig, where a ctrl+shift+t keystroke ran the host's `ctrl+t` action and the
-pane answered `Thinking blocks: visible`. (tmux's `M-S-f` is `1b 66` — ESC + lowercase — never ESC +
-`F`; the rigs send `-H 1b 46`, measured to land as one 2-byte read.) The extension moves **no** host
-binding, writes no config file, and leaves `ctrl+o` to the host.
+**The key is `alt+f`** (ESC + `f`) and `alt+shift+i` (ESC + `I`) is the registered fallback,
+probe-reported FREE. `alt+<letter>` is **byte-distinct** from every control code;
+`ctrl+shift+<letter>` is NOT a distinct keystroke — shift is invisible inside a control code,
+measured in the pty rig, where a ctrl+shift+t keystroke ran the host's `ctrl+t` action and the pane
+answered `Thinking blocks: visible`. (tmux's `M-f` is exactly `1b 66`, the chord's own two bytes;
+the rigs send `-H 1b 66`, measured to land as one 2-byte read.) The single-alt chords the measured
+table leaves free are `alt+c/e/j/q/s/t/u/v/w/x/z` — `FADE_ORCHESTRATE_KEY` accepts any of them. The
+extension moves **no** host binding, writes no config file, and leaves `ctrl+o` to the host.
 
 The chord's state is disclosed once per session, at the first hook that can answer, in the
 extension's own words:
 
 ```
-orchestrate: Alt+Shift+F opens the orchestration screen; Alt+Shift+I is the registered
-fallback and /orchestrate overlay is the command path
+orchestrate: the host's table binds Alt+F (keybinding), so the SHORTCUT for it is refused;
+the extension claims the raw byte, so Alt+F opens the orchestration screen and the host action does
+not run (proved by test/pty_rig.mjs). Alt+Shift+I is the registered fallback, /orchestrate overlay
+the command path, and FADE_ORCHESTRATE_KEY=alt+e (free in the measured table) the alternative
 ```
 
 and when `FADE_ORCHESTRATE_KEY` is pointed at a chord the host holds, the disclosure says so, names
@@ -118,23 +126,26 @@ except `keybindings.*`, so the desk's own config cannot leak in) and on a **priv
 — one rig's cleanup took the shared server, the other's session died mid-run at `send-keys` and its log
 opened with `no server running`. A per-rig session name does not isolate; the **server** is shared.
 
-- **DEFAULT** — nothing configured: the disclosure names `Alt+Shift+F` and the fallback; `ESC F` opens
-  the screen; `ctrl+o` opens **nothing** — the extension never takes the host's chord. Which action the
-  host runs there is the host's (this build's pane hint names `Ctrl+⇧O`), so the rig asserts only what
-  the extension controls and keeps the toggle count as an observation.
+- **DEFAULT** — nothing configured: the disclosure names the refusal, says `Alt+F` opens the screen
+  at the byte level, and names the fallback; `ESC f` opens the panel; `ctrl+o` opens **nothing** —
+  the extension never takes the host's chord. Which action the host runs there is the host's (this
+  build's pane hint names `Ctrl+⇧O`), so the rig asserts only what the extension controls and keeps
+  the toggle count as an observation.
 - **HELD** — `FADE_ORCHESTRATE_KEY=ctrl+o`: the disclosure names the conflict, the fallback and the
   variable; `C-o` opens no screen; `ESC I` (alt+shift+i) opens the panel.
 
-Run 1 runs on this desk's own state and asserts the bytes reach the extension (the host prints no
-`Tool output expansion:` for `ESC F`), that the panel opens, that it is bounded by the terminal width,
-that its clock moves on the refresh tick while open, and that `halt` clears the row.
+Run 1 runs on this desk's own state and asserts the `ESC f` bytes reach the extension (the host prints
+no `Tool output expansion:` for them), that the panel opens, that it is bounded by the terminal width,
+that its clock moves on the refresh tick while open, that **both** escape encodings close it, and that
+`halt` clears the row.
 
 The wiring is:
 
-- `pi.registerShortcut(FADE_KEY)` lets the HOST parse the chord — the robust route for ESC + letter,
-  whose two bytes a pty can split; the host refuses a chord its table holds, and that refusal is the
-  disclosure's trigger;
-- `ctx.ui.onTerminalInput(handler)` receives `ESC F`, returns `{ consume: true }` and opens the
+- `pi.registerShortcut(FADE_KEY)` is attempted first, so the HOST parses the chord wherever it can;
+  for `alt+f` the host's table holds it and the registration is **refused** — that refusal is the
+  disclosure's trigger, and the fake-host rig models it, so a "not registered" assertion in
+  `test/gate_rig.mjs` is honest and not a tautology;
+- `ctx.ui.onTerminalInput(handler)` receives `ESC f`, returns `{ consume: true }` and opens the
   screen; every other keystroke returns `undefined`, so an unrelated key is never swallowed. Both
   routes go through the same guarded open, so one keystroke yields one panel;
 - `alt+shift+i` is the registered fallback chord, in the table the host accepts, and is the key that
@@ -142,12 +153,25 @@ The wiring is:
 - `/orchestrate overlay` is the command path, and the only path that works over RPC (RPC frames
   carry no raw keystrokes).
 
+**Closing the screen is a parse, not a byte.** The host hands the focused component RAW bytes
+(`pi-tui` `tui.js:420-425` → `focusedComponent.handleInput(data)`), and its own escape matcher
+(`keys.js:648-654`) recognizes three forms: the legacy `\x1b`, the Kitty keyboard-protocol CSI-u
+sequence (`\x1b[27u`, `\x1b[27;<mod>u`) and xterm's `modifyOtherKeys` (`\x1b[27;<mod>;27~`). The
+panel compared only the legacy byte, so on a terminal that enables the Kitty protocol — kitty,
+wezterm, ghostty, foot — ESC did nothing while `q` closed (the operator's report, 2026-11-15).
+`isEscape()` in `src/panel.ts` now matches all three, ignores the Kitty RELEASE form (`...:3u`) so
+one press is one close, and refuses ESC carrying a modifier (the raw listener owns ESC + letter
+chords). `test/panel.test.mjs` drives each encoding through `handleInput`; the pty rig closes the
+panel with the legacy Escape **and** the injected CSI-u sequence (`send-keys -H 1b 5b 32 37 75`),
+because tmux's `screen` terminal has no Kitty protocol and cannot produce it unaided — which is
+exactly why the rig passed with ESC dead at the desk.
+
 A delegated session (a subagent's own session file) binds **no extra** listener: one listener per
 process, proved by `test/gate_rig.mjs` and `test/rpc_rig.mjs`.
 
 ## The screen
 
-`Alt+Shift+F` opens a near-full-screen overlay (96 % × 94 %, top-center) in the shape of the host's own
+`Alt+F` opens a near-full-screen overlay (96 % × 94 %, top-center) in the shape of the host's own
 agents panel. In an RPC/print host the **same lines** go to the top widget at 110 columns, so the
 headless rigs assert the delivered text.
 
@@ -236,7 +260,7 @@ class this screen exists to prevent.
 | `p` | pause / resume |
 | `c` | code (load the code lane) |
 | `h` | halt the run |
-| `esc` `q` `ctrl+c` | close, touching no loop control |
+| `esc` `q` `ctrl+c` | close, touching no loop control — `esc` in every encoding the host delivers (see above) |
 
 The bar **wraps**; it never clips. It is 120 visible columns, so on the 110-column default surface a
 single-line bar lost its tail — the key the operator needs most, `[esc] close`, was not on screen.
@@ -250,20 +274,24 @@ the process open.
 
 ## Redaction
 
-`FADE_ORCHESTRATE_REDACT=1` strips the repo path, the OS account, `/home/<someone>`, `~` and this
-machine's hostname from **every** line, so a screenshot is safe to paste. Off by default: the
-operator's own truth stays on the screen.
+`FADE_ORCHESTRATE_REDACT=1` — or `/orchestrate --demo-redact`, put back with `--demo-redact=off` —
+strips the repo path, the OS account, `/home/<someone>`, `~` and this machine's hostname from
+**every** rendered line, so a screenshot is safe to paste. **Display-only**: `state.json`,
+`metrics.jsonl` and `swap_history.json` keep the truth verbatim, and a fresh session starts
+unredacted. Off by default: the operator's own truth stays on the screen.
 
 ## Proof surface
 
 | file | what it proves |
 | --- | --- |
-| `test/panel.test.mjs` | the renderer: fits 40→120 columns, flush frame, the key bar keeps every key, selection details, scroll rules, live tick, both open surfaces |
+| `test/panel.test.mjs` | the renderer: fits 40→120 columns, flush frame, the key bar keeps every key, selection details, scroll rules, live tick, both open surfaces, and **every ESC encoding** closing (`\x1b`, `\x1b[27u`, `\x1b[27;1u`, `\x1b[27;1;27~`; the release form and ESC+modifier NOT closing; `q` closing) |
 | `test/panel_data.test.mjs` (guard) | a run state written mid-plan can lack `phases`; the screen reads it as no critique and renders — measured as a throw in the rpc rig (`undefined is not an object (evaluating 'src.run.phases.length')`), which turned the panel into an error notify |
 | `test/panel_data.test.mjs` | the data contract: rows from a real-shaped `/metrics` snapshot, the named-absent states, the abbreviated model named once |
-| `test/ui_status.test.mjs` | the status line: the operator's grammar, the terminal/no-run clear rule, the swap pill, the flip line, the chord bytes (`ESC F`, `ESC I`, why `alt+f` is never the key, and why `ctrl+shift+<letter>` has no byte form), the key label, the row's key hint |
-| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the chord is registered as a shortcut AND bound at the raw-input layer, `ESC F` opens the screen, the fallback chord is the one registered, a terminal run clears the row |
-| `test/pty_rig.mjs` | the real terminal: tmux + the `omp` binary + the live extension, the row on screen, the `ESC F` bytes (`-H 1b 46`, measured as one 2-byte read) opening the panel, the keys, Escape closing, halt clearing, and both chord states (DEFAULT: `ctrl+o` stays the host's, its toggle count increasing, no panel; HELD: the disclosure names the conflict and `ESC I` opens) (`FADE_ORCHESTRATE_LIVE_SMOKE=1`) |
+| `test/ui_status.test.mjs` | the status line: the operator's grammar, the terminal/no-run clear rule, the swap pill, the flip line, the chord bytes (`ESC f` is the delivered chord, `ESC I` the fallback, and why `ctrl+shift+<letter>` has no byte form), the key label, the row's key hint |
+| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the Y9 fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row |
+| `test/load_hostile.mjs` | the Y10 pre-unload gate against a hostile `/health`: an `error` state, a `cuda_fatal` state, zero VRAM, VRAM under the floor, a negative nested reading, a loaded context naming no model, and a swap in flight each issue **zero** `POST /v1/load` with the class named; the measured healthy line loads exactly once; a closed server is refused as `unreachable` |
+| `test/pty_rig.mjs` | the real terminal: tmux + the `omp` binary + the live extension, the row on screen, the `ESC f` bytes (`-H 1b 66`, measured as one 2-byte read) opening the panel, the keys, the legacy Escape **and** the injected Kitty CSI-u escape closing, halt clearing, and both chord states (DEFAULT: `ctrl+o` stays the host's, no panel; HELD: the disclosure names the conflict and `ESC I` opens) (`FADE_ORCHESTRATE_LIVE_SMOKE=1`) |
+| `test/rpc_rig.mjs` | the headless surface through `omp --mode rpc`: the row's pill (`[Alt+F]`), the overlay's panel frames, the redaction-OFF half (the seeded file name rides unmasked), skip/halt persistence, the clear on halt |
 
 **The fake host cannot see the loading-phase guard.** omp's extension runtime answers
 `getActiveTools`, `setModel`, `getShortcutConflict` and friends with

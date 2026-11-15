@@ -139,7 +139,7 @@ const c1 = frames.length;
 sendCmd("/orchestrate plan");
 await new Promise((r) => setTimeout(r, 12_000));
 const c2 = frames.length;
-// The Alt+Shift+F screen rides the live run: `/orchestrate overlay` renders the SAME collector and
+// The Alt+F screen rides the live run: `/orchestrate overlay` renders the SAME collector and
 // renderer the key binds to (the headless path writes the panel as a widget), and it must be
 // captured BEFORE the halt — after a halt there is no run to show.
 sendCmd("/orchestrate overlay");
@@ -179,7 +179,7 @@ ok("the host produced extension_ui_request frames at all", frames.length > 0, `f
 ok("the status row renders at the TOP of the editor (setWidget fade-top)", topFrames.length > 0, `widgets=${topFrames.length}`);
 ok(
 	"the row is the operator's line: glyph, Orchestrator, state, round, tally, the key",
-	topFrames.some((f) => topLines(f).some((l) => /Orchestrator: plan R1\/6 · T0\/1 · \[Alt\+Shift\+F\]/.test(l))),
+	topFrames.some((f) => topLines(f).some((l) => /Orchestrator: plan R1\/6 · T0\/1 · \[Alt\+F\]/.test(l))),
 	JSON.stringify(topLines(topFrames[0])),
 );
 ok(
@@ -242,7 +242,7 @@ ok("the loop pays at most ONE lane load per accepted phase (rows 0..2; resident 
 // The clear lands at the halt command itself (actHalt -> paint -> statusLines() === undefined), so
 // the window is from just BEFORE the command (c3), not after it settles (c4).
 ok("halt clears the top widget: a run not in use leaves nothing on screen", frames.slice(c3).some(isTopClear), `clears=${frames.slice(c3).filter(isTopClear).length} topFrames=${topFrames.length}`);
-// The Alt+Shift+F screen's headless surface: `/orchestrate overlay` renders the panel through the
+// The Alt+F screen's headless surface: `/orchestrate overlay` renders the panel through the
 // same collector and the same renderer the key binds to, so the frame carries the operator's columns.
 // The task tally is matched by GRAMMAR, not by a number: this rig runs `/orchestrate plan`, and the
 // planner rewrites the task list from its own payload, so a pinned `0/2` asserts the planner's output.
@@ -264,6 +264,15 @@ ok(
 		);
 	})(),
 	`panels=${panelFrames.length} text=${panelText().replace(/\s+/g, " ").slice(0, 300)}`,
+);
+// The redaction pair. Gate rig block 21 proves the ON state (`--demo-redact` / REDACT=1 masks the
+// panel to `<path>`/`<host>`/`<user>` and leaves `state.json` verbatim). This is the OFF half on the
+// frame surface: the default render is byte-identical to the seeded state — the task's own file name
+// rides, and no marker appears.
+ok(
+	"redaction OFF (the default): the panel is byte-identical — the seeded file name rides unmasked",
+	panelText().includes("a.ts") && !panelText().includes("<path>"),
+	`panels=${panelFrames.length} text=${panelText().replace(/\s+/g, " ").slice(0, 240)}`,
 );
 ok(
 	"the panel's lines fit the 110-column bound",

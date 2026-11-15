@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { hostname } from "node:os";
 import test from "node:test";
-import { openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
+import { isEscape, openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
 
 // The bundle in `.test-build/` is built by the ENTRY POINT (`npm run test:build` /
 // `node test/build.mjs`), never from inside a test file: `node --test` runs files in parallel and
@@ -209,6 +209,29 @@ test("redaction: a screenshot of the screen carries no account, home, repo path 
 	assert.ok(!s.includes(user), "the account must not survive");
 	const off = joined(panelLines(d, 120, { sel: 0 }));
 	assert.ok(off.includes(repo), "the flag is off by default: the operator's own truth stays on screen");
+});
+
+test("Y19 --demo-redact: every printed field is masked with markers, and OFF is byte-identical truth", () => {
+	// The row's flag is the panel's flag: one display switch for every surface a screenshot can
+	// capture. The identity rides in THREE fields on purpose (goal, reason, operator note) — a
+	// redactor that only patches the header fails here, and the markers must REPLACE the text so
+	// the screen stays readable (a screenshot with the fields deleted proves nothing to a viewer).
+	const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
+	const repo = `/home/${user}/projects/fadetheworld`;
+	const host = hostname();
+	const d = data({
+		run: run({
+			repo,
+			goal: `run ${repo} by ${user} on ${host}`,
+			reason: `halted in ${repo}: ${user}@${host} left the checks red`,
+			operator_note: `note from ${user}@${host}, worktree ${repo}`,
+		}),
+	});
+	const on = withFlag("1", () => joined(panelLines(d, 120, { sel: 0 })));
+	assert.ok(on.includes("<path>") && on.includes("<user>") && on.includes("<host>"), `the markers replace, they do not drop the line: ${on.slice(0, 400)}`);
+	assert.ok(!on.includes(repo) && !on.includes("/home/") && !on.includes(host) && !on.includes(user), on.slice(0, 400));
+	const off = joined(panelLines(d, 120, { sel: 0 }));
+	assert.ok(off.includes(repo) && off.includes(host), "OFF is the operator's own truth, verbatim — state.json on disk is never rewritten by the switch");
 });
 
 test("the headless widget path renders the SAME screen the TUI draws", () => {
@@ -414,4 +437,47 @@ test("a run state MISSING its arrays renders — the panel must never die on a s
 	assert.ok(s.includes("TASKS 0/0 passed"), "the task block names an empty plan instead of throwing");
 	assert.ok(s.includes("no plan yet"), "and says the loop is still planning");
 	assert.ok(s.includes("none accepted yet"), "the phase rail says none accepted");
+});
+
+// ── ESC closes the screen in EVERY encoding the host delivers (the operator's report) ────────────
+// The focused component receives RAW bytes (pi-tui tui.js:420-425), and the host's own escape
+// matcher (keys.js:648-654) accepts THREE forms: the legacy byte, the Kitty keyboard-protocol CSI-u
+// sequence, and xterm modifyOtherKeys. A terminal that enables the Kitty protocol (kitty, wezterm,
+// ghostty, foot) delivers ESC as `\x1b[27u`, so the panel's byte-equal compare against "\x1b" left
+// ESC dead while `q` closed. tmux's `screen` terminal never enables the protocol, which is why the
+// pty rig — `send-keys Escape` → the legacy byte — never caught it.
+const closeProbe = () => {
+	const closed = [];
+	const c = new PanelComponent(data(), async () => data(), undefined, tui(24), (r) => closed.push(JSON.parse(r)), 60000);
+	return { c, closed };
+};
+
+test("isEscape: the predicate names the escape in every host-recognized form", () => {
+	for (const d of ["\x1b", "\x1b[27u", "\x1b[27;1u", "\x1b[27;1;27~"]) assert.equal(isEscape(d), true, `${JSON.stringify(d)} must read as ESC`);
+	for (const d of ["\x1b[27;1:3u", "\x1b[27;3u", "\x1b[27;1;13~", "\x1b[A", "q", ""]) assert.equal(isEscape(d), false, `${JSON.stringify(d)} must not read as ESC`);
+});
+
+for (const [name, bytes] of [
+	["legacy byte", "\x1b"],
+	["kitty CSI-u press", "\x1b[27u"],
+	["kitty press, explicit modifier", "\x1b[27;1u"],
+	["xterm modifyOtherKeys", "\x1b[27;1;27~"],
+]) {
+	test(`esc (${name}) closes the screen`, () => {
+		const { c, closed } = closeProbe();
+		c.handleInput(bytes);
+		assert.deepEqual(closed, [{ key: "close" }], `${JSON.stringify(bytes)} did not close the screen`);
+		c.dispose();
+	});
+}
+
+test("esc: a kitty RELEASE, ESC+modifier, modifyOtherKeys of another key, and an arrow are NOT closes", () => {
+	const { c, closed } = closeProbe();
+	for (const d of ["\x1b[27;1:3u", "\x1b[27;3u", "\x1b[27;1;13~", "\x1b[A", "\x1b[27;1;13:3~"]) {
+		c.handleInput(d);
+	}
+	assert.equal(closed.length, 0, `a non-close sequence ended the screen: ${JSON.stringify(closed)}`);
+	c.handleInput("q");
+	assert.deepEqual(closed, [{ key: "close" }], "q must still close");
+	c.dispose();
 });

@@ -298,25 +298,30 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 
 
 /**
- * The stable-prefix win, measured: a request's `hit_rate` is the fraction of its prompt reused
- * from the conversation cache (log lines measured 44.9% early and 82.3% once the prefix settles).
- * A handover built STABLE FIRST (core.handover) keeps this high across resumes and lane returns.
+ * The stable-prefix win, measured: a request's `hit_rate` is the fraction of its prompt reused from
+ * the conversation cache (measured 2026-11-15 on the served lane: 0.796-0.858, ~200k tokens reused
+ * per request). A handover built STABLE FIRST (core.handover) keeps this high across resumes — the
+ * cache itself does NOT cross a lane swap: the same 47k-token prefix reused **0** tokens on the lane
+ * a swap landed on (`scripts/ops/basalt_cache_probe.sh --swap`, 2026-11-15), which is exactly why
+ * swaps are expensive and the flip guard prices them.
  */
 export function moeCacheRow(requests: MetricsRequest[] | undefined): { label: string; value: string } {
 	const withHit = (requests ?? []).filter((r) => typeof r.hit_rate === "number");
 	if (withHit.length === 0) return { label: "prefix cache", value: "no hit_rate reported" };
-	const last = withHit[withHit.length - 1];
+	const last = withHit[0]; // /metrics `requests` is newest-first: the row's "last" is the most recent request
 	const n = Math.min(withHit.length, 8);
-	const recent = withHit.slice(-n);
+	const recent = withHit.slice(0, n); // newest-first source: the LAST n requests are the FIRST n entries
 	const mean = recent.reduce((s, r) => s + (r.hit_rate ?? 0), 0) / recent.length;
-	// `ssd_share` is the routed-expert fraction that came from the FILE — the spill cost as the
-	// engine measures it, per request. The served IQ1_M reads 0.0 on this host, which is the
-	// whole reason the tier row matters.
-	const ssd = recent.filter((r) => typeof r.ssd_share === "number");
-	const ssdText = ssd.length > 0 ? ` · ssd ${((ssd.reduce((s, r) => s + (r.ssd_share ?? 0), 0) / ssd.length) * 100).toFixed(1)}%` : "";
+	// `pcie_share` / `ssd_share` are the routed-expert reads that crossed PCIe / landed in the file
+	// — the spill cost as the engine measures it, per request. Live on this box: pcie reported
+	// (~0.54), ssd_share NULL on every request. An absent reading is NAMED, never rendered as a zero.
+	const share = (key: "ssd_share" | "pcie_share"): string => {
+		const vals = recent.filter((r) => typeof r[key] === "number").map((r) => r[key] as number);
+		return vals.length === 0 ? `${key === "ssd_share" ? "ssd" : "pcie"} not reported` : `${key === "ssd_share" ? "ssd" : "pcie"} ${((vals.reduce((s, v) => s + v, 0) / vals.length) * 100).toFixed(1)}%`;
+	};
 	return {
 		label: "prefix cache",
-		value: `${(mean * 100).toFixed(1)}% hit over ${n} req · last ${((last.hit_rate ?? 0) * 100).toFixed(1)}% (${last.reused ?? 0} tok reused)${ssdText}`,
+		value: `${(mean * 100).toFixed(1)}% hit over ${n} req · last ${((last.hit_rate ?? 0) * 100).toFixed(1)}% (${last.reused ?? 0} tok reused) · ${share("pcie_share")} · ${share("ssd_share")}`,
 	};
 }
 

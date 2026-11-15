@@ -3,7 +3,7 @@
  *
  * Main pane: ONE status line at the TOP, docked above the editor, in the operator's own words
  * (2026-11-15: "use a nerdfont … and just say Orchestrator: plan R1/6 T0/0"):
- *   󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+Shift+F]
+ *   󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+F]
  * and NOTHING multi-line above the editor while a run is live (the monolith painted a 6+ line task
  * dump there; during long coding runs that dump ate the transcript).
  *
@@ -228,9 +228,11 @@ export function statusLines(
 	const glyph = orchGlyph();
 	const head = glyph === "" ? "" : `${glyph} `;
 	// The key hint is the configured chord's label, passed in by the caller: the row and the key can
-	// never disagree, and the default is the delivered chord — `Ctrl+O` is the chord the host holds
-	// and this extension never binds, so a row that defaulted to it would advertise a dead key.
-	const hint = `[${opts.key ?? "Alt+Shift+F"}]`;
+	// never disagree. The default is the delivered chord — `Alt+F`, claimed at the raw-input layer:
+	// the host's table binds `alt+f` (`tui.editor.cursorWordRight`) so its SHORTCUT is refused, and
+	// the byte is what opens the screen. `Ctrl+O` is the chord this extension never binds, so a row
+	// defaulting to it would advertise a dead key.
+	const hint = `[${opts.key ?? "Alt+F"}]`;
 	if (opts.swap) {
 		const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
 		const line = `${head}Orchestrator: switching ${opts.swap.from}→${opts.swap.to}${pct} · ${hint}${stall}${paused}`;

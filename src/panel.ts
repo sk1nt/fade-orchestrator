@@ -1,14 +1,18 @@
 /**
- * The Alt+Shift+F screen: the orchestration's whole state on one live panel, in the shape the host's
+ * The Alt+F screen: the orchestration's whole state on one live panel, in the shape the host's
  * own agents panel uses — a header, a selectable list, a metrics column, a key bar.
  *
- * Two delivery routes, both through the same guarded open: the chord is registered as a shortcut so
- * the HOST parses it (the robust path for an ESC + letter chord, whose bytes a pty can split), and a
- * raw-input listener keeps the byte-level path. The host is the authority on ownership: it refuses a
- * chord its table holds — `getShortcuts()` logs "Extension shortcut conflicts with built-in
- * shortcut", measured for `ctrl+o`, which is `app.tools.expand` — and the runtime probe says `alt+f`
- * is `tui.editor.cursorWordRight`, which is why the key is `alt+shift+f`. `/orchestrate overlay` and
- * `FADE_ORCHESTRATE_FALLBACK_KEY` (default `alt+shift+i`) stay the fallbacks.
+ * The chord is `alt+f`, claimed at the RAW-INPUT layer: the host's own table binds `alt+f`
+ * (`tui.editor.cursorWordRight`), so `registerShortcut` is refused and `onTerminalInput` consumes the
+ * two bytes (`ESC f`) ahead of the host's binding — proved against the real binary by
+ * `test/pty_rig.mjs`. `/orchestrate overlay` and `FADE_ORCHESTRATE_FALLBACK_KEY` (default
+ * `alt+shift+i`) stay the fallbacks, and a configured CONTROL chord (`ctrl+o`) stays the host's: the
+ * raw listener's family is ESC + a byte, never a control code.
+ *
+ * Closing is a parse, not a byte: the host hands this component RAW bytes, and its own escape matcher
+ * accepts the legacy `\x1b`, the Kitty CSI-u sequence and xterm's `modifyOtherKeys`, so `isEscape()`
+ * below matches all three (and ignores the Kitty release form). Comparing only `\x1b` left ESC dead on
+ * kitty/wezterm/ghostty/foot — the operator's report, 2026-11-15.
  *
  * Live by construction: the panel is given a `provider` and a bounded refresh tick, re-reads the
  * screen and calls `tui.requestRender()` — the numbers move while you watch, which is the whole
@@ -297,8 +301,34 @@ export function panelLines(d: ScreenData, width: number, view: PanelView = { sel
 
 export type PanelAction = { key: string; taskId?: string };
 
-/** Keys the panel owns: the loop controls, and the three ways the operator closes it. */
-const CLOSE_KEYS: Record<string, true> = { "\x1b": true, q: true, "\x03": true };
+/**
+ * ESC, in EVERY encoding the host's own parser recognizes. The focused component gets RAW bytes
+ * (`pi-tui` tui.js:420-425 → `focusedComponent.handleInput(data)`), and the host's escape matcher
+ * (keys.js:648-654) accepts three forms: the legacy byte, the Kitty keyboard-protocol CSI-u
+ * sequence (`\x1b[27u`, `\x1b[27;<mod>u`), and xterm's modifyOtherKeys (`\x1b[27;<mod>;27~`).
+ * Comparing only "\x1b" is therefore dead on any terminal that enables the Kitty protocol (kitty,
+ * wezterm, ghostty, foot) — the operator's report: ESC did nothing, `q` closed. The pty rig never
+ * caught it because tmux's `screen` terminal does not enable the protocol, so `send-keys Escape`
+ * writes the legacy byte. The Kitty RELEASE form (`...:3u`) is excluded so one press is exactly
+ * one close; the host filters releases (tui.js:414-419) unless a component asks for them.
+ */
+const KITTY_CSI_U = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
+const MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
+
+export function isEscape(data: string): boolean {
+	if (data === "\x1b") return true;
+	const kitty = KITTY_CSI_U.exec(data);
+	if (kitty) {
+		// groups: 1 codepoint, 2 shifted, 3 base-layout, 4 modifier (1 = none), 5 event (1 press, 2 repeat, 3 release)
+		return Number(kitty[1]) === 27 && (kitty[4] === undefined ? 1 : Number(kitty[4])) === 1 && (kitty[5] === undefined ? 1 : Number(kitty[5])) !== 3;
+	}
+	const mok = MODIFY_OTHER_KEYS.exec(data);
+	if (mok) return Number(mok[2]) === 27 && Number(mok[1]) === 1;
+	return false;
+}
+
+/** Keys the panel owns: the loop controls and the plain-byte closes; ESC is `isEscape`, not a byte. */
+const CLOSE_KEYS: Record<string, true> = { q: true, "\x03": true };
 const ACTION_KEYS: Record<string, true> = { s: true, v: true, r: true, p: true, c: true, h: true };
 
 /** Minimal view of the host's TUI: the panel needs the height and the render kick, nothing else. */
@@ -387,7 +417,7 @@ export class PanelComponent {
 		const all = arr(this.data.run.tasks);
 		const tasks = all.length;
 		const h = this.getHeight();
-		if (CLOSE_KEYS[data] === true) return this.done(JSON.stringify({ key: "close" } satisfies PanelAction));
+		if (isEscape(data) || CLOSE_KEYS[data] === true) return this.done(JSON.stringify({ key: "close" } satisfies PanelAction));
 		if (ACTION_KEYS[data] === true) {
 			const t = all[this.sel];
 			return this.done(JSON.stringify({ key: data, ...(t ? { taskId: t.id } : {}) } satisfies PanelAction));

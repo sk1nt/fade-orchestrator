@@ -30,7 +30,7 @@
 import http from "node:http";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildTestBundle } from "./build.mjs";
 
@@ -142,11 +142,20 @@ const widgets = new Map();
 const statusRows = new Map();
 const inputHandlers = [];
 let activeTools = ["read", "bash", "edit", "write", "grep", "task"];
+/** The host's chord table, as the rig models it: `registerShortcut` REFUSES a chord the host's own
+ *  table binds — measured on the live host as "Extension shortcut conflicts with built-in shortcut"
+ *  for `ctrl+o`, and the same probe answers `keybinding tui.editor.cursorWordRight` for `alt+f`.
+ *  The rig must refuse exactly where the host refuses, or the panel's raw-layer claim is never
+ *  exercised: a fake host that accepts every chord proves the registration, not the delivery. */
+const HOST_TABLE = new Set(["ctrl+c", "ctrl+d", "ctrl+g", "ctrl+l", "ctrl+o", "ctrl+r", "ctrl+s", "ctrl+t", "ctrl+y", "ctrl+z", "ctrl+.", "alt+a", "alt+b", "alt+d", "alt+f", "alt+g", "alt+h", "alt+i", "alt+k", "alt+l", "alt+m", "alt+n", "alt+o", "alt+p", "alt+r", "alt+y", "alt+shift+c", "alt+shift+k", "alt+shift+l", "alt+shift+p", "alt+shift+v"]);
 const pi = {
   registerTool: (t) => void (tools[t.name] = t),
   registerCommand: (name, c) => void (commands[name] = c),
   on: (evt, h) => void (hooks[evt] = h),
-  registerShortcut: (key, opts) => void (shortcuts[key] = opts),
+  registerShortcut: (key, opts) => {
+    if (HOST_TABLE.has(String(key))) throw new Error(`Extension shortcut conflicts with built-in shortcut: ${key}`);
+    shortcuts[key] = opts;
+  },
   setModel: async () => ({ switched: true }),
   setThinkingLevel: () => {},
   getActiveTools: () => activeTools,
@@ -154,6 +163,10 @@ const pi = {
   sendUserMessage: (t) => void sent.push(t),
 };
 const notes = [];
+/** The chord disclosure, captured separately: it is a ONE-SHOT at the first `session_start`, and the
+ *  `notes` transcript is scoped and cleared by the later blocks, so the disclosure must not be
+ *  asserted against a transcript that has already moved on. */
+let disclosure = "";
 const ctx = {
   hasUI: false,
   cwd: repo,
@@ -166,7 +179,10 @@ const ctx = {
   ui: {
     setStatus: (key, text) => void (text === undefined ? statusRows.delete(key) : statusRows.set(key, text)),
     setWidget: (key, lines, opts) => void (lines === undefined ? widgets.delete(key) : widgets.set(key, { lines, opts })),
-    notify: (m) => void notes.push(m),
+    notify: (m) => {
+      notes.push(m);
+      if (disclosure === "" && /orchestration screen/.test(m)) disclosure = m;
+    },
     setWorkingMessage: () => {},
     custom: async () => undefined,
     onTerminalInput: (h) => {
@@ -637,11 +653,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("a quiet lane carries no guard clause", quietNote === "", JSON.stringify(quietNote));
 }
 
-// 20. The Alt+Shift+F screen and the status row. The row is the one line the operator sees all day,
+// 20. The Alt+F screen and the status row. The row is the one line the operator sees all day,
 //     and it says what the loop is doing in the operator's own words (2026-11-15: "use a nerdfont …
 //     and just say Orchestrator: plan R1/6 T0/0"); the panel is the detail view, opened on
-//     `alt+shift+f` — the chord the host's own conflict probe reports FREE (`alt+f` is
-//     `tui.editor.cursorWordRight`, `ctrl+o` is `app.tools.expand`) and byte-distinct (ESC + `F`).
+//     `alt+f` — claimed at the RAW-INPUT layer, because the host's table binds that byte
+//     (`tui.editor.cursorWordRight`; `ctrl+o` is `app.tools.expand`) and refuses its registration.
 //     The default surface writes no status-bar row, and a terminal run clears the row.
 {
   resident = "flash-next";
@@ -649,15 +665,15 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await hooks.session_start({}, ctx);
   const top = widgets.get("fade-top");
   const row = top?.lines?.[0] ?? "";
-  ok("the status row is the operator's line: glyph, Orchestrator, state, round, tally, key", row === "󰚩 Orchestrator: code R1/6 · T0/2 · [Alt+Shift+F]", JSON.stringify(row));
+  ok("the status row is the operator's line: glyph, Orchestrator, state, round, tally, key", row === "󰚩 Orchestrator: code R1/6 · T0/2 · [Alt+F]", JSON.stringify(row));
   ok("the row is docked above the editor (the surface the loop can own)", top?.opts?.placement === "aboveEditor", JSON.stringify(top?.opts));
   ok("the default surface writes NO status-bar row", statusRows.size === 0, JSON.stringify([...statusRows.keys()]));
   ok("the chord is bound by the raw-input listener", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
-  ok("the panel's chord is registered as a shortcut, so the host parses it", Boolean(shortcuts["alt+shift+f"]), JSON.stringify(Object.keys(shortcuts)));
+  ok("the panel's chord is claimed at the raw layer, never registered over the host", !shortcuts["alt+f"] && inputHandlers.length === 1, JSON.stringify(Object.keys(shortcuts)));
   ok("the fallback chord is registered where the host accepts it", Boolean(shortcuts["alt+shift+i"]), JSON.stringify(Object.keys(shortcuts)));
   ok("an unrelated keystroke is not consumed", inputHandlers[0]("x") === undefined);
-  const consumed = inputHandlers[0]("\x1bF");
-  ok("Alt+Shift+F is consumed and opens the panel", consumed?.consume === true, JSON.stringify(consumed));
+  const consumed = inputHandlers[0]("\x1bf");
+  ok("Alt+F (ESC f, 0x1b 0x66) is consumed and opens the panel", consumed?.consume === true, JSON.stringify(consumed));
   await new Promise((r) => setTimeout(r, 300));
   const panel = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
   ok("the panel opens with the run's header", panel.includes("fade-orchestrator GATE1"), panel.slice(0, 240));
@@ -675,6 +691,97 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   delete process.env.PI_SESSION_FILE;
 }
 
+
+// 21. Alt+F is the panel's chord, claimed at the RAW-INPUT layer (the operator's ask, 2026-11-15).
+//     The host's own table binds `alt+f` (`tui.editor.cursorWordRight`), so its SHORTCUT
+//     registration is refused and the byte is the delivery: `ESC f` (0x1b 0x66) opens the panel.
+//     The row names the chord it honors, and Y19 `--demo-redact` masks identity for screenshots.
+//     The real-terminal half of this proof is `test/pty_rig.mjs`.
+{
+  resident = "flash-next";
+  const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
+  const host = hostname();
+  writeState({ ...seedState("coding", [["true", "green"]]), goal: `run ${repo} on ${host} by ${user}`, schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  await new Promise((r) => setTimeout(r, 700)); // the disclosure is deferred past the TUI attach
+  const row21 = widgets.get("fade-top")?.lines?.[0] ?? "";
+  ok("the row names [Alt+F], the chord the raw layer claims", row21.endsWith("· [Alt+F]"), JSON.stringify(row21));
+  ok("one raw-input listener is bound, for ESC f", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
+  const gotF = inputHandlers[0]("\x1bf");
+  ok("ESC f (0x1b 0x66) is consumed and opens the panel", gotF?.consume === true, JSON.stringify(gotF));
+  await new Promise((r) => setTimeout(r, 300));
+  const panel21 = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
+  ok("the panel opened on ESC f", panel21.includes("fade-orchestrator GATE1"), panel21.slice(0, 200));
+  ok("the host-held chord is NOT registered as a shortcut (the byte is the delivery)", !shortcuts["alt+f"], JSON.stringify(Object.keys(shortcuts)));
+  ok("the registered fallback chord survives", Boolean(shortcuts["alt+shift+i"]), JSON.stringify(Object.keys(shortcuts)));
+  ok("the disclosure names Alt+F and the raw-byte claim", /Alt\+F[\s\S]*raw byte/.test(disclosure), JSON.stringify(disclosure));
+  ok("the unredacted panel carries the account, host and repo path", panel21.includes(repo) && panel21.includes(host) && panel21.includes(user), panel21.slice(0, 300));
+  await commands.orchestrate.handler("--demo-redact", ctx);
+  ok("--demo-redact flips the display switch", process.env.FADE_ORCHESTRATE_REDACT === "1" && notes.some((n) => n.includes("demo redaction ON")), JSON.stringify(notes.slice(-1)));
+  inputHandlers[0]("\x1bf"); // re-open, so the SAME screen is re-rendered under the switch
+  await new Promise((r) => setTimeout(r, 300));
+  const panelR = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
+  ok("--demo-redact: the panel shows no repo path, home, host or account", panelR.length > 0 && !panelR.includes(repo) && !panelR.includes("/home/") && !panelR.includes(host) && !panelR.includes(user), panelR.slice(0, 300));
+  ok("--demo-redact is display-only: state.json keeps the repo verbatim", readState().repo === repo, readState().repo);
+  await commands.orchestrate.handler("--demo-redact=off", ctx);
+  ok("--demo-redact=off turns the switch back", process.env.FADE_ORCHESTRATE_REDACT === undefined, JSON.stringify(process.env.FADE_ORCHESTRATE_REDACT));
+}
+
+// 22. Y9 fast-path single-model bypass. The pre-swap gate has already produced the verifier's
+//     evidence (the plan's own exit codes) on the code lane, so a single-file diff under the
+//     15-line threshold, green on the FIRST try, completes with ZERO lane loads. The counterfactual
+//     in the same block: over the threshold, the verifier swap is paid exactly once.
+{
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  // The run's own state plane is not part of the coder's diff: `var/` is gitignored in the real
+  // repo (.gitignore:27). The rig's seed commit tracked it before the ignore existed, so it is
+  // untracked here — otherwise the fast path prices its own ledger (4 files, 93 lines) as the
+  // coder's change and the fast path never fires.
+  writeFileSync(join(repo, ".gitignore"), "var/\nsessions/\n");
+  git("rm", "-r", "-q", "--cached", "var");
+  git("add", "-A");
+  git("commit", "-q", "-m", "rig: ignore the run plane");
+  resident = "flash-next";
+  writeFileSync(join(repo, "a.ts"), "small edit\n");
+  writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  const base22 = loads();
+  const res22 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 60));
+  const s22 = readState();
+  ok("Y9: a green first try on a 1-file/2-line diff completes on the code lane", s22.state === "complete" && s22.lane === "flash-next", `${s22.state}/${s22.lane}`);
+  ok("Y9: the fast path pays ZERO lane loads (one transition for the round, not two)", loads() === base22, `${loads() - base22}`);
+  ok("Y9: the payload reports the fast path and no next lane", res22?.details?.fast_path === true && res22?.details?.next_lane === null, JSON.stringify(res22?.details));
+  ok("Y9: the accepted phase is recorded by name for the rail", `${s22.phases.at(-1)?.notes}`.includes("fast path"), JSON.stringify(s22.phases.at(-1)?.notes));
+  ok("Y9: the fast path tags the checkpoints an accepted verification would tag", Object.keys(s22.checkpoints ?? {}).length === 2, JSON.stringify(s22.checkpoints));
+  // Counterfactual: the same report with a 20-line diff is over the threshold, so the verifier
+  // swap is paid — exactly once.
+  resident = "flash-next"; // the case below pays a swap, so start it on the coder lane
+  writeFileSync(join(repo, "a.ts"), "line\n".repeat(20));
+  writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [], checkpoints: {} });
+  await hooks.session_start({}, ctx);
+  const base23 = loads();
+  const res23 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 60));
+  ok("Y9: over the threshold the verifier swap is paid EXACTLY once", loads() - base23 === 1, `${loads() - base23}`);
+  ok("Y9: over the threshold the run reaches verifying, not complete", readState().state === "verifying" && res23?.details?.fast_path === undefined, `${readState().state}/${JSON.stringify(res23?.details)}`);
+  resident = "flash-next"; // as above: a resident verifier lane pays no load (the flip guard)
+  // A round that already took a rejection is not a first try, however small its diff.
+  writeFileSync(join(repo, "a.ts"), "tiny again\n");
+  writeState({
+    ...seedState("coding", [["true", "green"]]),
+    schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, checkpoints: {},
+    rejection_history: [{ round: 1, at: "2026-11-15T00:00:00.000Z", kind: "task", reason: "pre-swap gate red: false", task_id: "T1" }],
+  });
+  await hooks.session_start({}, ctx);
+  const base24 = loads();
+  await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 60));
+  ok("Y9: a round with a rejection is not a FIRST TRY, so the swap is paid", loads() - base24 === 1 && readState().state === "verifying", `${loads() - base24}/${readState().state}`);
+}
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));
 if (failed.length > 0) {

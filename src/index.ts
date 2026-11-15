@@ -17,6 +17,7 @@
  */
 import { unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipGuarded, flipState, listLanes, loadLane, observeSwaps, routerBusy, type RouterBusy } from "./router.ts";
@@ -29,7 +30,7 @@ import {
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
 	TERMINAL,
 	briefings,
 	readJson,
@@ -49,16 +50,21 @@ import { laneMoe } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
 import { collectScreen, type ScreenData } from "./screendata.ts";
 
-// The panel key, chosen by measurement, not by table-guessing. The operator asked for Ctrl+O first;
-// the host binds `ctrl+o` to `app.tools.expand` and ACTS on its own bindings, so the screen cannot
-// live there. `alt+f` (the operator's second choice) looked free in the strings-extracted default
-// table and is NOT: the host's runtime answers `keybinding tui.editor.cursorWordRight` for it
-// (measured via `getShortcutConflict`, 2026-11-15), and the pty rig watched ESC f move the cursor
-// word instead of opening a panel. `alt+shift+f` (ESC + `F`) answers FREE and is byte-distinct, so
-// that is the key. `FADE_ORCHESTRATE_KEY` moves it (`ctrl+<a-z>`, `alt+<a-z>` and
-// `alt+shift+<a-z>` have byte forms; `ctrl+shift+<a-z>` does not — shift is invisible inside a
-// control code, measured). `FADE_ORCHESTRATE_FALLBACK_KEY` (default `alt+shift+i`, measured FREE,
-// ESC + `I`) is the registered companion chord.
+// The panel key, by measurement. The operator asked for Ctrl+O first; the host binds `ctrl+o` to
+// `app.tools.expand` and ACTS on its own bindings, so the screen cannot live there. The operator's
+// second ask (2026-11-15) is **Alt+F**, and Alt+F is the key. The host's key table binds `alt+f`
+// (`getShortcutConflict("alt+f")` → `keybinding tui.editor.cursorWordRight`), so the SHORTCUT
+// registration for it is refused — the chord is taken at the RAW-INPUT layer, where this extension
+// consumes `ESC f` (0x1b 0x66) and the host binding never runs. The registration is still
+// attempted and its refusal tolerated: the byte is the delivery, and no host binding is moved.
+// Which layer wins a chord the host's table binds is a terminal fact, not an assumption, so
+// `test/pty_rig.mjs` drives the real `omp` binary and asserts `ESC f` opens the panel; if the host
+// ever steals the byte the rig names the steal and the fallback chord is what opens.
+// `FADE_ORCHESTRATE_KEY` moves the chord (`ctrl+<a-z>`, `alt+<a-z>` and `alt+shift+<a-z>` have
+// byte forms; `ctrl+shift+<a-z>` does not — shift is invisible inside a control code, measured).
+// The chords the host's 38-action table leaves FREE in the single-alt family are
+// `alt+c e j q s t u v w x z`; `FADE_ORCHESTRATE_FALLBACK_KEY` (default `alt+shift+i`, probe
+// reported FREE, ESC + `I`) is the registered companion chord.
 
 // Y10 pre-unload health gate: `POST /v1/load` unloads the RESIDENT lane, and a request queued at
 // that instant is answered by the router's own log line `swap flash-next -> deepseek (1 waiting)` —
@@ -68,7 +74,15 @@ import { collectScreen, type ScreenData } from "./screendata.ts";
 // in milliseconds; the documented interval/budget is what the box runs.
 const GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3000);
 const GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 60_000);
-const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+shift+f";
+const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+f";
+// Y19 `--demo-redact`: the display switch starts OFF; `/orchestrate --demo-redact` flips it for
+// the session, and `FADE_ORCHESTRATE_REDACT=1` sets the same switch from the environment.
+// Y9 fast-path threshold: the verifier swap is 13-25 s and 52-130 GiB, and the pre-swap gate has
+// already run the plan's deterministic checks on the code lane. A single-file edit under this many
+// changed lines, with the gate green on the FIRST try, completes on the code lane: the swap buys
+// nothing the exit codes did not already prove.
+const FASTPATH_LINES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_LINES ?? 15);
+const FASTPATH_FILES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_FILES ?? 1);
 // The status row's surface. `widget` (the default) docks it above the editor; `status` writes the
 // same text to the host's status bar, which is the right choice only for a `statusLine` config that
 // placed the `status` segment after the model — the host puts the text wherever the config says, and
@@ -118,11 +132,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  during extension loading, where the probe throws). */
 	let chordResolved = false;
 	let probeHasAnswered = false;
-	/** True once the disclosure's probe says the configured chord is HELD. The row's key hint reads
-	 *  this: a row that advertises `[Ctrl+O]` while ctrl+o runs the host's action is a row that
-	 *  advertises a dead key (verifier review 2026-11-15 — the HELD rig state captured exactly that
-	 *  on screen while its own assertion read "ctrl+o opens nothing"). The row must name the chord
-	 *  that opens the screen, which in the held state is the fallback. */
+	/** True once the disclosure's probe (or the measured chord table) says the host's own table
+	 *  BINDS the configured chord. That binds the SHORTCUT registration only: the panel's chord is
+	 *  claimed at the raw-input layer, so the row keeps naming the configured chord whenever a byte
+	 *  form exists (`DELIVERED_KEY`). The flag drives the disclosure's wording — a row that
+	 *  advertises a chord the extension never claims is a row that advertises a dead key
+	 *  (verifier review 2026-11-15: the HELD rig state showed `[Ctrl+O]` while its own assertion
+	 *  read "ctrl+o opens nothing"). */
 	let chordHeld = false;
 	let turnSeq = 0;
 	let turnPhase: string | undefined;
@@ -263,6 +279,28 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
 	};
 
+	/** Y9: the diff the fast path prices — changed paths and changed lines in the working tree vs
+	 *  HEAD, with untracked files counted as paths. `files: -1` names a tree git cannot speak for,
+	 *  which is never fast-path eligible. */
+	const fastPathDiff = (repo: string): { files: number; lines: number } => {
+		try {
+			const numstat = execFileSync("git", ["-C", repo, "diff", "--numstat", "HEAD"], { encoding: "utf8" });
+			const untracked = execFileSync("git", ["-C", repo, "ls-files", "--others", "--exclude-standard"], { encoding: "utf8" });
+			let lines = 0;
+			let files = 0;
+			for (const row of numstat.split("\n")) {
+				if (row.trim() === "") continue;
+				const [add, del] = row.split("\t");
+				files += 1;
+				lines += (add === "-" ? 0 : Number(add) || 0) + (del === "-" ? 0 : Number(del) || 0);
+			}
+			files += untracked.split("\n").filter((s) => s.trim() !== "").length;
+			return { files, lines };
+		} catch {
+			return { files: -1, lines: -1 };
+		}
+	};
+
 	/** True once THIS process has written the status-bar row (the opt-in surface). The widget
 	 *  surface never touches `setStatus` at all — proved by `test/rpc_rig.mjs`: the default surface
 	 *  is the top widget, and a clear-only call there is an API touch the contract forbids. */
@@ -297,7 +335,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// `FADE_ORCHESTRATE_SURFACE=status` opts into the status bar for a config that placed the
 		// `status` segment right after the model. The detail view stays the panel, and the row's key
 		// hint is the configured chord's label, so the row never advertises a key it does not honor.
-		const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(chordHeld ? FALLBACK_KEY : FADE_KEY) });
+		const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(DELIVERED_KEY) });
 		if (!lines) {
 			clearSurface(ctx);
 			return;
@@ -507,13 +545,24 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 
-	// The chord, taken at the raw-input layer. That layer is the proven path: `registerShortcut` is
-	// refused for a chord the host's table holds ("Extension shortcut conflicts with built-in
-	// shortcut" in getShortcuts, measured for ctrl+o), and a raw listener sees the bytes whatever
-	// owns the action. While the panel is open the byte is NOT consumed: the overlay keeps its own
-	// keys (esc closes).
+	// The chord, claimed at the raw-input layer. `registerShortcut` is refused for a chord the host's
+	// table binds ("Extension shortcut conflicts with built-in shortcut" in getShortcuts, measured for
+	// ctrl+o, and the probe says the same for alt+f), and the refusal is tolerated; the RAW byte is the
+	// delivery, so `ESC f` opens the panel and the host's `tui.editor.cursorWordRight` never runs.
+	// While the panel is open the byte is NOT consumed: the overlay keeps its own keys (esc closes).
 	const CHORD = chordBytes(FADE_KEY);
 	const FALLBACK_KEY = process.env.FADE_ORCHESTRATE_FALLBACK_KEY ?? "alt+shift+i";
+	/** The listener's family is ESC + a byte: `alt+<letter>` and `alt+shift+<letter>` are the chords
+	 *  whose keystroke the extension can claim ahead of the host — `onTerminalInput` sees the two
+	 *  bytes and returns `consume`. A control code is NOT in that family: the host ACTS on it
+	 *  (measured, a raw `C-o` printed `Tool output expansion: enabled` and the listener never saw
+	 *  `0x0f`), so a configured control chord stays the host's and the fallback chord is what opens.
+	 *  `DELIVERED_KEY` is the chord the keystroke actually delivers, and it is what the row names: a
+	 *  row advertising a key that opens nothing was the measured defect (the pty rig caught
+	 *  `[Ctrl+O]` painted while its own assertion read "ctrl+o opens nothing", verifier review 2026-11-15).
+	 */
+	const RAW_DELIVERABLE = CHORD !== undefined && CHORD.startsWith("\x1b");
+	const DELIVERED_KEY = RAW_DELIVERABLE ? FADE_KEY : FALLBACK_KEY;
 	const openPanelGuarded = async (ctx: ExtensionContext): Promise<void> => {
 		if (panelOpen) return;
 		panelOpen = true;
@@ -527,8 +576,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	/**
 	 * The host's chord table — the chords its own action table binds, read out of the 18.20.2 binary and
 	 * confirmed at runtime by the conflict probe where the probe answers (measured 2026-11-15: `alt+f`
-	 * answers `keybinding tui.editor.cursorWordRight`; `alt+shift+f` and `alt+shift+i` answer FREE, which
-	 * is why the extension's chord is `alt+shift+f`).
+	 * answers `keybinding tui.editor.cursorWordRight`, so its shortcut registration is REFUSED and the
+	 * raw listener delivers the byte; `alt+shift+i` answers FREE, which is why the fallback registers).
 	 *
 	 * The table exists because the probe is **not callable when a hook can run**: `getShortcutConflict`
 	 * throws for the loading-phase proxy, `session_start` fires inside that window, and an idle TUI
@@ -561,9 +610,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		chordHeld = held;
 		if (conflictReported) return;
 		conflictReported = true;
-		const text = held
-			? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) — the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z`
-			: `orchestrate: ${keyLabel(FADE_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
+		// Three states, each stated as it is: the host binds the chord AND the extension can claim the
+		// byte (the `alt+<letter>` family — the SHORTCUT is refused, the raw byte delivers, and the pty
+		// rig proves the host's action does not run); the host binds the chord and the byte is NOT
+		// claimable (a control code: the chord stays the host's, and the fallback is the key); or
+		// nothing binds it and the configured chord is simply the key.
+		const text = held && RAW_DELIVERABLE
+			? `orchestrate: the host's table binds ${keyLabel(FADE_KEY)} (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "a keybinding"}), so the SHORTCUT for it is refused; the extension claims the raw byte, so ${keyLabel(FADE_KEY)} opens the orchestration screen and the host action does not run (proved by test/pty_rig.mjs). ${keyLabel(FALLBACK_KEY)} is the registered fallback, /orchestrate overlay the command path, and FADE_ORCHESTRATE_KEY=alt+e (free in the measured table) the alternative`
+			: held
+				? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) — the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z. An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone`
+				: `orchestrate: ${keyLabel(DELIVERED_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
 		// The FIRST notify of a session is swallowed by the host's TUI attach: measured in the pty rig
 		// (2026-11-15), the disclosure fired at `session_start` never reached the scrollback while the
 		// notify ~20 lines later in the same hook rendered every time. Deferring past the attach is the
@@ -592,9 +648,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			st.tasks = (payload.tasks as Task[]).map((t) => ({ ...t, round: st.round }));
 			st.checks = payload.checks as [string, string][];
 			st.tier = st.tasks.length <= 2 ? "S" : st.tasks.length <= 4 ? "M" : "L";
-			// Adaptive budget: a 2-task plan reserves 3 rounds, a 6-task plan 5 — swaps are the
-			// unit of cost here (13-25 s per pack load), so the budget tracks the plan size.
-			st.max_rounds = adaptiveRounds(st.tasks.length, st.max_rounds);
+			// Y8: the cap is the PLAN's, not a constant. A task that declares `complexity` sets the
+			// tier (trivial 2 / standard 4 / deep 6, the max over the plan); a plan declaring none
+			// falls back to the measured task-count curve (2 tasks reserve 3 rounds, 6 reserve 5).
+			// Swaps are the unit of cost (13-25 s per pack load), and the operator's `--rounds`
+			// budget is the ceiling in both cases.
+			st.max_rounds = roundsForTasks(st.tasks, st.max_rounds);
 			st.repair_tasks = [];
 			st.state = "coding";
 			return { next: CODE_LANE, nextState: "coding" };
@@ -785,6 +844,38 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					};
 				}
 			}
+			// Y9 fast-path single-model bypass. The gate is green, every task in the window is
+			// passed, the diff is under the threshold, and this round has taken no task/verification
+			// rejection — the first try. The verifier's evidence IS the exit codes the gate just
+			// collected, so the 13-25 s / 52-130 GiB swap buys nothing: the run completes on the
+			// code lane and pays ZERO lane loads. The accepted phase is recorded by name so the
+			// phase rail and the ledger show what happened, and the checkpoints land exactly as an
+			// accepted verification would (Y16).
+			if (params.phase === "coding_done" && applied.nextState === "verifying" && run.gate_last?.passed === true) {
+				const st2: RunState = run;
+				const firstTry = !(st2.rejection_history ?? []).some((r) => r.round === st2.round && (r.kind === "task" || r.kind === "verification"));
+				const allPassed = st2.tasks.length > 0 && st2.tasks.every((t) => t.status === "passed");
+				const diff = firstTry && allPassed ? fastPathDiff(st2.repo) : undefined;
+				if (diff && diff.files >= 1 && diff.files <= FASTPATH_FILES && diff.lines < FASTPATH_LINES) {
+					st2.phases.push({ phase: "verification_done", lane: st2.lane, accepted: true, round: st2.round, at: new Date().toISOString(), notes: `fast path: ${diff.files} file(s), ${diff.lines} changed lines < ${FASTPATH_LINES}, gate green on the first try — the verifier swap was not paid` });
+					st2.state = "complete";
+					const tags2 = st2.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st2.repo, st2, t.id));
+					const ok2 = tags2.filter((t) => t.ok).map((t) => t.tag);
+					const refused2 = tags2.filter((t) => !t.ok);
+					checkpointNote = ok2.length > 0 ? `; checkpoints ${ok2.join(", ")}` : "";
+					if (refused2.length > 0) checkpointNote += `; checkpoint FAILED ${refused2.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+					turnPhase = "verification_done";
+					persist();
+					paint(ctx);
+					pending = undefined;
+					settledNotified = false;
+					ctx.abort();
+					return {
+						content: [{ type: "text", text: `fast path: gate green on the first try, ${diff.lines} changed lines in ${diff.files} file(s) under the ${FASTPATH_LINES}-line threshold; the run is complete on the ${st2.lane} lane and the verifier swap was not paid${checkpointNote}` }],
+						details: { phase: "coding_done", state: "complete", fast_path: true, files: diff.files, lines: diff.lines, threshold_lines: FASTPATH_LINES, threshold_files: FASTPATH_FILES, next_lane: null, checkpoints: st2.checkpoints ?? {} },
+					};
+				}
+			}
 			persist();
 			paint(ctx);
 			pending = applied.nextState === "failed" || applied.nextState === "complete" ? undefined : { lane: applied.next, phase: params.phase };
@@ -844,9 +935,23 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
-			const raw = args.trim();
+			// Y19 `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
+			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
+			// form flips the switch, and `--demo-redact=off` (or `=0`) turns it back. The durable
+			// record — state.json, metrics.jsonl, swap_history.json — is never touched.
+			let raw = args.trim();
+			const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
+			if (demo) {
+				const off = demo[1] === "off" || demo[1] === "0";
+				if (off) delete process.env.FADE_ORCHESTRATE_REDACT;
+				else process.env.FADE_ORCHESTRATE_REDACT = "1";
+				raw = raw.replace(demo[0], " ").replace(/\s+/g, " ").trim();
+				paint(ctx);
+				ctx.ui.notify(`orchestrate: demo redaction ${off ? "OFF" : "ON"} — the row, pill and panel mask the account, host, home and repo path (display only)`, "info");
+				if (raw === "") return;
+			}
 			const first = raw.split(/\s+/)[0] ?? "";
 			if (first === "status") {
 				if (!run) {
@@ -1014,7 +1119,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		await ensurePhaseTool();
 		// Bind the chord for this session. A delegated worker never binds it: the keystroke is global
 		// to the terminal, and the panel belongs to the session that owns the run.
-		if (CHORD && !inputUnsub) {
+		if (RAW_DELIVERABLE && !inputUnsub) {
 			inputUnsub = ctx.ui.onTerminalInput((data) => {
 				if (data !== CHORD || panelOpen) return undefined;
 				void openPanelGuarded(ctx);

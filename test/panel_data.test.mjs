@@ -209,6 +209,13 @@ test("collectScreen: the whole screen from injected sources — tiers, lanes, co
 		assert.ok(String(d.critique).includes("the rig asserts a line that never renders"), "the verifier's words ride");
 		assert.equal(d.elapsed_s, 842, "the run's age from its own start stamp");
 		assert.deepEqual(d.missing, [], "every source answered, so nothing is missing");
+		writeFileSync(cfg, JSON.stringify({ version: 2, models: [
+			{ alias: "flash-next", model: "qwen3.8-coder.basalt", "expert-profile-save": prof, "expert-profile-save-every": 10 },
+			{ alias: "deepseek", model: "DeepSeek-V4.1-Flash.basalt" },
+		] }));
+		const rows = liveRows({ configPath: cfg, proof: { routerConfigPath: cfg, engineStartEpoch: mtime_s - 60 } });
+		assert.match(liveRow(rows, "MoE flash-next").value, /written by this engine · warm start/);
+		assert.match(liveRow(rows, "MoE deepseek").value, /unsupported \(Flash-Next only/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

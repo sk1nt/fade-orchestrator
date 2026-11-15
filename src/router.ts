@@ -36,7 +36,7 @@ export async function listLanes(): Promise<{ health: string; models: RouterLane[
 	}
 }
 
-export type RouterHealth = { model?: string; loaded?: boolean | string; loading?: boolean; percent?: number | null; swap?: { from?: string; to?: string; phase?: string; waiting?: number; elapsed_s?: number } };
+export type RouterHealth = { model?: string; loaded?: boolean | string; loading?: boolean; percent?: number | null; status?: string; state?: string; service?: string; max_context?: number; vram_free_mib?: number; free_vram_mib?: number; vram_total_mib?: number; vram?: { free_mib?: number; total_mib?: number }; swap?: { from?: string; to?: string; phase?: string; waiting?: number; elapsed_s?: number } };
 
 /** The router's own health line: `loading` is true while a swap is in flight. */
 export async function laneHealth(): Promise<RouterHealth | undefined> {
@@ -48,8 +48,86 @@ export async function laneHealth(): Promise<RouterHealth | undefined> {
 	}
 }
 
-export const SETTLE_POLL_MS = 2000;
-export const SETTLE_MAX_MS = 120_000;
+/**
+ * Y10: the PRE-UNLOAD GATE. `POST /v1/load` is not additive — it unloads the resident context to
+ * make room for the next pack — so the decision is judged on the router's own `/health` line, in
+ * words, BEFORE the byte is sent. The classes are the ones this box has measured, and an absent
+ * reading is never reported as a zero:
+ *  * `unreachable` — `/health` refused: a router that cannot answer is not a context a swap can
+ *    land in (the recorded shapes: the referee's `status=6/ABRT` CUDA launch that raced the lane,
+ *    and the `:18014` slowness after the 2026-11-09 OOM);
+ *  * `error state` — the line's `status`/`state` is not `ok`: a context that stopped saying `ok`
+ *    cannot serve the next lane (the hung-context and half-dead-CUDA class surfaces here);
+ *  * `no model` — `loaded: true` while `model` names nothing: a context that claims to be loaded
+ *    and cannot say what it loaded is not serving;
+ *  * `zero VRAM` / `below the floor` — reported free VRAM at or under zero, or under
+ *    `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` (default 8192): no pack lands there;
+ *  * `swap in flight` — `loading: true` at the END of the settle window. The measured ping-pong
+ *    (2026-11-14 21:55:50-21:58:33: `swap: flash-next ready in 16.4 s`, then `(1 waiting)`,
+ *    `(3 waiting)`) is exactly a second load queued behind a running one.
+ */
+export interface ServeVerdict {
+	serve: boolean;
+	reason: string;
+}
+
+/** Reported free VRAM below this is not a context a pack can land in. */
+export const VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 8192);
+
+/** Every state the health line reports (`status` and `state` can both ride): a hostile one is a
+ *  hostile line, so a healthy `status` never masks a `state` of `cuda_fatal`. */
+const healthStates = (h: RouterHealth): string[] =>
+	(["status", "state"] as const)
+		.map((k) => (typeof h[k] === "string" && h[k]!.length > 0 ? h[k]!.toLowerCase() : undefined))
+		.filter((v): v is string => v !== undefined);
+
+/** Free VRAM, from whichever spelling the router's build uses; an absent reading stays absent. */
+const vramFreeMib = (h: RouterHealth): number | undefined => {
+	const direct = finite(h.vram_free_mib) ?? finite(h.free_vram_mib);
+	const nested = finite((h.vram as Record<string, any> | undefined)?.free_mib);
+	return direct ?? nested;
+};
+
+/** The named pre-unload verdict, from the health line alone. Pure: the rig drives it hostile JSON. */
+export function serveVerdict(h: RouterHealth | undefined): ServeVerdict {
+	if (h === undefined) return { serve: false, reason: `router unreachable at ${ROUTER}: /health refused; a router that cannot answer is not a context a swap can land in` };
+	const bad = healthStates(h).find((s) => s !== "ok" && s !== "ready" && s !== "healthy");
+	if (bad !== undefined) {
+		return { serve: false, reason: `router health reports "${bad}": a context that stopped saying ok cannot serve the next lane` };
+	}
+	if (h.loading === true) {
+		const sw = h.swap;
+		const pct = finite(h.percent);
+		return { serve: false, reason: `swap in flight${sw?.from ? ` ${sw.from} -> ${sw.to ?? "?"}` : ""}${pct !== undefined ? ` at ${Math.round(pct)}%` : ""}: a second load is the queued ping-pong, not a faster lane` };
+	}
+	const free = vramFreeMib(h);
+	if (free !== undefined && free <= 0) return { serve: false, reason: `zero free VRAM (${free} MiB): the CUDA context is dead — the recorded half-dead shape` };
+	if (free !== undefined && free < VRAM_MIN_FREE_MIB) return { serve: false, reason: `free VRAM ${free} MiB is under the ${VRAM_MIN_FREE_MIB} MiB pack floor: no lane lands here` };
+	const model = typeof h.model === "string" ? h.model.trim() : "";
+	if (h.loaded === true || h.loaded === "true") {
+		if (model === "") return { serve: false, reason: "health claims a loaded context that names no model: nothing is serving" };
+	}
+	return { serve: true, reason: `context can serve${model !== "" ? ` (${model}${h.loading === false ? ", idle" : ""})` : ""}${free !== undefined ? `, ${Math.round(free)} MiB free` : ", VRAM not reported"}` };
+}
+
+/**
+ * Settle an in-flight swap, then hand back the health line the window ENDED on: the pre-unload
+ * gate reads the same reading, never a fresh guess.
+ */
+export async function settleInFlight(): Promise<RouterHealth | undefined> {
+	let health = await laneHealth();
+	for (let waited = 0; health?.loading === true && waited < SETTLE_MAX_MS; waited += SETTLE_POLL_MS) {
+		const { promise: settle, resolve: settleDone } = Promise.withResolvers<void>();
+		setTimeout(settleDone, SETTLE_POLL_MS);
+		await settle;
+		health = await laneHealth();
+	}
+	return health;
+}
+
+/** The settle window for an in-flight swap. Rigs shrink it so the hung-context class is proved in milliseconds. */
+export const SETTLE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_POLL_MS ?? 2000);
+export const SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?? 120_000);
 
 /**
  * `POST /v1/load` is a pack swap — flash-next 52.2 GiB, deepseek 120 GiB, 13-25 s each
@@ -62,14 +140,15 @@ export const SETTLE_MAX_MS = 120_000;
  *  * the resident entry is never reloaded. The round loop asks for the code lane twice in a
  *    row (`verification_done needs_repair` → code, next round's `planning_done` → code), and
  *    a second load of a resident pack re-reads 52 GiB for nothing.
+ *  * Y10: the router's own `/health` line is read FIRST (`serveVerdict`), and a context that
+ *    cannot serve — unreachable, an error state, a loaded context naming no model, zero/low free
+ *    VRAM, a swap still in flight — is REFUSED with the class named, and `/v1/load` is never sent.
  */
 export async function loadLane(lane: string): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
-	for (let waited = 0; waited < SETTLE_MAX_MS; waited += SETTLE_POLL_MS) {
-		if ((await laneHealth())?.loading !== true) break;
-		const { promise: settle, resolve: settleDone } = Promise.withResolvers<void>();
-		setTimeout(settleDone, SETTLE_POLL_MS);
-		await settle;
-	}
+	const t0 = Date.now();
+	// Y10: settle any in-flight swap FIRST and keep the health line the window ended on — that
+	// reading is the gate's evidence.
+	const health = await settleInFlight();
 	const resident = (await listLanes()).models.find((m) => m.status === "loaded")?.id;
 	const flip = flipState(resident, FLIP_WINDOW_MS);
 	const guarded = flipGuarded(flip);
@@ -77,7 +156,12 @@ export async function loadLane(lane: string): Promise<{ ok: boolean; detail: str
 	// the churn named: this is the call site where a flip would be paid, so it is where the
 	// operator has to see it.
 	if (resident === lane) return { ok: true, detail: `already resident; no swap issued${flipNote(flip)}`, elapsed_s: 0, guarded, flip };
-	const t0 = Date.now();
+	// A swap UNLOADS the resident context, so the router's health is read before the byte: the
+	// refusal names the class, and the router is never poked with a load it cannot serve.
+	const verdict = serveVerdict(health);
+	if (verdict.serve === false) {
+		return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+	}
 	try {
 		const r = await fetch(`${ROUTER}/v1/load`, {
 			method: "POST",

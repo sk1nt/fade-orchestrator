@@ -163,7 +163,7 @@ const untilText = async (needle, ms = 20_000) => {
 const checks = [];
 const ok = (name, cond, detail = "") => checks.push({ name, ok: Boolean(cond), detail: String(detail).slice(0, 400) });
 
-const ROW = /Orchestrator: \w+ R1\/6 · T0\/2 · \[Alt\+Shift\+F\]/;
+const ROW = /Orchestrator: \w+ R1\/6 · T0\/2 · \[Alt\+F\]/;
 const strip = (s) => s.replace(/\s+/g, " ");
 
 // ---- run 1: the delivered surface (the top row) and the panel ----
@@ -176,16 +176,16 @@ try {
 	ok("the status row shows in the terminal: glyph, Orchestrator, state, round, tally, key", ROW.test(strip(withRow)), strip(withRow).slice(0, 380));
 
 
-	// The key, as raw bytes (ESC + `F`) to a real terminal. Measured with a chunk-logging reader in
-	// tmux: `send-keys -H 1b 46` lands as ONE read of two bytes (`1b46`), which is what both the
-	// listener's byte comparison and the host's chord parser need — and `M-S-f` is NOT usable here,
-	// because tmux delivers it as `1b66` (ESC + lowercase f), which is the host's cursorWordRight.
-	// The host binds `ctrl+o` to `app.tools.expand` and this extension leaves that chord alone —
-	// run 3 proves the host still acts on it.
-	tmux("send-keys", "-t", SESSION, "-H", "1b", "46");
+	// The key, as raw bytes (ESC + `f`) to a real terminal. Measured with a chunk-logging reader in
+	// tmux: `send-keys -H 1b 66` lands as ONE read of two bytes (`1b66`) — the same two bytes tmux
+	// delivers for `M-f`. The extension's raw-input listener consumes them, so the host's
+	// `tui.editor.cursorWordRight` — what its own table binds for `alt+f` — does NOT run, which is
+	// the check below and not an assumption. `ctrl+o` stays the host's (`app.tools.expand`) and run
+	// 3 proves the extension never takes it.
+	tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
 	const panelText = await until("ENGINE / ROUTER", 20_000);
 	const flatPanel = strip(panelText);
-	ok("Alt+Shift+F (ESC F) opens the screen", panelText.includes("ENGINE / ROUTER"), flatPanel.slice(0, 380));
+	ok("Alt+F (ESC f) opens the screen", panelText.includes("ENGINE / ROUTER"), flatPanel.slice(0, 380));
 	ok("the host did not act: the chord reached the extension", !panelText.includes("Tool output expansion"), flatPanel.slice(0, 300));
 	ok("the screen names the run", panelText.includes("PTYRIG1"), flatPanel.slice(0, 200));
 	ok("the screen carries the task list", /TASKS 0\/2 passed/.test(flatPanel), flatPanel.slice(0, 300));
@@ -212,6 +212,16 @@ try {
 	const closed = await until("Orchestrator:", 15_000);
 	ok("Escape closes the screen", !closed.includes("ENGINE / ROUTER"), strip(closed).slice(0, 300));
 	ok("the status row survives the close", ROW.test(strip(closed)), strip(closed).slice(0, 300));
+	// The operator's ESC report, proved at the byte level. tmux's `screen` terminal has NO Kitty
+	// keyboard protocol, so `send-keys Escape` writes the legacy `\x1b` — the ONLY form the panel
+	// used to compare, which is exactly why this rig passed while ESC was dead on a Kitty-protocol
+	// terminal (kitty, wezterm, ghostty, foot), where ESC arrives as CSI-u. tmux cannot enable the
+	// protocol, so the sequence is injected raw: ESC [ 2 7 u.
+	tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
+	await until("ENGINE / ROUTER", 20_000);
+	tmux("send-keys", "-t", SESSION, "-H", "1b", "5b", "32", "37", "75");
+	const closedKitty = await until("Orchestrator:", 15_000);
+	ok("the Kitty CSI-u escape (ESC [ 2 7 u) closes the screen too", !closedKitty.includes("ENGINE / ROUTER"), strip(closedKitty).slice(0, 300));
 
 	// The disclosure's proof surface is the scrollback (run 3): a notify at session_start has
 	// scrolled out of the 45 visible lines by the time the row paints, and a disclosure that scrolls
@@ -242,13 +252,15 @@ try {
 }
 
 // ---- run 3: the chord, in BOTH host states ----
-// The chosen chord is `alt+shift+f` (ESC + `F`): the host's own conflict probe answers FREE for it,
-// while `alt+f` — which a strings-extracted default table suggested was free — is bound to
-// `tui.editor.cursorWordRight` (the pty rig watched ESC f move the word, 2026-11-15). Two states,
-// each in an isolated agent dir so the desk's own config cannot leak into either:
-//   DEFAULT — nothing configured: the disclosure says Alt+Shift+F opens the screen and names the
-//             fallback; ESC F opens the panel; ctrl+o opens NOTHING (the extension never takes the
-//             host's chord — which action the host runs there is the host's, not the rig's claim).
+// The chord is `alt+f` (ESC + `f`), claimed at the RAW-INPUT layer: the host's table binds `alt+f`
+// to `tui.editor.cursorWordRight` (the pty rig watched ESC f move the word, 2026-11-15), so
+// `registerShortcut` is refused and the extension's `onTerminalInput` listener consumes the two
+// bytes before the host's binding acts. Two states, each in an isolated agent dir so the desk's own
+// config cannot leak into either:
+//   DEFAULT — nothing configured: the disclosure names the refusal, says Alt+F opens the screen at
+//             the byte level, and names the fallback chord; ESC f opens the panel; ctrl+o opens
+//             NOTHING (the extension never takes the host's chord — which action the host runs
+//             there is the host's, not the rig's claim).
 //   HELD    — FADE_ORCHESTRATE_KEY=ctrl+o, a chord the host binds: the disclosure names the conflict,
 //             names the fallback chord, and names the env var that moves the key; ctrl+o opens no
 //             screen, and ESC I (alt+shift+i) opens the panel. This is the state the extension has to
@@ -284,13 +296,13 @@ for (const state of ["DEFAULT", "HELD"]) {
 		await until("Orchestrator:", 60_000);
 		if (state === "DEFAULT") {
 			const disclosed = strip(await untilText("opens the orchestration screen", 20_000));
-			ok(`[${tag}] the disclosure names the key and the fallback`, /Alt\+Shift\+F opens the orchestration screen/.test(disclosed) && disclosed.includes("Alt+Shift+I"), disclosed.slice(-380));
+			ok(`[${tag}] the disclosure names the key and the fallback`, /Alt\+F opens the orchestration screen/.test(disclosed) && disclosed.includes("Alt+Shift+I"), disclosed.slice(-380));
 			// The row and the key must agree: in the free state the row advertises the configured chord.
 			const shown = strip(scrollback());
-			ok(`[${tag}] the row advertises the chord that opens the screen`, /T\d+\/\d+ · \[Alt\+Shift\+F\]/.test(shown), shown.slice(-300));
-			tmux("send-keys", "-t", SESSION, "-H", "1b", "46");
+			ok(`[${tag}] the row advertises the chord that opens the screen`, /T\d+\/\d+ · \[Alt\+F\]/.test(shown), shown.slice(-300));
+			tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
 			const opened = strip(await until("ENGINE / ROUTER", 20_000));
-			ok(`[${tag}] ESC F opens the screen`, opened.includes("ENGINE / ROUTER"), opened.slice(0, 300));
+			ok(`[${tag}] ESC f opens the screen`, opened.includes("ENGINE / ROUTER"), opened.slice(0, 300));
 			tmux("send-keys", "-t", SESSION, "Escape");
 			await until("Orchestrator:", 15_000).catch(() => "");
 			// The extension never takes ctrl+o. Which action the host runs there is the host's business
