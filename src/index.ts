@@ -535,6 +535,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 * session — the pty rig, and an operator reading the wall — has no `agent_start` to retry on. Measured
 	 * in every rig state: with the disclosure tied to the probe alone it never reached the screen. So the
 	 * probe decides when it answers and the table decides when it does not; the chord is always disclosed.
+	 *
+	 * The table's boundary is the disclosed truth: a chord NOT in it, behind a probe that never answers,
+	 * is advertised as configured (`chordHeld` stays false) — the table is the only knowledge in that
+	 * state, and claiming a chord this extension registers is held, when nothing says it is, would be a
+	 * invented conflict. The raw-input listener and `registerShortcut` both attempt it, so the disclosure
+	 * matches what the keystroke will do (verifier review 2026-11-15, residual named and accepted).
 	 */
 	const HOST_HELD_CHORDS: Record<string, true> = {
 		"ctrl+c": true, "ctrl+d": true, "ctrl+g": true, "ctrl+l": true, "ctrl+o": true, "ctrl+r": true,

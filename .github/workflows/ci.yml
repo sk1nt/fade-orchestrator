@@ -48,6 +48,11 @@ jobs:
           # legitimately calls setStatus twice (src/index.ts:279 behind `statusWritten`, :307 inside
           # the SURFACE branch), and a CI gate that forbids a documented path is a false gate. A
           # grep over `src/ui.ts` is not usable here: that file names setStatus in prose only.
+          # The guard check is a line-distance heuristic, deliberately: a refactor that routes setStatus
+          # through a helper breaks it (fix the step with the refactor), and a call placed within 8 lines
+          # under the `SURFACE` const (`:76`) passes vacuously. The real guard is the rpc rig's frame
+          # assertion (`test/rpc_rig.mjs`: zero status-bar rows on the default surface, on a live host)
+          # — this step is the cheap tripwire that a host-less CI can run.
           bash -c 'guards=$(grep -n -E "if \(statusWritten\)|SURFACE === .status." src/index.ts | cut -d: -f1); test -n "$guards" || { echo "no status-surface guard found"; exit 1; }; for l in $(grep -n "setStatus(ORCH_STATUS_KEY" src/index.ts | cut -d: -f1); do ok=0; for g in $guards; do if [ "$l" -gt "$g" ] && [ $((l - g)) -le 8 ]; then ok=1; fi; done; if [ "$ok" != 1 ]; then echo "unguarded setStatus at line $l"; exit 1; fi; done; echo "setStatus guarded: $(grep -c "setStatus(ORCH_STATUS_KEY" src/index.ts) call sites, guards at $(echo $guards | tr " " ,)"'
       # The RPC rig (test/rpc_rig.mjs) needs the omp CLI and a live provider, so it runs on the
       # host that owns a basalt router: FADE_ORCHESTRATE_LIVE_SMOKE=1 node test/rpc_rig.mjs
