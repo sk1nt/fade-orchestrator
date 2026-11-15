@@ -290,7 +290,7 @@ for (const state of ["DEFAULT", "HELD"]) {
 	mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
 	seed();
 	seedAgentDir();
-	const tag = state === "DEFAULT" ? "alt+shift+f, nothing configured" : "FADE_ORCHESTRATE_KEY=ctrl+o, a chord the host holds";
+	const tag = state === "DEFAULT" ? "alt+f, nothing configured" : "FADE_ORCHESTRATE_KEY=ctrl+o, a chord the host holds";
 	try {
 		await launch({ PI_CODING_AGENT_DIR: agentDir, FADE_ORCHESTRATE_METRICS_INTERVAL_MS: "2000", FADE_ORCHESTRATE_PANEL_REFRESH_MS: "1000", ...(state === "HELD" ? { FADE_ORCHESTRATE_KEY: "ctrl+o" } : {}) });
 		await until("Orchestrator:", 60_000);

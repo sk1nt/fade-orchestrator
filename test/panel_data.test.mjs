@@ -7,11 +7,13 @@
 // no live router, no live session, deterministic fixtures.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { clockOf, collectScreen, compactNumber, formatElapsed, gateRows, laneRows, nameResidentRow, sparkline, swapRows, turnRows } from "../.test-build/screendata.mjs";
+import { moeCacheRow, tiersFromMetrics } from "../.test-build/livedata.mjs";
+import { moeRows } from "../.test-build/moe.mjs";
 
 // The bundle in `.test-build/` is built by the ENTRY POINT (`npm run test:build` /
 // `node test/build.mjs`), never from inside a test file: `node --test` runs files in parallel and
@@ -196,7 +198,8 @@ test("collectScreen: the whole screen from injected sources — tiers, lanes, co
 		// tok/s is rounded by design (a compact column); the live state is the router's own word.
 		assert.equal(tiers.get("decode now"), "131 tok/s (queue 0, decoding)");
 		assert.ok(String(tiers.get("expert slots")).includes("2200"), String(tiers.get("expert slots")));
-		assert.equal(tiers.get("prefix cache"), "82.3% hit over 1 req · last 82.3% (900 tok reused) · ssd 0.0%");
+		// the row grew the pcie/ssd shares as NAMED columns (2026-11-15); this fixture carries no pcie_share.
+		assert.equal(tiers.get("prefix cache"), "82.3% hit over 1 req · last 82.3% (900 tok reused) · pcie not reported · ssd 0.0%");
 		assert.deepEqual(
 			d.lanes.map((l) => l.model),
 			["deepseek", "flash-next"],
@@ -209,13 +212,6 @@ test("collectScreen: the whole screen from injected sources — tiers, lanes, co
 		assert.ok(String(d.critique).includes("the rig asserts a line that never renders"), "the verifier's words ride");
 		assert.equal(d.elapsed_s, 842, "the run's age from its own start stamp");
 		assert.deepEqual(d.missing, [], "every source answered, so nothing is missing");
-		writeFileSync(cfg, JSON.stringify({ version: 2, models: [
-			{ alias: "flash-next", model: "qwen3.8-coder.basalt", "expert-profile-save": prof, "expert-profile-save-every": 10 },
-			{ alias: "deepseek", model: "DeepSeek-V4.1-Flash.basalt" },
-		] }));
-		const rows = liveRows({ configPath: cfg, proof: { routerConfigPath: cfg, engineStartEpoch: mtime_s - 60 } });
-		assert.match(liveRow(rows, "MoE flash-next").value, /written by this engine · warm start/);
-		assert.match(liveRow(rows, "MoE deepseek").value, /unsupported \(Flash-Next only/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -289,6 +285,74 @@ process.stdout.write(JSON.stringify({ tiers: d.tiers, moe: d.moe, missing: d.mis
 		assert.equal(d.tiers.length, 1, `a dead router fabricates no tiers: ${JSON.stringify(d.tiers)}`);
 		assert.ok(d.missing.some((m) => m.includes("unreachable")), JSON.stringify(d.missing));
 		assert.ok(d.moe.every((m) => m.value !== "0"), JSON.stringify(d.moe));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ── the CAPTURED live shapes, measured 2026-11-15 on this desk ───────────────────────────────────
+// The spill reading is ABSENT (0.4.0 /metrics has no spill-use key — null, NOT a zero), the slots
+// read 2200/15360, hit_rate 0.79-0.80 with ~200k tokens reused, ssd_share null on every request,
+// pcie_share ~0.54. Each row below is composed the way the screen composes it.
+const liveSnapshot = {
+	at_utc: "2026-11-15T13:40:00Z",
+	quant: "IQ1_M",
+	slots: 2200,
+	spill_experts: undefined,
+	spill_total: 15360,
+	requests: [
+		{ hit_rate: 0.8, reused: 204348, ssd_share: null, pcie_share: 0.54 },
+		{ hit_rate: 0.79, reused: 150000, ssd_share: null, pcie_share: 0.53 },
+	],
+};
+const liveRows = (over = {}) => [
+	...tiersFromMetrics(liveSnapshot),
+	moeCacheRow(liveSnapshot.requests),
+	...moeRows(["flash-next", "deepseek"], { configPath: over.configPath, proof: over.proof }),
+	...swapRows([]),
+];
+const liveRow = (rows, label) => {
+	const r = rows.find((x) => x.label === label);
+	assert.ok(r, `row ${label} exists: ${rows.map((x) => x.label).join(", ")}`);
+	return r;
+};
+
+test("live shape: the absent spill reads ?/15360, measured pcie prints, the null ssd is NAMED", () => {
+	const rows = liveRows({ configPath: "/nonexistent-basalt-config.json" });
+	assert.equal(liveRow(rows, "expert slots").value, "2200 · spill ?/15360");
+	const cache = liveRow(rows, "prefix cache").value;
+	assert.match(cache, /79\.5% hit over 2 req · last 80\.0% \(204348 tok reused\) · pcie 53\.5% · ssd not reported/);
+});
+
+test("live config shape: a save-writing lane says so, and the unsupported lane is never sold as saving", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-panel-"));
+	try {
+		const prof = join(dir, "flash-next.prof");
+		writeFileSync(prof, "P");
+		const cfg = join(dir, "config.json");
+		writeFileSync(cfg, JSON.stringify({ version: 2, models: [
+			{ alias: "flash-next", model: "qwen3.8-coder.basalt", "expert-profile-save": prof, "expert-profile-save-every": 10 },
+			{ alias: "deepseek", model: "DeepSeek-V4.1-Flash.basalt" },
+		] }));
+		const mtime_s = statSync(prof).mtimeMs / 1000;
+		const rows = liveRows({ configPath: cfg, proof: { routerConfigPath: cfg, engineStartEpoch: mtime_s - 60 } });
+		assert.match(liveRow(rows, "MoE flash-next").value, /written by this engine · warm start/);
+		assert.match(liveRow(rows, "MoE deepseek").value, /unsupported \(Flash-Next only/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("live config, stale profile: the reload act renders instead of a green", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-panel-"));
+	try {
+		const prof = join(dir, "flash-next.prof");
+		writeFileSync(prof, "P");
+		const cfg = join(dir, "config.json");
+		writeFileSync(cfg, JSON.stringify({ version: 2, models: [{ alias: "flash-next", model: "qwen3.8-coder.basalt", "expert-profile-save": prof }] }));
+		const mtime_s = statSync(prof).mtimeMs / 1000;
+		const rows = liveRows({ configPath: cfg, proof: { routerConfigPath: cfg, engineStartEpoch: mtime_s + 3600 } });
+		assert.match(liveRow(rows, "MoE flash-next").value, /earlier engine's file · warm on reload/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
