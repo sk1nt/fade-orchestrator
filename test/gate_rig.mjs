@@ -498,6 +498,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   // The swap itself is 5b's subject; here the gate going GREEN at the repaired root is the point,
   // and it is the state the loader pays from.
   ok("a green gate at the repaired root reaches verifying, so the swap is paid for", g.state === "verifying", g.state);
+  // Hand the scenarios below back a run rooted at a directory that EXISTS: `alt` is a tmpdir this
+  // block removes, and a run whose root is gone makes every later git reader degrade — measured as
+  // the verifier's active tool set arriving with writers on the CI runner.
+  writeState({ ...readState(), repo });
+  await hooks.session_start({}, ctx);
   rmSync(alt, { recursive: true, force: true });
 }
 
