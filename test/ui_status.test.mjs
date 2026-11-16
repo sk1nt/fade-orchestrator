@@ -8,7 +8,7 @@
 import os from "node:os";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chordBytes, keyLabel, laneTag, modelLabel, ORCH_STATUS_KEY, orchGlyph, shortState, statusLines, TOP_WIDGET_KEY } from "../.test-build/ui.mjs";
+import { chordBytes, keyLabel, laneTag, modelLabel, ORCH_STATUS_KEY, orchGlyph, shortState, statusLines, switchGlyph, TOP_WIDGET_KEY } from "../.test-build/ui.mjs";
 
 const task = (id, status) => ({ id, objective: `${id} objective`, files: [`${id}.ts`], acceptance: `${id} acceptance`, dependencies: [], round: 1, status });
 const run = (over = {}) => ({
@@ -33,6 +33,19 @@ const withGlyph = (value, fn) => {
 	} finally {
 		if (prev === undefined) delete process.env.FADE_ORCHESTRATE_GLYPH;
 		else process.env.FADE_ORCHESTRATE_GLYPH = prev;
+	}
+};
+
+/** Set the switch icon for one call, restore the ambient value after — the tests share `process.env`. */
+const withSwitchGlyph = (value, fn) => {
+	const prev = process.env.FADE_ORCHESTRATE_SWITCH_GLYPH;
+	if (value === undefined) delete process.env.FADE_ORCHESTRATE_SWITCH_GLYPH;
+	else process.env.FADE_ORCHESTRATE_SWITCH_GLYPH = value;
+	try {
+		return fn();
+	} finally {
+		if (prev === undefined) delete process.env.FADE_ORCHESTRATE_SWITCH_GLYPH;
+		else process.env.FADE_ORCHESTRATE_SWITCH_GLYPH = prev;
 	}
 };
 
@@ -179,13 +192,29 @@ test("the switching row is multicolored, and the incoming model is named exactly
 	const lines = statusLines(run({ lane: "deepseek" }), { swap: { from: "deepseek", to: "flash-next (IQ3_S, dual)", percent: 47 } });
 	const raw = lines[0];
 	const plain = raw.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
-	assert.equal(plain, "󰚩 Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]");
+	assert.equal(plain, "󰚩 Orchestrator: \u{F051F} switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]");
 	const colors = raw.match(/\x1b\[38;2;\d+;\d+;\d+m/g) ?? [];
 	assert.ok(colors.length >= 20, `the row is not multicolored (${colors.length} color runs)`);
 	assert.equal(plain.match(/flash-next/g).length, 1, "the model name rides once");
 	// The percent drives the ramp's phase, so each sample repaints a different row.
 	const later = statusLines(run({ lane: "deepseek" }), { swap: { from: "deepseek", to: "flash-next (IQ3_S, dual)", percent: 82 } })[0];
 	assert.notEqual(later.match(/\x1b\[38;2;\d+;\d+;\d+m/)[0], raw.match(/\x1b\[38;2;\d+;\d+;\d+m/)[0], "the ramp phase moves with the percent");
+});
+
+test("the switch icon rides between the label and the verb: the default is a private-use codepoint", () => {
+	const plain = statusLines(run({ lane: "deepseek" }), { swap: { from: "deepseek", to: "flash-next", percent: 12 } })[0].replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+	assert.equal(switchGlyph(), "\u{F051F}", "the default is the single private-use codepoint U+F051F");
+	assert.ok(plain.includes("\u{F051F} switching"), `no switch icon before the verb: ${plain}`);
+	assert.ok(plain.startsWith(`${orchGlyph()} `), `the steady row glyph and its space still lead: ${plain}`);
+});
+
+test("an empty FADE_ORCHESTRATE_SWITCH_GLYPH drops the icon, leaving ONE space after \"Orchestrator:\"", () => {
+	withGlyph("", () => withSwitchGlyph("", () => {
+		const plain = statusLines(run({ lane: "deepseek" }), { swap: { from: "deepseek", to: "flash-next", percent: 12 } })[0].replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+		assert.ok(plain.includes("Orchestrator: switching"), `not a single space after the label: ${plain}`);
+		const privateUse = [...plain].filter((c) => c.codePointAt(0) > 0xe000);
+		assert.deepEqual(privateUse, [], `a private-use codepoint survived: ${JSON.stringify(privateUse)}`);
+	}));
 });
 
 // ---- the widget keys ----
