@@ -222,8 +222,10 @@ export interface SwapWatchHandle {
 	cancel(): void;
 	/** Await the swap completing (bounded), compute first/steady rates, append the history row.
 	 *  `runId` stamps the row with the run that paid it, so the per-run cost is answerable from
-	 *  the ledger; a watch that names no run writes an unattributed row, never a guessed owner. */
-	finish(from: string, to: string, elapsed_s: number, dir: string, runId?: string): Promise<SwapRow | undefined>;
+	 *  the ledger; a watch that names no run writes an unattributed row, never a guessed owner.
+	 *  `taskClass` stamps the row with the CLASS of work the swap paid for (taskmoe.ts); a watch
+	 *  that names none writes a row no class claims — the census reads that as an unjudged swap. */
+	finish(from: string, to: string, elapsed_s: number, dir: string, runId?: string, taskClass?: string): Promise<SwapRow | undefined>;
 }
 
 /**
@@ -260,7 +262,7 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 		cancel() {
 			stopped = true;
 		},
-		async finish(from, toLane, elapsed_s, dir, runId?) {
+		async finish(from, toLane, elapsed_s, dir, runId?, taskClass?) {
 			stopped = true;
 			if (!sawSwap && from === toLane) return undefined;
 			const m = await fetchJson<Record<string, any>>(`${ROUTER}/metrics`);
@@ -296,6 +298,7 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 				percent_path: percentPath.slice(0, 60),
 				...(moe ? { moe } : {}),
 				...(runId ? { run_id: runId } : {}),
+				...(taskClass ? { task_class: taskClass } : {}),
 				at: new Date().toISOString(),
 			};
 			await appendSwap(dir, row);

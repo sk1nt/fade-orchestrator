@@ -51,6 +51,10 @@ export interface SwapRow {
 	 *  `summarizeSwaps` never charges such a row to the run asking — the panel's `swaps this run`
 	 *  row names that gap instead of reading another run's cost as this run's. */
 	run_id?: string;
+	/** The class of the work this swap was PAID for (taskmoe.ts): the per-class warm-start record,
+	 *  so "did the CI work come in warm?" is answerable from the ledger. A row from a watcher that
+	 *  named no class has none, and `classWarmth` charges such a row to no class. */
+	task_class?: string;
 }
 
 /**
@@ -74,7 +78,6 @@ export async function appendSwap(dir: string, row: SwapRow): Promise<void> {
  * The badge class for a first-completion rate. A restored placement map wins: that start was
  * warm by construction, whatever the first rate happens to read.
  */
-
 export function rampClass(decodeTps: number | undefined, mapRestored: boolean, threshold = HOT_STEADY_TPS): "cold_ramp" | "hot_steady" | "map_restored" {
 	if (mapRestored) return "map_restored";
 	return decodeTps !== undefined && decodeTps >= threshold ? "hot_steady" : "cold_ramp";

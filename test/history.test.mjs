@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { appendSwap, appendTurn, readSwaps, readTurns, summarizeSwaps } from "../.test-build/history.mjs";
 
 /** A swap row in the shape the watcher writes: the measured 0.4.0 ramp rates. */
-const swapRow = (elapsed_s, run_id) => ({
+const swapRow = (elapsed_s, run_id, task_class) => ({
 	from: "flash-next",
 	to: "deepseek",
 	elapsed_s,
@@ -26,6 +26,7 @@ const swapRow = (elapsed_s, run_id) => ({
 	percent_path: [12, 61, 96],
 	at: "2030-01-01T12:10:00.000Z",
 	...(run_id ? { run_id } : {}),
+	...(task_class ? { task_class } : {}),
 });
 
 /** A turn record the router could have reported: pp and tg both present. */
@@ -133,6 +134,22 @@ test("a swap row written through appendSwap is read back with its run_id", async
 		assert.equal(rows.length, 1);
 		assert.equal(rows[0].run_id, "run-a", "the attribution survives the durable write, not just the return value");
 		assert.equal(summarizeSwaps(rows, "run-a").count, 1, "the ledger read is what the status line prices");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a swap row's task_class survives the ledger, and the per-run bill is unchanged by it", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "fade-swaps-class-"));
+	try {
+		await appendSwap(dir, swapRow(14.2, "run-a", "ci"));
+		await appendSwap(dir, swapRow(3.1, "run-a"));
+		const rows = await readSwaps(dir);
+		assert.equal(rows.find((r) => r.elapsed_s === 14.2).task_class, "ci", "the class rides the durable row, not just the argument");
+		assert.equal(rows.find((r) => r.elapsed_s === 3.1).task_class, undefined, "a row written without one stays unclassified");
+		assert.equal(rows[0].elapsed_s, 3.1, "the ledger stays newest-first, which is what the per-class census reads the profile off");
+		const price = summarizeSwaps(rows, "run-a");
+		assert.deepEqual([price.count, price.total_elapsed_s], [2, 17.3], "the class is a label on the row, not a second ledger: both rows still price the run");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

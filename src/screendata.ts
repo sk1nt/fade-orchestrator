@@ -16,6 +16,7 @@ import type { InstanceLock } from "./core.ts";
 import { readTurns, readSwaps, summarizeSwaps, type SwapRow, type TurnRecord } from "./history.ts";
 import { fetchMetrics, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
 import { moeBalanceRows, moeRows } from "./moe.ts";
+import { classWarmth } from "./taskmoe.ts";
 import { ROUTER } from "./router.ts";
 import { modelLabel, type FlipBadge, type TierRow } from "./ui.ts";
 
@@ -56,6 +57,9 @@ export interface ScreenData {
 	tiers: TierRow[];
 	/** The MoE placement state per lane (warm start vs relearn). */
 	moe: MetricRow[];
+	/** The per-class warm-start record (`taskmoe.ts`): how often each class of work landed on a
+	 *  lane that started from the placement the engine saved. */
+	classes: MetricRow[];
 	turns: TurnRecord[];
 	swaps: SwapRow[];
 	context?: ScreenContext;
@@ -253,6 +257,15 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 			healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {},
 		}),
 	];
+	// The per-class record: the swaps stamped with a class, and how many of them landed on a lane
+	// whose saved placement was live AND written by the RUNNING engine. A class the ledger never
+	// ran is named as unrun — a share of an empty set is not a measurement, and a class that ran
+	// cold every time reads warn, because that is the actionable reading.
+	const classes: MetricRow[] = classWarmth(swaps).map((c) => ({
+		label: `MoE class ${c.cls}`,
+		value: c.swaps === 0 ? "no swap ran this class" : `${c.warm}/${c.swaps} warm · ${c.profile ?? "profile not named"}`,
+		...(c.swaps === 0 ? { tone: "dim" as const } : c.warm === 0 ? { tone: "warn" as const } : { tone: "ok" as const }),
+	}));
 	const tiers = [...nameResidentRow(tiersFromMetrics(metrics), metrics, src.names), claimRow(src)];
 	const missing: string[] = [];
 	if (!metrics) missing.push(`router ${ROUTER} unreachable — engine, decode and queue are not measured`);
@@ -287,6 +300,7 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 		lanes: laneRows(src, metrics),
 		tiers,
 		moe,
+		classes,
 		turns,
 		swaps,
 		context,

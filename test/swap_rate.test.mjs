@@ -69,18 +69,21 @@ test("the row the watcher writes is the row the panel reads", async () => {
 	s.close();
 });
 
-test("the run that paid the swap rides on the row, and its absence is an absence", async () => {
+test("the run that paid the swap and the class of work it paid for ride on the row, and their absence is an absence", async () => {
 	const s = await stub([MEASURED_ROW]);
 	process.env.FADE_ORCHESTRATE_ROUTER = s.url;
 	const { startSwapWatch } = await import(`../.test-build/livedata.mjs?runid=${encodeURIComponent(s.url)}`);
 	const dir = mkdtempSync(join(tmpdir(), "fade-swaprate3-"));
-	const paid = await startSwapWatch("deepseek").finish("flash-next", "deepseek", 12.5, dir, "20261116T070757Z-x5m9");
+	const paid = await startSwapWatch("deepseek").finish("flash-next", "deepseek", 12.5, dir, "20261116T070757Z-x5m9", "ci");
 	const unattributed = await startSwapWatch("deepseek").finish("flash-next", "deepseek", 3.2, dir);
 	const ledger = JSON.parse(readFileSync(join(dir, "swap_history.json"), "utf8"));
 	assert.equal(paid.run_id, "20261116T070757Z-x5m9", "the caller names the run, the row carries it");
 	assert.equal(unattributed.run_id, undefined, "a watch that names no run writes an unattributed row, never a guessed owner");
 	assert.equal(ledger.rows.find((r) => r.elapsed_s === 12.5).run_id, "20261116T070757Z-x5m9", "the stamp survives the durable write, so the per-run cost is answerable from the file");
 	assert.equal(ledger.rows.find((r) => r.elapsed_s === 3.2).run_id, undefined, "and the unstamped row stays unattributed on disk");
+	assert.equal(paid.task_class, "ci", "the class of the window the swap opened rides on the row the caller gets back");
+	assert.equal(ledger.rows.find((r) => r.elapsed_s === 12.5).task_class, "ci", "and it survives the durable write, so the per-class census is answerable from the file");
+	assert.equal(ledger.rows.find((r) => r.elapsed_s === 3.2).task_class, undefined, "a watch that names no class leaves the row unclassified, never guessed");
 	rmSync(dir, { recursive: true, force: true });
 	s.close();
 });

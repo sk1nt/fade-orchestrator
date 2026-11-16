@@ -184,7 +184,7 @@ function phaseBlock(d: ScreenData, theme: PanelTheme | undefined, width: number)
 
 /** The metrics column: what the loop is paying, measured by the engine itself. */
 function metricBlock(d: ScreenData, theme: PanelTheme | undefined, width: number): string[] {
-	const rows: MetricRow[] = [...d.tiers, ...d.moe];
+	const rows: MetricRow[] = [...d.tiers, ...d.moe, ...(d.classes ?? [])];
 	if (d.context) rows.push({ label: "context", value: `${compactNumber(d.context.tokens)} / ${compactNumber(d.context.window)} (${d.context.percent.toFixed(1)}%)` });
 	rows.push(...gateRows(d.gate));
 	rows.push(...turnRows(d.turns));

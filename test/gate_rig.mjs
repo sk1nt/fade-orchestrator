@@ -1025,6 +1025,41 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await commands.orchestrate.handler("stop --clear", ctx);
   ok("`stop` releases the claim, so the next session is not refused", !existsSync(claimFile), claimFile);
 }
+
+// 17. `/orchestrate moe`: the per-class warm-start census, the card split and the build line, over
+//     a ledger the rig injects — and it pays ZERO `POST /v1/load`, because a read-only verb must
+//     never touch the router's load path. The screen bills the same census.
+{
+  writeState(seedState("coding", []));
+  await hooks.session_start({}, ctx);
+  writeFileSync(
+    join(repo, "var", "omp-orchestrate", "swap_history.json"),
+    JSON.stringify({
+      key: "fade.omp_orchestrate.swaps.v1",
+      rows: [
+        { from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 31, steady_tg: 480, percent_path: [], at: "2030-01-01T12:10:00.000Z", run_id: "GATE1", task_class: "ci", moe: { lane: "flash-next", state: "live", profile_path: "/var/basalt-profiles/flash-next.prof", profile_exists: true, written_by_running_engine: true } },
+        { from: "flash-next", to: "deepseek", elapsed_s: 22.0, first_tg: 91, steady_tg: 130, percent_path: [], at: "2030-01-01T12:40:00.000Z", run_id: "GATE1", task_class: "code", moe: { lane: "deepseek", state: "unsupported", profile_exists: false } },
+      ],
+    }),
+  );
+  const loadsBefore = reqLog.filter((r) => r.startsWith("POST /v1/load")).length;
+  notes.length = 0;
+  await commands.orchestrate.handler("moe", ctx);
+  const moeNote = notes.join("\n");
+  ok("/orchestrate moe bills the CI class by the warm start it measured", hasRow(moeNote, "ci: 1 swaps · 1/1 warm · profile /var/basalt-profiles/flash-next.prof"), moeNote.slice(0, 700));
+  ok("/orchestrate moe counts the verifier pack's swap as not warm", hasRow(moeNote, "code: 1 swaps · 0/1 warm · profile none named"), moeNote.slice(0, 700));
+  ok("/orchestrate moe prints a class the ledger never ran, at 0 swaps", hasRow(moeNote, "tests: 0 swaps · 0/0 warm"), moeNote.slice(0, 700));
+  ok("/orchestrate moe names the card split for both lanes", hasRow(moeNote, "MoE balance flash-next") && hasRow(moeNote, "MoE balance deepseek"), moeNote.slice(0, 700));
+  ok("/orchestrate moe names the engine version the router reports", hasRow(moeNote, "engine 0.4.0 · ext"), moeNote.slice(0, 700));
+  ok("/orchestrate moe names a bundle it cannot read rather than inventing a hash", /bundle (not built|[0-9a-f]{8})/.test(moeNote), moeNote.slice(0, 700));
+  ok("/orchestrate moe pays ZERO lane load", reqLog.filter((r) => r.startsWith("POST /v1/load")).length === loadsBefore, reqLog.filter((r) => r.startsWith("POST /v1/load")).join(","));
+  inputHandlers[0]("\x1bf");
+  await new Promise((r) => setTimeout(r, 300));
+  const panel17 = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
+  const moeRows17 = panel17.split("\n").filter((l) => /MoE/.test(l)).join("\n");
+  ok("the screen bills the CI class's warm start", hasRow(panel17, "MoE class ci 1/1 warm"), moeRows17.slice(0, 600));
+  ok("the screen names a class the ledger never ran, never a green zero", hasRow(panel17, "MoE class tests no swap ran this class"), moeRows17.slice(0, 600));
+}
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));
 if (failed.length > 0) {

@@ -179,7 +179,7 @@ listener sees the byte gets a login clause: once per process, on the run's own l
 never prints a key that opens nothing.
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run. It claims the router first (one orchestrator per router: the router carries one resident lane, one live-turn ledger and one flip guard, so two runs on one router would each gate the other's working tree). A claim held by a live pid refuses, naming the pid, run, repo and host; a claim whose owner died is reclaimed. Then it preflights the router: the think lane must load.
-- `/orchestrate status | overlay | runs | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]` — `status` ends with the swap cost this run paid (`swaps 3 · 41.2s paid`, or `0 swaps`); `runs` prints the archived finished runs, newest first
+- `/orchestrate status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]` — `status` ends with the swap cost this run paid (`swaps 3 · 41.2s paid`, or `0 swaps`); `runs` prints the archived finished runs, newest first; `moe` prints the per-class record (`ci: 3 swaps · 2/3 warm · profile /var/basalt-profiles/flash-next.prof`), the `gpu` split for both lanes, and the build line (`engine 0.4.0 · ext 0.1.0 · bundle 1a2b3c4d`, every missing piece named)
 - `/orchestrate handover` — send the condensed digest now (any time, mid-run).
 - `/lanes` — live router census (both entries' status + `/health`).
 
@@ -202,6 +202,8 @@ a postmortem file, not a panel row.
 The engine can persist the expert placement it derives at runtime and re-apply it on the next start.
 The measured difference is a 91 tok/s cold ramp (experts promoted during the first ~1,200 tokens)
 against a warm start. `moe.ts` reads it per lane and records it on every swap row.
+
+**The per-class record.** One pack carries one placement profile, so the actionable question is which CLASS of work lands on which lane, and whether that lane came in warm. `taskmoe.ts` classifies each task from the plan's own words (`ci` / `tests` / `docs` / `code`, priority in that order), the swap row carries the class of the window it opened (`task_class`), and `/orchestrate moe` prints the census: swaps per class, how many landed on a lane whose saved placement was live AND written by the running engine, the profile path, the card split, and the build line. CI work runs on the code lane — the only save-capable alias — so its warm share is the number that answers "will the CI job start on hot experts?" The verifier pack has no save path in this engine release, so its class can never read warm: named, not counted as a failure.
 
 Measured engine facts (`docs/configuration/index.md` of basalt 0.4.0):
 

@@ -16,6 +16,8 @@
  *                                      (keys s/v/r/p/c/h act on the selected task; esc closes)
  *   /lanes                             live router census: both entries + health
  */
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
@@ -45,15 +47,17 @@ import {
 	gitCaveat,
 	isGitRepo,
 } from "./core.ts";
+import { roundWindow } from "./core.ts";
 import { chordBytes, keyLabel, modelLabel, ORCH_STATUS_KEY, OVERLAY_WIDGET_KEY, statusLines, TOP_WIDGET_KEY, type FlipBadge, type SwapPill } from "./ui.ts";
 import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keymap.ts";
 import { appendTurn, readSwaps, summarizeSwaps, turnRecordOrNull } from "./history.ts";
 import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, startSwapWatch, type MetricsSnapshot } from "./livedata.ts";
 import { handoverText } from "./core.ts";
-import { engineProofInvalidate, laneMoe } from "./moe.ts";
+import { engineProofInvalidate, laneMoe, moeBalanceRows } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
 import { collectScreen, formatElapsed, type ScreenData } from "./screendata.ts";
 import { RUNS_DIRNAME, archiveRun, listRuns } from "./runs.ts";
+import { classOf, classWarmth, versionLine } from "./taskmoe.ts";
 
 // The panel key. The default is `alt+f`, not `ctrl+o`: the host binds `ctrl+o` to
 // `app.tools.expand` and ACTS on its own bindings, so the screen cannot live there. The host's
@@ -566,7 +570,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		}
 		if (from && runDir && from !== lane) {
 			turnSwapMs += Math.round(loaded.elapsed_s * 1000);
-			void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id).then(() => paint(ctx));
+			void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
 		}
 		if (run) run.lane = lane;
 		await persist();
@@ -619,6 +623,45 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				...(process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}),
 			});
 		};
+	};
+
+	/** The extension's own version, read when the verb asks. An installed extension file has no
+	 *  package.json above it, and `versionLine` names that gap instead of printing a zero. */
+	const packageVersion = async (): Promise<string | undefined> => {
+		const here = dirname(fileURLToPath(import.meta.url));
+		for (const p of [join(here, "..", "package.json"), join(here, "package.json")]) {
+			try {
+				const raw: unknown = JSON.parse(await readFile(p, "utf8"));
+				if (raw && typeof raw === "object" && "version" in raw && typeof raw.version === "string" && raw.version !== "") return raw.version;
+			} catch {
+				// Not this layout: try the next candidate.
+			}
+		}
+		return undefined;
+	};
+
+	/** The bundle's fingerprint: sha256 over the built `dist/index.js`, the file CI proves equals a
+	 *  fresh build of `src/`. A tree that never built has none, and the version line says so. */
+	const bundleHash = async (): Promise<string | undefined> => {
+		const here = dirname(fileURLToPath(import.meta.url));
+		for (const p of [join(here, "index.js"), join(here, "..", "dist", "index.js")]) {
+			try {
+				return createHash("sha256").update(await readFile(p)).digest("hex");
+			} catch {
+				// Not this layout.
+			}
+		}
+		return undefined;
+	};
+
+	/** The class of the window a swap OPENS (taskmoe.ts): the first READY task's class — the work
+	 *  the lane is loaded to start on — falling back to the first open task, then the plan's first.
+	 *  A run with no tasks has no class, and the row is left unjudged rather than guessed. */
+	const windowClass = (r: RunState | undefined): string | undefined => {
+		if (!r) return undefined;
+		const w = roundWindow(r);
+		const t = w.readyNow[0] ?? w.open[0] ?? (r.tasks ?? [])[0];
+		return t ? classOf(t) : undefined;
 	};
 
 	/** A panel key is a loop control: the same directives `/orchestrate` answers, on the SELECTED task. */
@@ -1078,7 +1121,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
 			// `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
 			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
@@ -1134,6 +1177,26 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					ctx.ui.notify(`run ${r.run_id}: ${r.state} · ${r.rounds} rounds · ${r.tasks_passed}/${r.tasks_total} tasks · ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
 				}
 				if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join(dir, RUNS_DIRNAME)}`, "info");
+				return;
+			}
+			if (first === "moe") {
+				// The per-class MoE record (taskmoe.ts): which class of work the swaps were paid
+				// for, how often that lane came in WARM from the placement the engine saved, which
+				// cards carry the expert tier, and what build this is. Read-only — no lane load, no
+				// state write, and every missing measurement is named in its own words.
+				const dir = runDir ?? join(ctx.cwd, "var", "omp-orchestrate");
+				for (const c of classWarmth(await readSwaps(dir))) {
+					ctx.ui.notify(`orchestrate: ${c.cls}: ${c.swaps} swaps · ${c.warm}/${c.swaps} warm · profile ${c.profile ?? "none named"}`, "info");
+				}
+				const snap = (await fetchMetrics()) ?? metrics;
+				if (snap) metrics = snap;
+				for (const r of moeBalanceRows([THINK_LANE, CODE_LANE], {
+					...(process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}),
+					healthByLane: snap?.loaded ? { [snap.loaded]: { spill_experts: snap.spill_experts, spill_total: snap.spill_total, spill_bytes_gb: snap.spill_bytes_gb, slots: snap.slots } } : {},
+				})) {
+					ctx.ui.notify(`orchestrate: ${r.label} · ${r.value}`, "info");
+				}
+				ctx.ui.notify(`orchestrate: ${versionLine(snap?.engine_version, await packageVersion(), await bundleHash())}`, "info");
 				return;
 			}
 			if (first === "overlay") {
