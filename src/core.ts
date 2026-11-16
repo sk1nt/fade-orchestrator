@@ -6,11 +6,27 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { msg } from "./router.ts";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * One `git` call, OFF the TUI's loop. Every git reader in this file used `execFileSync`, which
+ * holds the host's paint loop for the spawn: a repo the size of this one costs 20-60 ms per
+ * `status`, and the synthesizer fired four of them back to back at a turn boundary. The bounds
+ * are the sync form's (`timeout` 5 s, 1 MiB) so a hung git cannot park a lane load.
+ */
+export async function execGitAsync(repo: string, args: string[], opts: { timeout?: number; maxBuffer?: number } = {}): Promise<string> {
+	const { stdout } = await execFileAsync("git", ["-C", repo, ...args], {
+		timeout: opts.timeout ?? 5_000,
+		maxBuffer: opts.maxBuffer ?? 1 << 20,
+		encoding: "utf8",
+	});
+	return `${stdout}`;
+}
 
 export const STATE_KEY = "fade.omp_orchestrate.v1";
 export const ACTIVE_FILENAME = "ACTIVE.json";
@@ -101,14 +117,24 @@ export function classifyTurnEnd(run: RunState, hadPhase: boolean): TurnEnd {
  * and answers with its ~60-line usage page, which then rides into the briefing as the
  * `Working tree:` line. One quiet `rev-parse --git-dir` answers for every git call the run makes,
  * so the degraded state is named in one line.
+ *
+ * ASYNC, and the answer is CACHED per repo for `FADE_ORCHESTRATE_REPO_PROBE_TTL_MS` (default
+ * 15 s): the run's root does not move, and ONE phase asks this question from the caveat, the
+ * handover, the diff stat, the synthesizer and every checkpoint tag — ten spawns per phase all
+ * answering the same fact, each one on the TUI's loop. The cache is a TTL, not a permanent memo,
+ * so a root that gets `git init`ed mid-run is noticed; `0` re-probes every call.
  */
-export function isGitRepo(repo: string): boolean {
-	try {
-		execFileSync("git", ["-C", repo, "rev-parse", "--git-dir"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8", stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
+let repoProbe: { repo: string; at: number; answer: Promise<boolean> } | undefined;
+
+export function isGitRepo(repo: string): Promise<boolean> {
+	const ttl = Number(process.env.FADE_ORCHESTRATE_REPO_PROBE_TTL_MS ?? 15_000);
+	if (repoProbe && repoProbe.repo === repo && (ttl <= 0 || Date.now() - repoProbe.at < ttl)) return repoProbe.answer;
+	const answer = execGitAsync(repo, ["rev-parse", "--git-dir"]).then(
+		() => true,
+		() => false,
+	);
+	repoProbe = { repo, at: Date.now(), answer };
+	return answer;
 }
 
 /** The one sentinel every git reader emits on a non-repo run root. */
@@ -116,11 +142,11 @@ export const notARepo = (repo: string): string =>
 	`(not a git repo: ${repo} — no git evidence; start the run inside a working tree, or run \`git init\` in it)`;
 
 /** `git status --porcelain` verbatim (capped): the synthesizer's evidence base. */
-export function porcelain(repo: string): string {
-	if (!isGitRepo(repo)) return notARepo(repo);
+export async function porcelain(repo: string): Promise<string> {
+	if (!(await isGitRepo(repo))) return notARepo(repo);
 	try {
-		const out = execFileSync("git", ["-C", repo, "status", "--porcelain"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
-		const head = `${out}`.replace(/\n+$/, "").split("\n").slice(0, 200).join("\n");
+		const out = await execGitAsync(repo, ["status", "--porcelain"]);
+		const head = out.replace(/\n+$/, "").split("\n").slice(0, 200).join("\n");
 		return head || "(working tree clean)";
 	} catch (e) {
 		return `(git status failed: ${msg(e)} in ${repo})`;
@@ -356,21 +382,21 @@ export function refreshChecks(run: RunState, live: RunState | undefined): { chan
  * keyed by `run_id`, never for a path that is not a git working tree, and announced, never
  * silent. The refusal is returned so the caller can name the reason out loud.
  */
-export function refreshRoot(run: RunState, live: RunState | undefined, probe: (repo: string) => boolean = isGitRepo): { changed: boolean; from: string; to: string; refused?: string } {
+export async function refreshRoot(run: RunState, live: RunState | undefined, probe: (repo: string) => boolean | Promise<boolean> = isGitRepo): Promise<{ changed: boolean; from: string; to: string; refused?: string }> {
 	if (!live || live.run_id !== run.run_id || typeof live.repo !== "string" || live.repo === "") return { changed: false, from: run.repo, to: run.repo };
 	if (live.repo === run.repo) return { changed: false, from: run.repo, to: run.repo };
-	if (!probe(live.repo)) return { changed: false, from: run.repo, to: run.repo, refused: `${live.repo} is not a git working tree` };
+	if (!(await probe(live.repo))) return { changed: false, from: run.repo, to: run.repo, refused: `${live.repo} is not a git working tree` };
 	const from = run.repo;
 	run.repo = live.repo;
 	return { changed: true, from, to: live.repo };
 }
 
 /** `git diff --stat` tail: the volatile "what changed since" line a fresh lane needs. */
-export function diffStat(repo: string): string {
-	if (!isGitRepo(repo)) return notARepo(repo);
+export async function diffStat(repo: string): Promise<string> {
+	if (!(await isGitRepo(repo))) return notARepo(repo);
 	try {
-		const out = execFileSync("git", ["-C", repo, "diff", "--stat"], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
-		const tail = `${out}`.trim().split("\n").slice(-6).join("\n");
+		const out = await execGitAsync(repo, ["diff", "--stat"]);
+		const tail = out.trim().split("\n").slice(-6).join("\n");
 		return tail || "(working tree clean)";
 	} catch (e) {
 		return `(git diff failed: ${msg(e)} in ${repo})`;
@@ -433,11 +459,14 @@ export interface SynthesizedDone {
  * pre-swap gate exit codes — never from a model's word. A task whose declared files are absent
  * from the porcelain output is `blocked`, naming the evidence that is missing; nothing here
  * ever claims a result no source supports.
+ *
+ * ASYNC: the four git calls this used to fire (`rev-parse` twice, `status`, `diff`) ran back to
+ * back through `execFileSync` at a turn boundary, on the TUI's own loop. ONE cached repo probe
+ * feeds both readers, and the two readers run together.
  */
-export function synthesizeCodingDone(run: RunState, repo: string): SynthesizedDone {
-	const raw = porcelain(repo);
+export async function synthesizeCodingDone(run: RunState, repo: string): Promise<SynthesizedDone> {
+	const [raw, stat] = await Promise.all([porcelain(repo), diffStat(repo)]);
 	const entries = porcelainEntries(raw);
-	const stat = diffStat(repo);
 	const gate = gateSummary(run);
 	const tasks = run.tasks.length > 0 ? run.tasks : run.repair_tasks;
 	const done = tasks.map((t) => {
@@ -462,12 +491,15 @@ export function checkpointName(run: RunState, taskId: string): string {
  * names the HEAD the task was accepted against; `git checkout -f <tag> -- .` plus `git clean
  * -fd` against the pair restores the tree exactly. Re-tagging a re-passed task moves the tag
  * forward (`-f`) instead of failing the phase.
+ *
+ * ASYNC, and the repo probe is the CACHED one: a phase that passes twelve tasks used to pay
+ * twenty-four sync spawns (probe + tag, per task) on the tool's own return path.
  */
-export function tagCheckpoint(repo: string, run: RunState, taskId: string): { tag: string; ok: boolean; error?: string } {
+export async function tagCheckpoint(repo: string, run: RunState, taskId: string): Promise<{ tag: string; ok: boolean; error?: string }> {
 	const tag = checkpointName(run, taskId);
-	if (!isGitRepo(repo)) return { tag, ok: false, error: `not a git repo: ${repo} — no checkpoint tag is possible` };
+	if (!(await isGitRepo(repo))) return { tag, ok: false, error: `not a git repo: ${repo} — no checkpoint tag is possible` };
 	try {
-		execFileSync("git", ["-C", repo, "tag", "-f", tag], { timeout: 5_000, maxBuffer: 1 << 20, encoding: "utf8" });
+		await execGitAsync(repo, ["tag", "-f", tag]);
 		if (typeof run.checkpoints !== "object" || run.checkpoints === null) run.checkpoints = {};
 		run.checkpoints[taskId] = tag;
 		return { tag, ok: true };
@@ -501,7 +533,7 @@ export function critiquesFor(run: RunState, ids: string[]): string[] {
  * changes near the end keeps the cache warm — the same discipline a new lane gets for free when
  * it starts from this digest instead of replaying the transcript.
  */
-export function handover(run: RunState): { stable: string[]; volatile: string[] } {
+export async function handover(run: RunState): Promise<{ stable: string[]; volatile: string[] }> {
 	const stable = [
 		`Resume of orchestrated run ${run.run_id} (${run.state}, round ${run.round}/${run.max_rounds}).`,
 		`Goal: ${run.goal}`,
@@ -524,14 +556,14 @@ export function handover(run: RunState): { stable: string[]; volatile: string[] 
 					)}`,
 				]
 			: []),
-		`Working tree: ${diffStat(run.repo)}`,
+		`Working tree: ${await diffStat(run.repo)}`,
 	];
 	return { stable, volatile };
 }
 
 /** Condensed handover as one message: what /orchestrate handover sends and a resume opens with. */
-export function handoverText(run: RunState): string {
-	const h = handover(run);
+export async function handoverText(run: RunState): Promise<string> {
+	const h = await handover(run);
 	return [
 		...h.stable,
 		"",
@@ -601,12 +633,86 @@ export interface RunState {
 	checkpoints?: Record<string, string>;
 }
 
-export function readJson<T>(path: string): T | undefined {
+/** Parse a state/ledger record: anything unparsable is `undefined`, never a throw, never a zero. */
+export function parseJson<T>(text: string): T | undefined {
 	try {
-		return JSON.parse(readFileSync(path, "utf8")) as T;
+		return JSON.parse(text) as T;
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * The async read of the same file. `state.json` is read on EVERY tool call (the verifier
+ * sandbox) and the swap ledger on every panel tick, where `readFileSync` is a stall of the
+ * host's paint loop the operator can see.
+ */
+export async function readJsonAsync<T>(path: string): Promise<T | undefined> {
+	try {
+		return parseJson<T>(await readFile(path, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Durable write: temp + fdatasync + rename + directory sync — the SAME ordering as `writeJson`,
+ * with only the BLOCKING removed: every step is `fs.promises`, so the host paints and takes
+ * keystrokes while the record travels to the disk. `handle.sync()` is `fdatasync`: the record's
+ * bytes and its length are on the platter before the rename publishes them. Directory sync is
+ * best-effort (platforms that refuse an `r` fd on a directory must not fail the phase).
+ */
+export async function writeJsonAsync(path: string, value: unknown): Promise<void> {
+	const dir = join(path, "..");
+	await mkdir(dir, { recursive: true });
+	const tmp = `${path}.tmp`;
+	const h = await open(tmp, "w");
+	try {
+		await h.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+		await h.sync();
+	} finally {
+		await h.close();
+	}
+	await rename(tmp, path);
+	try {
+		const d = await open(dir, "r");
+		try {
+			await d.sync();
+		} finally {
+			await d.close();
+		}
+	} catch {
+		/* the rename is already atomic; the directory flush is the durability we can add, not the record */
+	}
+}
+
+/** One path's coalescing slot: the chain of writes in flight, and the payload that replaces them. */
+const coalesced = new Map<string, { tail: Promise<void>; pending: { value: unknown } | undefined }>();
+
+/**
+ * A durable write that COALESCES per path: ONE write in flight, and a newer payload REPLACES the
+ * pending one. A phase boundary persists three times (the phase, the rejection, the lane) and
+ * with this pays ONE write — the LAST payload. The ordering inside each write is
+ * `writeJsonAsync`'s, so a `kill -9` still leaves a whole record, never a half one. Two rapid
+ * calls share the slot's promise: that identity is what "one write" means, and what the test
+ * reads.
+ */
+export function coalesceWrite(path: string, value: unknown): Promise<void> {
+	const slot = coalesced.get(path) ?? { tail: Promise.resolve(), pending: undefined };
+	coalesced.set(path, slot);
+	const queued = slot.pending !== undefined;
+	slot.pending = { value };
+	if (queued) return slot.tail;
+	const drain = async (): Promise<void> => {
+		while (slot.pending) {
+			const v = slot.pending.value;
+			slot.pending = undefined;
+			await writeJsonAsync(path, v);
+		}
+		if (coalesced.get(path) === slot) coalesced.delete(path);
+	};
+	slot.tail = slot.tail.then(drain, drain);
+	return slot.tail;
 }
 
 /**
@@ -615,6 +721,10 @@ export function readJson<T>(path: string): T | undefined {
  * sees a half-written record, and the rename itself survives the crash because the directory
  * entry is flushed after it. Directory fsync is best-effort (platforms that refuse an `r` fd on
  * a directory must not fail the phase).
+ *
+ * The SYNC form is the last resort, kept for the ONE site that must be durable before it
+ * returns: `/orchestrate stop`, after which the operator may close the session in the same
+ * keystroke. Every hot path uses `writeJsonAsync`/`coalesceWrite`.
  */
 export function writeJson(path: string, value: unknown): void {
 	const dir = join(path, "..");
