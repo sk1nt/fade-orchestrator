@@ -320,17 +320,31 @@ export async function runGate(checks: [string, string][], cwd: string, onCheck?:
  * repaired strings forever. Refresh the run's checks from the on-disk state, keyed by `run_id`
  * so a state file belonging to another run is never adopted, and report the delta so the
  * refresh is visible, never silent.
+ *
+ * The comparison is over the WHOLE pair. A row is `["<command>", "<accepted state>"]`, and the
+ * accepted state is judged from the SECOND element: `expectation()` reads its head words
+ * ("fails:", "exits 1", "no output:") to decide whether a non-zero exit is the pass. Re-declaring
+ * a row's expected state — the repair a red row needs when the command is right and the declared
+ * state was written in prose — changes no command, so a command-keyed refresh reports
+ * `changed: false` and keeps judging the stale state forever.
  */
-export function refreshChecks(run: RunState, live: RunState | undefined): { changed: boolean; to: number; added: string[]; removed: string[] } {
-	const before = run.checks.map((c) => c[0]);
-	if (!live || live.run_id !== run.run_id || !Array.isArray(live.checks)) return { changed: false, to: before.length, added: [], removed: [] };
+export function refreshChecks(run: RunState, live: RunState | undefined): { changed: boolean; to: number; added: string[]; removed: string[]; redrafted: number } {
+	const before = run.checks;
+	const none = { changed: false, to: before.length, added: [] as string[], removed: [] as string[], redrafted: 0 };
+	if (!live || live.run_id !== run.run_id || !Array.isArray(live.checks)) return none;
 	const isPair = (c: unknown): c is [string, string] =>
 		Array.isArray(c) && c.length === 2 && typeof c[0] === "string" && typeof c[1] === "string";
 	const next: [string, string][] = (live.checks as unknown[]).filter(isPair);
-	const after = next.map((c) => c[0]);
-	if (JSON.stringify(before) === JSON.stringify(after)) return { changed: false, to: after.length, added: [], removed: [] };
+	if (JSON.stringify(before) === JSON.stringify(next)) return { ...none, to: next.length };
+	const redrafted = before.filter((b) => next.some((a) => a[0] === b[0] && a[1] !== b[1])).length;
 	run.checks = next;
-	return { changed: true, to: after.length, added: after.filter((c) => !before.includes(c)), removed: before.filter((c) => !after.includes(c)) };
+	return {
+		changed: true,
+		to: next.length,
+		added: next.filter((a) => !before.some((b) => b[0] === a[0])).map((a) => a[0]),
+		removed: before.filter((b) => !next.some((a) => a[0] === b[0])).map((b) => b[0]),
+		redrafted,
+	};
 }
 
 /**
