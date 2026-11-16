@@ -1,7 +1,7 @@
 // src/index.ts
 import { unlinkSync as unlinkSync2 } from "node:fs";
-import { basename, dirname, join as join5 } from "node:path";
-import { readFile as readFile2, stat } from "node:fs/promises";
+import { basename, dirname, join as join6 } from "node:path";
+import { readFile as readFile2, stat as stat3 } from "node:fs/promises";
 import { Type } from "typebox";
 
 // src/router.ts
@@ -429,7 +429,7 @@ function gateSummary(run) {
   return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}${asExp ? ` (${asExp} as expected)` : ""}: ${parts.join(" | ") || "no checks"}`;
 }
 async function synthesizeCodingDone(run, repo) {
-  const [raw, stat2] = await Promise.all([porcelain(repo), diffStat(repo)]);
+  const [raw, stat4] = await Promise.all([porcelain(repo), diffStat(repo)]);
   const entries = porcelainEntries(raw);
   const gate = gateSummary(run);
   const tasks = run.tasks.length > 0 ? run.tasks : run.repair_tasks;
@@ -442,7 +442,7 @@ async function synthesizeCodingDone(run, repo) {
     return { id: t.id, status: "passed", result: `synthesize: git status --porcelain shows ${hits.length} ${hits.length === 1 ? "entry" : "entries"} touching this task's declared files [${quoted}]` };
   });
   run.synthesized = { phase: "coding_done", round: run.round, at: (/* @__PURE__ */ new Date()).toISOString() };
-  return { done, sources: { porcelain: raw, diffStat: stat2, gate } };
+  return { done, sources: { porcelain: raw, diffStat: stat4, gate } };
 }
 function checkpointName(run, taskId) {
   return `omp-ckpt/${run.run_id}/${taskId}-passed`;
@@ -1035,7 +1035,7 @@ function actCode(run) {
 
 // src/history.ts
 import { join as join2 } from "node:path";
-import { appendFile, mkdir as mkdir2, open as open2 } from "node:fs/promises";
+import { appendFile, mkdir as mkdir2, open as open2, rename as rename2, stat } from "node:fs/promises";
 var HISTORY_FILENAME = "swap_history.json";
 var METRICS_JSONL_FILENAME = "metrics.jsonl";
 var HOT_STEADY_TPS = 120;
@@ -1054,6 +1054,11 @@ function rampClass(decodeTps, mapRestored, threshold = HOT_STEADY_TPS) {
   if (mapRestored) return "map_restored";
   return decodeTps !== void 0 && decodeTps >= threshold ? "hot_steady" : "cold_ramp";
 }
+function summarizeSwaps(rows, runId) {
+  const mine = rows.filter((r) => r.run_id === runId);
+  const total = mine.reduce((s, r) => s + (typeof r.elapsed_s === "number" ? r.elapsed_s : 0), 0);
+  return { count: mine.length, total_elapsed_s: Math.round(total * 10) / 10 };
+}
 function turnRecordOrNull(m, id) {
   if (typeof m?.pp !== "number" || typeof m?.tg !== "number") return void 0;
   return {
@@ -1070,9 +1075,32 @@ function turnRecordOrNull(m, id) {
     round_outcome: id.round_outcome
   };
 }
+var LEDGER_MAX_BYTES_DEFAULT = 8388608;
+var ledgerMaxBytes = () => {
+  const raw = process.env.FADE_ORCHESTRATE_LEDGER_MAX_BYTES;
+  if (raw === void 0 || raw === "") return LEDGER_MAX_BYTES_DEFAULT;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : LEDGER_MAX_BYTES_DEFAULT;
+};
 async function appendTurn(dir, rec) {
   await mkdir2(dir, { recursive: true });
-  await appendFile(join2(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}
+  const path = join2(dir, METRICS_JSONL_FILENAME);
+  const cap = ledgerMaxBytes();
+  if (cap > 0) {
+    let size = 0;
+    try {
+      size = (await stat(path)).size;
+    } catch {
+      size = 0;
+    }
+    if (size > cap) {
+      try {
+        await rename2(path, `${path}.1`);
+      } catch {
+      }
+    }
+  }
+  await appendFile(path, `${JSON.stringify(rec)}
 `);
 }
 var TURN_TAIL_DEFAULT = 500;
@@ -1253,7 +1281,7 @@ function startSwapWatch(to, moe, onSample) {
     cancel() {
       stopped = true;
     },
-    async finish(from, toLane, elapsed_s, dir) {
+    async finish(from, toLane, elapsed_s, dir, runId) {
       stopped = true;
       if (!sawSwap && from === toLane) return void 0;
       const m = await fetchJson(`${ROUTER}/metrics`);
@@ -1272,6 +1300,7 @@ function startSwapWatch(to, moe, onSample) {
         ramp: rampClass(first, mapRestored),
         percent_path: percentPath.slice(0, 60),
         ...moe ? { moe } : {},
+        ...runId ? { run_id: runId } : {},
         at: (/* @__PURE__ */ new Date()).toISOString()
       };
       await appendSwap(dir, row);
@@ -1362,8 +1391,8 @@ function engineProofInvalidate() {
 }
 function processStartEpoch(pid) {
   try {
-    const stat2 = readFileSync2(`/proc/${pid}/stat`, "utf8");
-    const fields = stat2.slice(stat2.lastIndexOf(")") + 2).split(" ");
+    const stat4 = readFileSync2(`/proc/${pid}/stat`, "utf8");
+    const fields = stat4.slice(stat4.lastIndexOf(")") + 2).split(" ");
     const starttime = Number(fields[19]);
     const uptime = Number(readFileSync2("/proc/uptime", "utf8").split(" ")[0]);
     if (!Number.isFinite(starttime) || !Number.isFinite(uptime)) return void 0;
@@ -1578,6 +1607,11 @@ function swapRows(swaps) {
     };
   });
 }
+function swapSummaryRow(swaps, runId) {
+  const { count, total_elapsed_s } = summarizeSwaps(swaps, runId);
+  if (count > 0) return { label: "swaps this run", value: `${count} \xB7 ${total_elapsed_s.toFixed(1)}s paid`, tone: "ok" };
+  return { label: "swaps this run", value: swaps.length === 0 ? "0 \xB7 no swaps measured" : "0 \xB7 older runs only", tone: "dim" };
+}
 function gateRows(gate) {
   if (!gate) return [{ label: "gate", value: "no gate run this round", tone: "dim" }];
   const bad = gate.results.filter((r) => !r.ok);
@@ -1781,8 +1815,9 @@ function metricBlock(d, theme, width) {
 function swapBlock(d, theme, width) {
   const rows = swapRows(d.swaps);
   const lines = [label(theme, "LANE SWAPS")];
-  if (rows.length === 0) return [...lines, "  (no swaps recorded yet)"];
-  return [...lines, ...metricLines(rows, theme, width, 22)];
+  const summary = metricLines([swapSummaryRow(d.swaps, d.run.run_id)], theme, width);
+  if (rows.length === 0) return [...lines, ...summary, "  (no swaps recorded yet)"];
+  return [...lines, ...summary, ...metricLines(rows, theme, width, 22)];
 }
 function tailBlocks(d, theme, width) {
   const lines = [];
@@ -1988,6 +2023,56 @@ async function openPanel(ctx, provider, onAction, headless = process.env.FADE_OR
   if (action && action.key !== "close" && onAction) onAction(action);
 }
 
+// src/runs.ts
+import { join as join5 } from "node:path";
+import { readdir, stat as stat2 } from "node:fs/promises";
+var RUNS_DIRNAME = "runs";
+var runsDir = (dir) => join5(dir, RUNS_DIRNAME);
+var runArchivePath = (dir, runId) => join5(runsDir(dir), `${runId}.json`);
+async function archiveRun(dir, state) {
+  if (TERMINAL[state.state] !== true) return void 0;
+  const path = runArchivePath(dir, state.run_id);
+  try {
+    await stat2(path);
+    return void 0;
+  } catch {
+  }
+  await writeJsonAsync(path, { ...state, ended_utc: (/* @__PURE__ */ new Date()).toISOString() });
+  return path;
+}
+var stampOf = (r) => {
+  const t = Date.parse(r.ended_utc ?? r.started_utc ?? "");
+  return Number.isFinite(t) ? t : 0;
+};
+async function listRuns(dir) {
+  const shelf = runsDir(dir);
+  let names;
+  try {
+    names = await readdir(shelf);
+  } catch {
+    return [];
+  }
+  const summaries = [];
+  for (const name of names.filter((n) => n.endsWith(".json"))) {
+    const rec = await readJsonAsync(join5(shelf, name));
+    if (typeof rec?.goal !== "string") continue;
+    const tasks = Array.isArray(rec.tasks) ? rec.tasks : [];
+    const runId = typeof rec.run_id === "string" ? rec.run_id : name.replace(/\.json$/, "");
+    summaries.push({
+      run_id: runId,
+      state: typeof rec.state === "string" ? rec.state : "unknown",
+      goal: rec.goal,
+      ...typeof rec.started_utc === "string" ? { started_utc: rec.started_utc } : {},
+      ...typeof rec.ended_utc === "string" ? { ended_utc: rec.ended_utc } : {},
+      rounds: typeof rec.round === "number" ? rec.round : 0,
+      tasks_total: tasks.length,
+      tasks_passed: tasks.filter((t) => t?.status === "passed").length
+    });
+  }
+  summaries.sort((a, b) => stampOf(b) - stampOf(a));
+  return summaries;
+}
+
 // src/index.ts
 var GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3e3);
 var GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 6e4);
@@ -2101,7 +2186,7 @@ function fadeOrchestrate(pi) {
       return false;
     }
   };
-  const statePath = () => runDir ? join5(runDir, STATE_FILENAME) : "<unset>";
+  const statePath = () => runDir ? join6(runDir, STATE_FILENAME) : "<unset>";
   const persist = () => run && runDir ? coalesceWrite(statePath(), run) : Promise.resolve();
   let lastWriteWarn = "";
   const warnWrite = (ctx, what) => (e) => {
@@ -2118,9 +2203,9 @@ function fadeOrchestrate(pi) {
   let liveCache;
   const liveState = async () => {
     if (!runDir) return void 0;
-    const path = join5(runDir, STATE_FILENAME);
+    const path = join6(runDir, STATE_FILENAME);
     try {
-      const s = await stat(path);
+      const s = await stat3(path);
       const key = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
       if (liveCache && liveCache.key === key) return liveCache.state;
       const state = parseJson(await readFile2(path, "utf8"));
@@ -2288,7 +2373,7 @@ function fadeOrchestrate(pi) {
     }
     if (from && runDir && from !== lane) {
       turnSwapMs += Math.round(loaded.elapsed_s * 1e3);
-      void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
+      void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id).then(() => paint(ctx));
     }
     if (run) run.lane = lane;
     await persist();
@@ -2667,7 +2752,7 @@ ${SCHEMA_HINT}` : text);
     registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
   }
   pi.registerCommand("orchestrate", {
-    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
     handler: async (args, ctx) => {
       let raw = args.trim();
       const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
@@ -2690,11 +2775,26 @@ ${SCHEMA_HINT}` : text);
         const claim2 = readInstanceLock(instanceLockDir(ROUTER));
         const started = claim2 && Number.isFinite(Date.parse(claim2.started)) ? Date.parse(claim2.started) : NaN;
         const held = Number.isFinite(started) ? ` \xB7 held ${formatElapsed(Math.max(0, (Date.now() - started) / 1e3))}` : "";
+        const cost = runDir ? summarizeSwaps(await readSwaps(runDir), run.run_id) : { count: 0, total_elapsed_s: 0 };
+        const paid = cost.count > 0 ? `swaps ${cost.count} \xB7 ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
         ctx.ui.notify(
-          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${statePath()}`,
+          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid} \xB7 ${statePath()}`,
           "info"
         );
         paint(ctx);
+        return;
+      }
+      if (first === "runs") {
+        const dir = runDir ?? join6(ctx.cwd, "var", "omp-orchestrate");
+        const archived = await listRuns(dir);
+        if (archived.length === 0) {
+          ctx.ui.notify(`orchestrate: no archived runs in ${join6(dir, RUNS_DIRNAME)}`, "info");
+          return;
+        }
+        for (const r of archived.slice(0, 5)) {
+          ctx.ui.notify(`run ${r.run_id}: ${r.state} \xB7 ${r.rounds} rounds \xB7 ${r.tasks_passed}/${r.tasks_total} tasks \xB7 ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
+        }
+        if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join6(dir, RUNS_DIRNAME)}`, "info");
         return;
       }
       if (first === "overlay") {
@@ -2764,7 +2864,7 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
         if (raw.includes("--clear")) {
           try {
-            unlinkSync2(join5(runDir, ACTIVE_FILENAME));
+            unlinkSync2(join6(runDir, ACTIVE_FILENAME));
           } catch {
           }
           run = void 0;
@@ -2823,7 +2923,12 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
         return;
       }
-      runDir = join5(repo, "var", "omp-orchestrate");
+      const previous = run;
+      runDir = join6(repo, "var", "omp-orchestrate");
+      if (previous && TERMINAL[previous.state] === true) {
+        const archived = await archiveRun(join6(previous.repo || repo, "var", "omp-orchestrate"), previous);
+        if (archived) ctx.ui.notify(`orchestrate: the finished run ${previous.run_id} is archived at ${archived}`, "info");
+      }
       run = {
         key: STATE_KEY,
         run_id: runId,
@@ -2842,7 +2947,7 @@ ${SCHEMA_HINT}` : text);
         started_utc: (/* @__PURE__ */ new Date()).toISOString()
       };
       settledNotified = false;
-      await writeJsonAsync(join5(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+      await writeJsonAsync(join6(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
       await persist();
       const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
       if (!model) {
@@ -2873,11 +2978,11 @@ ${SCHEMA_HINT}` : text);
     }
     const chordNote = resolveChord();
     const repo = ctx.cwd;
-    const active = await readJsonAsync(join5(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
-    const state = await readJsonAsync(join5(repo, "var", "omp-orchestrate", STATE_FILENAME));
+    const active = await readJsonAsync(join6(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
+    const state = await readJsonAsync(join6(repo, "var", "omp-orchestrate", STATE_FILENAME));
     let runNote;
     if (active && state) {
-      runDir = join5(repo, "var", "omp-orchestrate");
+      runDir = join6(repo, "var", "omp-orchestrate");
       run = normalizeRun(state);
       settledNotified = false;
       paint(ctx);
