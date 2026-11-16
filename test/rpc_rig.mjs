@@ -92,6 +92,11 @@ const child = spawn("omp", ["--model", "basalt-deepseek/deepseek:auto", "--mode"
 		// A named key is required: the extension registers the lanes and calls setModel under it.
 		FADE_ORCHESTRATE_STATE_KEY: "rpcrig",
 		FADE_ORCHESTRATE_ROOT: repo,
+		// The router claim is per router under `~/.local/state/fade-orchestrator/<router>` by
+		// default. The rig starts a REAL run on the live router, so it must claim its own fixture
+		// plane: a test must never claim the router the operator is driving, and a rig killed
+		// mid-run must never leave the operator refusing on a stale claim.
+		FADE_ORCHESTRATE_LOCK_DIR: join(repo, "var", "orchestrator-claim"),
 		// The flip needs two health polls; the metrics tick is the poller, so the rig shortens it
 		// to make the churn observable in seconds instead of the host default of 30.
 		FADE_ORCHESTRATE_METRICS_INTERVAL_MS: "2000",

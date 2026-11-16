@@ -7,7 +7,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { msg } from "./router.ts";
 
@@ -868,6 +868,18 @@ export function releaseInstanceLock(dir: string, pid: number = process.pid): voi
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
 	}
+}
+
+/**
+ * Where the router claim lives: per ROUTER, not per repo. The router is single-tenant (one resident
+ * lane, one live-turn ledger, one flip guard), so two sessions driving it from two checkouts of two
+ * repos must meet at one file. `FADE_ORCHESTRATE_LOCK_DIR` moves the whole plane (rigs, containers,
+ * a second router on one box).
+ */
+export function instanceLockDir(router: string = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:18014"): string {
+	if (process.env.FADE_ORCHESTRATE_LOCK_DIR) return process.env.FADE_ORCHESTRATE_LOCK_DIR;
+	const slug = router.replace(/^[a-z]+:\/\//i, "").replace(/[^a-z0-9]+/gi, "-").replace(/-+$/, "") || "router";
+	return join(homedir(), ".local", "state", "fade-orchestrator", slug);
 }
 
 export function isRepoRelative(path: string): boolean {

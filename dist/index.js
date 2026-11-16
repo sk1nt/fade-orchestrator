@@ -201,6 +201,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 var execFileAsync = promisify(execFile);
 async function execGitAsync(repo, args, opts = {}) {
@@ -591,6 +592,69 @@ function writeJson(path, value) {
   } catch {
   }
 }
+var LOCK_FILENAME = "orchestrator.lock";
+function readInstanceLock(dir) {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, LOCK_FILENAME), "utf8"));
+    return raw && typeof raw === "object" ? raw : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function holderAlive(pid) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code !== "ESRCH";
+  }
+}
+function acquireInstanceLock(dir, info) {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, LOCK_FILENAME);
+  const claim = () => {
+    const lock = { pid: process.pid, run_id: info.run_id, repo: info.repo, started: (/* @__PURE__ */ new Date()).toISOString(), host: hostname() };
+    const fd = openSync(path, "wx");
+    try {
+      writeFileSync(fd, `${JSON.stringify(lock)}
+`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  };
+  const taken = () => {
+    try {
+      claim();
+      return true;
+    } catch (e) {
+      if (e.code === "EEXIST") return false;
+      throw e;
+    }
+  };
+  if (taken()) return { ok: true };
+  const holder = readInstanceLock(dir);
+  if (holderAlive(holder?.pid)) return { ok: false, holder, stale: false };
+  rmSync(path, { force: true });
+  if (taken()) return { ok: true };
+  const rival = readInstanceLock(dir) ?? holder ?? { pid: 0, run_id: "unknown", repo: info.repo, started: (/* @__PURE__ */ new Date()).toISOString(), host: hostname() };
+  return { ok: false, holder: rival, stale: true };
+}
+function releaseInstanceLock(dir, pid = process.pid) {
+  const holder = readInstanceLock(dir);
+  if (!holder || holder.pid !== pid) return;
+  try {
+    unlinkSync(join(dir, LOCK_FILENAME));
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+}
+function instanceLockDir(router = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:18014") {
+  if (process.env.FADE_ORCHESTRATE_LOCK_DIR) return process.env.FADE_ORCHESTRATE_LOCK_DIR;
+  const slug = router.replace(/^[a-z]+:\/\//i, "").replace(/[^a-z0-9]+/gi, "-").replace(/-+$/, "") || "router";
+  return join(homedir(), ".local", "state", "fade-orchestrator", slug);
+}
 function isRepoRelative(path) {
   if (typeof path !== "string" || path.trim() === "" || isAbsolute(path)) return false;
   return !path.split(/[\\/]/).includes("..");
@@ -811,7 +875,7 @@ var briefings = {
 };
 
 // src/ui.ts
-import { hostname, userInfo } from "node:os";
+import { hostname as hostname2, userInfo } from "node:os";
 var OVERLAY_WIDGET_KEY = "fade-overlay";
 var TOP_WIDGET_KEY = "fade-top";
 var ORCH_STATUS_KEY = "fade-orch";
@@ -832,7 +896,7 @@ function account() {
 }
 function machine() {
   try {
-    return hostname().length > 1 ? hostname() : "";
+    return hostname2().length > 1 ? hostname2() : "";
   } catch {
     return "";
   }
@@ -1312,7 +1376,10 @@ var sameFile = (a, b) => {
   return na === nb || na.replace(/\/+$/, "") === nb.replace(/\/+$/, "");
 };
 function laneMoe(lane, opts = {}) {
-  const cfg = readServeConfig(opts.configPath);
+  const proof = opts.proof ?? engineProof();
+  const configPath = opts.configPath ?? proof.routerConfigPath;
+  const configDerived = opts.configPath === void 0 && configPath !== void 0;
+  const cfg = readServeConfig(configPath);
   const model = cfg?.models?.[lane];
   const savePath = model && typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : void 0;
   const saveCapable = FLASH_NEXT_SAVE_CAPABLE.test(lane) || model && String(model.model ?? "").toLowerCase().includes("qwen");
@@ -1327,9 +1394,8 @@ function laneMoe(lane, opts = {}) {
       note: 'save-capable pack: the serve config does not set "expert-profile-save" (operator act: add it at the model alias, then reload the lane)'
     };
   }
-  const proof = opts.proof ?? engineProof();
   const argvLive = opts.liveCmdline !== void 0 && opts.liveCmdline.includes("--expert-profile-save") && opts.liveCmdline.includes(savePath);
-  const configIsRunning = opts.configPath !== void 0 && proof.routerConfigPath !== void 0 && sameFile(proof.routerConfigPath, opts.configPath);
+  const configIsRunning = configPath !== void 0 && proof.routerConfigPath !== void 0 && sameFile(proof.routerConfigPath, configPath);
   const isLive = opts.liveCmdline !== void 0 ? argvLive : argvLive || configIsRunning;
   let exists = false;
   let age_s;
@@ -1342,7 +1408,7 @@ function laneMoe(lane, opts = {}) {
   } catch {
     exists = false;
   }
-  const note = isLive ? exists && writtenByEngine === false ? "live: the running router serves this config; the profile PREDATES this engine \u2014 placing from it needs the lane (re)load, and the engine rewrites it every expert-profile-save-every minutes" : void 0 : `configured, NOT live: the running router serves ${proof.routerConfigPath ?? "no config path (a direct engine launch)"}, not ${opts.configPath ?? "the configured path"} (reload the lane/router to apply)`;
+  const note = isLive ? exists && writtenByEngine === false ? "live: the running router serves this config; the profile PREDATES this engine \u2014 placing from it needs the lane (re)load, and the engine rewrites it every expert-profile-save-every minutes" : configDerived ? `live: read from the router's own --config (${configPath}); FADE_ORCHESTRATE_BASALT_CONFIG is unset` : void 0 : `configured, NOT live: the running router serves ${proof.routerConfigPath ?? "no config path (a direct engine launch)"}, not ${configPath ?? "the configured path"} (reload the lane/router to apply)`;
   return {
     lane,
     state: isLive ? "live" : "configured",
@@ -1361,6 +1427,100 @@ function moeRows(lanes, opts = {}) {
     const age = m.profile_age_s !== void 0 ? `${(m.profile_age_s / 3600).toFixed(1)} h old` : "no file";
     const value = m.state === "unsupported" ? "unsupported (Flash-Next only; relearned per swap)" : m.state === "configured" && !m.profile_path ? "not configured (add expert-profile-save, reload lane)" : m.state === "configured" ? `configured, NOT live \xB7 ${m.profile_exists ? age : "no profile yet"}` : `${m.state} \xB7 ${m.profile_exists ? age : "no profile yet"} \xB7 ${m.written_by_running_engine === true ? "written by this engine \xB7 warm start" : m.profile_exists ? "earlier engine's file \xB7 warm on reload" : "nothing learned yet"}`;
     return { label: `MoE ${lane}`, value };
+  });
+}
+var gpuDevices = (gpu) => {
+  if (typeof gpu === "string") {
+    const cards = gpu.split(/[\s,]+/).filter(Boolean);
+    return cards.length ? { verbatim: gpu, devices: cards.length } : void 0;
+  }
+  if (Array.isArray(gpu)) {
+    const cards = gpu.map(String).filter((c) => c !== "" && c !== "undefined" && c !== "null");
+    return cards.length ? { verbatim: cards.join(","), devices: cards.length } : void 0;
+  }
+  if (typeof gpu === "number" && Number.isFinite(gpu)) return { verbatim: String(gpu), devices: 1 };
+  return void 0;
+};
+var reserveClause = (model, devices) => {
+  const raw = model["vram-reserve-mib"];
+  const vram = typeof raw === "number" ? raw : void 0;
+  if (vram === void 0) return "";
+  const gib = (mib) => `${+(mib / 1024).toFixed(2)} GiB`;
+  return `; "vram-reserve-mib": ${vram} is per card \u2014 ${gib(vram)} on each of the ${devices} cards, ${gib(vram * devices)} held off the pair, not ${gib(vram)} total`;
+};
+var stalePlacementClause = (model, engineStartEpoch) => {
+  const savePath = typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : void 0;
+  if (!savePath) return "";
+  const start = engineStartEpoch();
+  if (start === void 0) return "";
+  let mtime_s;
+  try {
+    mtime_s = statSync(savePath).mtimeMs / 1e3;
+  } catch {
+    return "";
+  }
+  if (mtime_s >= start) return "";
+  return `; its profile PREDATES this engine's start, so placement is restored from the PREVIOUS run's map (reload the lane to relearn it)`;
+};
+var placementBalance = (lane, opts, engineStartEpoch) => {
+  const cfg = readServeConfig(opts.configPath);
+  if (!cfg) {
+    return { lane, verdict: "unknown", note: `no serve config to read${opts.configPath ? ` at ${opts.configPath}` : " (no config path configured)"} \u2014 placement is unjudged` };
+  }
+  const model = cfg.models[lane];
+  if (!model) {
+    return { lane, verdict: "unknown", note: `lane "${lane}" is not in ${opts.configPath} \u2014 no "gpu" / "*-reserve-mib" keys to judge` };
+  }
+  const gpu = gpuDevices(model.gpu);
+  if (!gpu) {
+    return { lane, verdict: "unknown", note: `the alias carries no "gpu" key (or an empty one): add "gpu": "0,1" to split the expert tier across the cards` };
+  }
+  const { verbatim, devices } = gpu;
+  const health = opts.health;
+  if (!health) {
+    return { lane, verdict: "unknown", gpu: verbatim, devices, note: `no health reading supplied for ${lane}: spill is unmeasured, so the placement is unjudged` };
+  }
+  const spill = typeof health.spill_experts === "number" ? health.spill_experts : void 0;
+  const reserve = reserveClause(model, devices);
+  const spillTotal = health.spill_total;
+  if (spill !== void 0 && spill > 0) {
+    return {
+      lane,
+      verdict: "spilled",
+      gpu: verbatim,
+      devices,
+      spill_experts: spill,
+      ...spillTotal !== void 0 ? { spill_total: spillTotal } : {},
+      note: `${spill}/${spillTotal ?? "?"} experts are on the file tier${health.spill_bytes_gb !== void 0 ? ` (${health.spill_bytes_gb} GB)` : ""} \u2014 experts outside VRAM are PCIe/NVMe reads per generated token, on the generation path; fit the tier to the ${devices} card(s) with "ram-reserve-mib" / "vram-reserve-mib" at the alias and the pack quant, then re-save the profile \u2014 never a bigger pack${reserve}`
+    };
+  }
+  const measured = { ...spill !== void 0 ? { spill_experts: spill } : {}, ...spillTotal !== void 0 ? { spill_total: spillTotal } : {} };
+  if (devices === 1) {
+    return {
+      lane,
+      verdict: "single-gpu",
+      gpu: verbatim,
+      devices,
+      ...measured,
+      note: `one card carries the whole expert tier and the second is idle for this lane: the alias sets "gpu": "${verbatim}" \u2014 widen it to "gpu": "0,1" so both cards split the tier${reserve}`
+    };
+  }
+  return {
+    lane,
+    verdict: "balanced",
+    gpu: verbatim,
+    devices,
+    ...measured,
+    note: `${devices} cards carry the expert tier ("gpu": "${verbatim}") and ${spill === 0 ? `the health reading shows 0/${spillTotal ?? "?"} experts on the file tier` : "the file tier is UNMEASURED: the router reported no spill line, so nothing here proves the tier fits in VRAM"}${reserve}${stalePlacementClause(model, engineStartEpoch)}`
+  };
+};
+function moeBalanceRows(lanes, opts = {}) {
+  const proof = engineProofCached();
+  return lanes.map((lane) => {
+    const b = placementBalance(lane, { configPath: opts.configPath ?? proof.routerConfigPath, health: opts.healthByLane?.[lane] }, () => proof.engineStartEpoch);
+    const tail = b.verdict === "spilled" ? `${b.spill_experts ?? "?"}/${b.spill_total ?? "?"} experts on the file tier` : b.verdict === "single-gpu" ? "second card idle" : b.verdict === "balanced" ? b.spill_experts === void 0 ? "file tier UNMEASURED (router reported no spill line)" : "no file-tier experts" : b.note;
+    const value = b.verdict === "unknown" ? `${b.verdict} \xB7 ${b.note}` : `${b.verdict} \xB7 gpu ${b.gpu ?? "?"} \xB7 ${b.devices ?? "?"} devices \xB7 ${tail}`;
+    return { label: `MoE balance ${lane}`, value };
   });
 }
 
@@ -1462,7 +1622,16 @@ async function collectScreen(src) {
     src.swaps ?? readSwaps(src.runDir),
     src.turns ?? readTurns(src.runDir, SCREEN_TURNS)
   ]);
-  const moe = moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath });
+  const moe = [
+    ...moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath }),
+    // GPU placement: the serve config names each alias's `gpu` and reserves, so the row exists for
+    // BOTH lanes; the file-tier spill is only measurable on the RESIDENT engine, so the other
+    // lane's row says spill is unmeasured rather than claiming zero.
+    ...moeBalanceRows([src.lanes.think, src.lanes.code], {
+      configPath: src.moeConfigPath,
+      healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {}
+    })
+  ];
   const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
   const missing = [];
   if (!metrics) missing.push(`router ${ROUTER} unreachable \u2014 engine, decode and queue are not measured`);
@@ -1827,6 +1996,7 @@ var isDelegatedSession = () => {
 function fadeOrchestrate(pi) {
   let run;
   let runDir;
+  let lockDir;
   let pending;
   let settledNotified = false;
   let metrics;
@@ -1930,6 +2100,11 @@ function fadeOrchestrate(pi) {
     lastWriteWarn = msg2;
     ctx.ui.notify(`orchestrate: the state write failed \u2014 ${msg2}`, "warning");
   };
+  const releaseLock = () => {
+    if (!lockDir) return;
+    releaseInstanceLock(lockDir);
+    lockDir = void 0;
+  };
   let liveCache;
   const liveState = async () => {
     if (!runDir) return void 0;
@@ -2016,6 +2191,7 @@ function fadeOrchestrate(pi) {
     if (run) {
       run.state = "failed";
       run.reason = reason;
+      releaseLock();
       void persist().catch(warnWrite(ctx, "fail"));
       paint(ctx);
     }
@@ -2383,6 +2559,7 @@ ${SCHEMA_HINT}` : text);
       const applied = applyPhase(params.phase, payload);
       turnPhase = params.phase;
       classifyTurnEnd(run, true);
+      if (applied.nextState === "complete" || applied.nextState === "failed") releaseLock();
       let checkpointNote = "";
       if (params.phase === "verification_done" && applied.nextState === "complete") {
         const st = run;
@@ -2497,8 +2674,9 @@ ${SCHEMA_HINT}` : text);
           return;
         }
         const done = run.tasks.filter((t) => t.status === "passed").length;
+        const claim2 = readInstanceLock(instanceLockDir(ROUTER));
         ctx.ui.notify(
-          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 ${statePath()}`,
+          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"} \xB7 ${statePath()}`,
           "info"
         );
         paint(ctx);
@@ -2565,6 +2743,7 @@ ${SCHEMA_HINT}` : text);
           run.state = "stopped";
           if (runDir) writeJson(statePath(), run);
         }
+        releaseLock();
         pending = void 0;
         clearSurface(ctx);
         ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
@@ -2600,23 +2779,35 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify("orchestrate: usage /orchestrate [--rounds N] <goal>", "warning");
         return;
       }
+      const runId = `${(/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
+      const repo = ctx.cwd;
+      const claimDir = instanceLockDir(ROUTER);
+      const claim = acquireInstanceLock(claimDir, { run_id: runId, repo });
+      if (!claim.ok) {
+        ctx.ui.notify(
+          `orchestrate: the router ${ROUTER} is claimed by pid ${claim.holder.pid} \u2014 run ${claim.holder.run_id} in ${claim.holder.repo} on ${claim.holder.host}${claim.stale ? "; its owner died in the same instant as the reclaim, so that instance holds the router" : ""}. End that run (\`/orchestrate stop\` there) or point this session at another router (FADE_ORCHESTRATE_ROUTER / FADE_ORCHESTRATE_LOCK_DIR). Nothing was written.`,
+          "error"
+        );
+        return;
+      }
+      lockDir = claimDir;
+      if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
       ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
       engineProofInvalidate();
       const loaded = await loadLane(THINK_LANE);
       ctx.ui.setWorkingMessage();
       if (!loaded.ok) {
+        releaseLock();
         ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
         return;
       }
       const census = await listLanes();
       const resident = census.models.find((m) => m.status === "loaded");
       if (!census.error && resident?.id !== THINK_LANE) {
+        releaseLock();
         ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
         return;
       }
-      const runId = `${(/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
-      const repo = ctx.cwd;
-      if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
       runDir = join5(repo, "var", "omp-orchestrate");
       run = {
         key: STATE_KEY,

@@ -34,6 +34,7 @@ import {
 	gitCaveat,
 	handover,
 	handoverText,
+	instanceLockDir,
 	isGitRepo,
 	LOCK_FILENAME,
 	MAX_WINDOW_TASKS,
@@ -50,6 +51,7 @@ import {
 	roundsForTasks,
 	runGate,
 	sameTaskPlan,
+	STATE_FILENAME,
 	synthesizeCodingDone,
 	tagCheckpoint,
 	validateChecks,
@@ -1053,6 +1055,40 @@ test("readTurns honours its TAIL bound: 600 ledger lines, the bound's count, the
 		assert.equal(tail[0].turn, total - TURN_TAIL_DEFAULT + 1, "the oldest kept is exactly the bound back, and no partial line parsed");
 		assert.equal((await readTurns(dir, 12)).length, 12, "the panel's explicit smaller bound is honoured too");
 		assert.equal((await readTurns(join(dir, "nope"))).length, 0, "no ledger yet is an empty list, never a crash");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("instanceLockDir names the ROUTER, not the checkout, and honors FADE_ORCHESTRATE_LOCK_DIR", () => {
+	const saved = process.env.FADE_ORCHESTRATE_LOCK_DIR;
+	try {
+		delete process.env.FADE_ORCHESTRATE_LOCK_DIR;
+		const local = instanceLockDir("http://127.0.0.1:18014");
+		assert.match(local, /fade-orchestrator[/\\]127-0-0-1-18014$/, local);
+		const remote = instanceLockDir("http://example.com:18014");
+		assert.match(remote, /fade-orchestrator[/\\]example-com-18014$/, remote);
+		assert.notEqual(local, remote, "two routers claim twice, so two checkouts of ONE router meet at one file");
+		assert.ok(!local.startsWith(process.cwd()), "the claim is not repo-scoped: the router is the resource, not the checkout");
+		process.env.FADE_ORCHESTRATE_LOCK_DIR = join(tmpdir(), "orch-claim-plane");
+		assert.equal(instanceLockDir("http://127.0.0.1:18014"), process.env.FADE_ORCHESTRATE_LOCK_DIR, "one variable moves the whole plane (rigs, containers, a read-only home)");
+	} finally {
+		if (saved === undefined) delete process.env.FADE_ORCHESTRATE_LOCK_DIR;
+		else process.env.FADE_ORCHESTRATE_LOCK_DIR = saved;
+	}
+});
+
+test("a released claim stays released while the run's last state write is still in flight", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-release-"));
+	try {
+		assert.equal(acquireInstanceLock(dir, { run_id: "R1", repo: "/repo" }).ok, true, "the run claims its router");
+		const inFlight = writeJsonAsync(join(dir, STATE_FILENAME), { run_id: "R1", state: "complete" });
+		releaseInstanceLock(dir, process.pid); // the run ends while that write is queued
+		await inFlight;
+		await new Promise((r) => setTimeout(r, 60)); // the coalesced tail write, if any, has landed by now
+		assert.equal(existsSync(join(dir, LOCK_FILENAME)), false, "the claim is gone, and no state flush puts it back");
+		assert.equal(JSON.parse(readFileSync(join(dir, STATE_FILENAME), "utf8")).state, "complete", "the state record survives the release");
+		releaseInstanceLock(dir, process.pid); // releasing twice is not an error
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

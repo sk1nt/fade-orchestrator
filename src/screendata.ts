@@ -14,7 +14,7 @@
 import type { GateResult, RunState } from "./core.ts";
 import { readTurns, readSwaps, type SwapRow, type TurnRecord } from "./history.ts";
 import { fetchMetrics, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
-import { moeRows } from "./moe.ts";
+import { moeBalanceRows, moeRows } from "./moe.ts";
 import { ROUTER } from "./router.ts";
 import { modelLabel, type FlipBadge, type TierRow } from "./ui.ts";
 
@@ -222,7 +222,16 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 		src.swaps ?? readSwaps(src.runDir),
 		src.turns ?? readTurns(src.runDir, SCREEN_TURNS),
 	]);
-	const moe = moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath });
+	const moe = [
+		...moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath }),
+		// GPU placement: the serve config names each alias's `gpu` and reserves, so the row exists for
+		// BOTH lanes; the file-tier spill is only measurable on the RESIDENT engine, so the other
+		// lane's row says spill is unmeasured rather than claiming zero.
+		...moeBalanceRows([src.lanes.think, src.lanes.code], {
+			configPath: src.moeConfigPath,
+			healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {},
+		}),
+	];
 	const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
 	const missing: string[] = [];
 	if (!metrics) missing.push(`router ${ROUTER} unreachable — engine, decode and queue are not measured`);

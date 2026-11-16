@@ -132,6 +132,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | Variable | Default | Meaning |
 |---|---|---|
 | `FADE_ORCHESTRATE_ROUTER` | `http://127.0.0.1:18014` | basalt router base URL |
+| `FADE_ORCHESTRATE_LOCK_DIR` | `~/.local/state/fade-orchestrator` | the base of the **router claim**: one file per router (`<router-slug>/orchestrator.lock`), holding the owning pid, run id, repo and host. A run claims its router at the keystroke and releases it at `halt`/`stop`/completion/preflight failure; a second session on the same router is refused before any lane load or state write. Set it to move the whole plane (rigs, containers, a read-only home) |
 | `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
 | `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane) |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements |
@@ -142,7 +143,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_GLYPH` | `󰚩` | the status line's leading glyph; an empty value removes it (a terminal without a Nerd Font) |
 | `FADE_ORCHESTRATE_REDACT` | unset | `1`, or `/orchestrate --demo-redact` (`--demo-redact=off` to clear), strips the repo path, account, `/home/…`, `~` and the hostname from every rendered line. Display-only: `state.json`, `metrics.jsonl` and `swap_history.json` stay verbatim, and a fresh session starts unredacted |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the screen as a widget (110 columns) instead of an overlay component (RPC/print hosts) |
-| `FADE_ORCHESTRATE_BASALT_CONFIG` | unset | the basalt serve config JSON; enables the per-lane MoE placement panel (`expert-profile-save`) |
+| `FADE_ORCHESTRATE_BASALT_CONFIG` | unset | overrides which basalt serve config the MoE rows read. Unset, the panel reads the config the **running router names in its own `--config`** (from the `/proc` proof), so the rows describe the engine that is serving: the lane's `expert-profile-save`, its profile's age against the engine start, and the GPU placement. Pointing it at a config the router does not serve is answered honestly — the row says `configured, NOT live` and names both paths |
 | `FADE_ORCHESTRATE_GATE_POLL_MS` / `_GATE_BUDGET_MS` | `3000` / `60000` | the pre-unload router-idle gate: a `POST /v1/load` is deferred while `/health` reports the router busy, polled every `_GATE_POLL_MS` for up to `_GATE_BUDGET_MS`, then paid anyway. A gate that expires without loading the lane leaves the run stalled |
 | `FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS` | `600000` | the pre-swap gate's total wall budget across every check; each check keeps its own 120 s timeout. A row that starts with the budget spent is never spawned and prints `NOT RUN … unmeasured` |
 | `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | the fast path's bound: a gate-green round that touched ≤ 1 file and < 15 changed lines on the first try completes with zero lane loads |
@@ -169,7 +170,7 @@ raw-byte claim) is in the docs. Only a configured control chord that the host ac
 listener sees the byte gets a login clause: once per process, on the run's own line, so the row
 never prints a key that opens nothing.
 
-- `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run (preflights the router: think lane must load).
+- `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run. It claims the router first (one orchestrator per router: the router carries one resident lane, one live-turn ledger and one flip guard, so two runs on one router would each gate the other's working tree). A claim held by a live pid refuses, naming the pid, run, repo and host; a claim whose owner died is reclaimed. Then it preflights the router: the think lane must load.
 - `/orchestrate status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`
 - `/orchestrate handover` — send the condensed digest now (any time, mid-run).
 - `/lanes` — live router census (both entries' status + `/health`).

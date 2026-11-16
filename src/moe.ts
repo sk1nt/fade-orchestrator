@@ -147,7 +147,15 @@ const sameFile = (a: string, b: string): boolean => {
 };
 
 export function laneMoe(lane: string, opts: { configPath?: string; modelsDir?: string; liveCmdline?: string; proof?: EngineProof } = {}): LaneMoe {
-	const cfg = readServeConfig(opts.configPath);
+	const proof = opts.proof ?? engineProof();
+	// Which serve config this row reads: the operator's explicit `FADE_ORCHESTRATE_BASALT_CONFIG`,
+	// else the config the RUNNING router names in its own argv. A config the router does not serve
+	// answers a question nobody asked: on this box the live config carries the lane's
+	// `expert-profile-save` and a stale prod alias does not, so a panel pointed at the alias reported
+	// "not configured (add expert-profile-save)" about a pack that was placing from a warm profile.
+	const configPath = opts.configPath ?? proof.routerConfigPath;
+	const configDerived = opts.configPath === undefined && configPath !== undefined;
+	const cfg = readServeConfig(configPath);
 	const model = cfg?.models?.[lane];
 	const savePath = model && typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : undefined;
 	const saveCapable = FLASH_NEXT_SAVE_CAPABLE.test(lane) || (model && String(model.model ?? "").toLowerCase().includes("qwen"));
@@ -162,12 +170,11 @@ export function laneMoe(lane: string, opts: { configPath?: string; modelsDir?: s
 			note: 'save-capable pack: the serve config does not set "expert-profile-save" (operator act: add it at the model alias, then reload the lane)',
 		};
 	}
-	const proof = opts.proof ?? engineProof();
 	// Liveness: the caller may hand us a cmdline (the rigs' argv form, the engine's direct-launch
 	// form). The knobs reach the engine through the CONFIG the router names, so the running
 	// router's `--config` path is the test; the argv scan is the fallback for a direct launch.
 	const argvLive = opts.liveCmdline !== undefined && opts.liveCmdline.includes("--expert-profile-save") && opts.liveCmdline.includes(savePath);
-	const configIsRunning = opts.configPath !== undefined && proof.routerConfigPath !== undefined && sameFile(proof.routerConfigPath, opts.configPath);
+	const configIsRunning = configPath !== undefined && proof.routerConfigPath !== undefined && sameFile(proof.routerConfigPath, configPath);
 	const isLive = opts.liveCmdline !== undefined ? argvLive : argvLive || configIsRunning;
 	let exists = false;
 	let age_s: number | undefined;
@@ -183,8 +190,10 @@ export function laneMoe(lane: string, opts: { configPath?: string; modelsDir?: s
 	const note = isLive
 		? exists && writtenByEngine === false
 			? "live: the running router serves this config; the profile PREDATES this engine — placing from it needs the lane (re)load, and the engine rewrites it every expert-profile-save-every minutes"
-			: undefined
-		: `configured, NOT live: the running router serves ${proof.routerConfigPath ?? "no config path (a direct engine launch)"}, not ${opts.configPath ?? "the configured path"} (reload the lane/router to apply)`;
+			: configDerived
+				? `live: read from the router's own --config (${configPath}); FADE_ORCHESTRATE_BASALT_CONFIG is unset`
+				: undefined
+		: `configured, NOT live: the running router serves ${proof.routerConfigPath ?? "no config path (a direct engine launch)"}, not ${configPath ?? "the configured path"} (reload the lane/router to apply)`;
 	return {
 		lane,
 		state: isLive ? "live" : "configured",
@@ -318,7 +327,9 @@ const placementBalance = (lane: string, opts: { configPath?: string; health?: Mo
 		gpu: verbatim,
 		devices,
 		...measured,
-		note: `${devices} cards carry the expert tier ("gpu": "${verbatim}") and the health reading shows no file-tier experts${reserve}${stalePlacementClause(model, engineStartEpoch)}`,
+		note: `${devices} cards carry the expert tier ("gpu": "${verbatim}") and ${
+			spill === 0 ? `the health reading shows 0/${spillTotal ?? "?"} experts on the file tier` : "the file tier is UNMEASURED: the router reported no spill line, so nothing here proves the tier fits in VRAM"
+		}${reserve}${stalePlacementClause(model, engineStartEpoch)}`,
 	};
 };
 
@@ -330,9 +341,11 @@ const placementBalance = (lane: string, opts: { configPath?: string; health?: Mo
  * `expert-profile-save`, and only to compare its profile's mtime against the engine's start.
  */
 export function moeBalance(lane: string, opts: { configPath?: string; health?: MoeHealth } = {}): MoeBalance {
+	// Same rule as `laneMoe`: the operator's path, else the config the RUNNING router serves.
+	const configPath = opts.configPath ?? engineProofCached().routerConfigPath;
 	let read = false;
 	let start: number | undefined;
-	return placementBalance(lane, opts, () => {
+	return placementBalance(lane, { ...opts, configPath }, () => {
 		if (!read) {
 			read = true;
 			start = engineProof().engineStartEpoch;
@@ -345,14 +358,16 @@ export function moeBalance(lane: string, opts: { configPath?: string; health?: M
 export function moeBalanceRows(lanes: string[], opts: { configPath?: string; healthByLane?: Record<string, MoeHealth> } = {}): { label: string; value: string }[] {
 	const proof = engineProofCached();
 	return lanes.map((lane) => {
-		const b = placementBalance(lane, { configPath: opts.configPath, health: opts.healthByLane?.[lane] }, () => proof.engineStartEpoch);
+		const b = placementBalance(lane, { configPath: opts.configPath ?? proof.routerConfigPath, health: opts.healthByLane?.[lane] }, () => proof.engineStartEpoch);
 		const tail =
 			b.verdict === "spilled"
 				? `${b.spill_experts ?? "?"}/${b.spill_total ?? "?"} experts on the file tier`
 				: b.verdict === "single-gpu"
 					? "second card idle"
 					: b.verdict === "balanced"
-						? "no file-tier experts"
+						? b.spill_experts === undefined
+							? "file tier UNMEASURED (router reported no spill line)"
+							: "no file-tier experts"
 						: b.note;
 		const value = b.verdict === "unknown" ? `${b.verdict} · ${b.note}` : `${b.verdict} · gpu ${b.gpu ?? "?"} · ${b.devices ?? "?"} devices · ${tail}`;
 		return { label: `MoE balance ${lane}`, value };

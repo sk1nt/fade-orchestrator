@@ -30,7 +30,7 @@ import {
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, coalesceWrite, execGitAsync, normalizeRun, parseJson, pushRejection, readJsonAsync, refreshChecks, refreshRoot, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, acquireInstanceLock, adaptiveRounds, classifyTurnEnd, coalesceWrite, execGitAsync, instanceLockDir, normalizeRun, parseJson, pushRejection, readInstanceLock, readJsonAsync, refreshChecks, refreshRoot, releaseInstanceLock, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
 	TERMINAL,
 	briefings,
 	validateChecks,
@@ -116,6 +116,11 @@ const isDelegatedSession = (): boolean => {
 export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let run: RunState | undefined;
 	let runDir: string | undefined;
+	/** The router claim, taken at a run's start and released at its end. The router carries ONE
+	 *  resident lane, ONE live-turn ledger and ONE flip guard, so a second orchestrator on the same
+	 *  router is not a concurrency question but a correctness one: each one's pre-swap gate ends up
+	 *  judging the other's working tree. */
+	let lockDir: string | undefined;
 	let pending: { lane: string; phase: string } | undefined;
 	let settledNotified = false;
 	let metrics: MetricsSnapshot | undefined;
@@ -278,6 +283,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		ctx.ui.notify(`orchestrate: the state write failed — ${msg}`, "warning");
 	};
 
+	/** Release the router claim. `releaseInstanceLock` is owner-only, so a run adopted from disk (a
+	 *  session that resumed a run its pid never started) has nothing to release and never deletes the
+	 *  live owner's file. */
+	const releaseLock = (): void => {
+		if (!lockDir) return;
+		releaseInstanceLock(lockDir);
+		lockDir = undefined;
+	};
+
 	/**
 	 * The ON-DISK run, for the verifier sandbox, which asks on EVERY tool call. `readFileSync` +
 	 * `JSON.parse` there parsed the whole state per call, on the host's loop. The file's
@@ -411,6 +425,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (run) {
 			run.state = "failed";
 			run.reason = reason;
+			releaseLock();
 			void persist().catch(warnWrite(ctx, "fail"));
 			paint(ctx);
 		}
@@ -929,6 +944,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// An accepted phase is the end of the protocol streak. `round`/`max_rounds` are
 			// untouched here — a lane that reports never owes the round budget anything.
 			classifyTurnEnd(run, true);
+			// A terminal state releases the router claim in the same keystroke, so the next session
+			// starts without a manual release. Owner-only: an adopted run holds no claim of its own.
+			if (applied.nextState === "complete" || applied.nextState === "failed") releaseLock();
 			let checkpointNote = "";
 			if (params.phase === "verification_done" && applied.nextState === "complete") {
 				// Tag the tree at the moment each task was accepted, namespaced per run.
@@ -1079,8 +1097,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					return;
 				}
 				const done = run.tasks.filter((t) => t.status === "passed").length;
+				const claim = readInstanceLock(instanceLockDir(ROUTER));
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
@@ -1171,6 +1190,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					// durable before this command returns, with no write left in flight.
 					if (runDir) writeJson(statePath(), run);
 				}
+				releaseLock();
 				pending = undefined;
 				clearSurface(ctx);
 				ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
@@ -1206,6 +1226,26 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify("orchestrate: usage /orchestrate [--rounds N] <goal>", "warning");
 				return;
 			}
+			// The router is claimed BEFORE the lane load and before a byte of state is written: a
+			// refused start pays no 13-25 s pack load and leaves no half-run. The claim is per ROUTER,
+			// so two sessions driving one router from two checkouts meet at one file — one resident
+			// lane, one live-turn ledger, one flip guard.
+			const runId = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
+			const repo = ctx.cwd;
+			const claimDir = instanceLockDir(ROUTER);
+			const claim = acquireInstanceLock(claimDir, { run_id: runId, repo });
+			if (!claim.ok) {
+				ctx.ui.notify(
+					`orchestrate: the router ${ROUTER} is claimed by pid ${claim.holder.pid} — run ${claim.holder.run_id} in ${claim.holder.repo} on ${claim.holder.host}${claim.stale ? "; its owner died in the same instant as the reclaim, so that instance holds the router" : ""}. End that run (\`/orchestrate stop\` there) or point this session at another router (FADE_ORCHESTRATE_ROUTER / FADE_ORCHESTRATE_LOCK_DIR). Nothing was written.`,
+					"error",
+				);
+				return;
+			}
+			lockDir = claimDir;
+			// A non-git run root is knowable at this keystroke and changes what the loop can prove; say it
+			// now, not two rounds later as a wall of red `blocked` rows: in a non-git root the phase
+			// synthesizer has no git evidence at all, so every task lands `blocked`.
+			if (!(await isGitRepo(repo))) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
 			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
 			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
 			// in this run reads a pre-load engine state.
@@ -1213,21 +1253,19 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const loaded = await loadLane(THINK_LANE);
 			ctx.ui.setWorkingMessage();
 			if (!loaded.ok) {
+				// A start that never began releases its claim: a preflight failure must not strand
+				// the router behind a run that does not exist.
+				releaseLock();
 				ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
 				return;
 			}
 			const census = await listLanes();
 			const resident = census.models.find((m) => m.status === "loaded");
 			if (!census.error && resident?.id !== THINK_LANE) {
+				releaseLock();
 				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
 				return;
 			}
-			const runId = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
-			const repo = ctx.cwd;
-			// A non-git run root is knowable at this keystroke and changes what the loop can prove; say it
-			// now, not two rounds later as a wall of red `blocked` rows: in a non-git root the phase
-			// synthesizer has no git evidence at all, so every task lands `blocked`.
-			if (!(await isGitRepo(repo))) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
 			runDir = join(repo, "var", "omp-orchestrate");
 			run = {
 				key: STATE_KEY,

@@ -147,6 +147,31 @@ test("no proof at all: configured, named, never a green", () => {
 	}
 });
 
+test("no config path given: the row reads the config the router SERVES", () => {
+	// The box's failure this closes: the live config carries the lane's `expert-profile-save` and a
+	// stale prod alias does not, so a panel pointed at the alias printed "not configured (add
+	// expert-profile-save, reload lane)" about a pack that was placing from a warm profile.
+	const dir = mkdtempSync(join(tmpdir(), "orch-moe-"));
+	try {
+		writeFileSync(join(dir, "flash-next.prof"), "P");
+		const served = liveCfg(dir);
+		const m = laneMoe("flash-next", { proof: { routerConfigPath: served } });
+		assert.equal(m.state, "live", "the served config's save path is found with no env var at all");
+		assert.equal(m.config_is_running, true);
+		assert.match(m.note ?? "", /FADE_ORCHESTRATE_BASALT_CONFIG is unset/, m.note ?? "");
+		// An explicit path still wins, and its NOT-live diagnosis is unchanged.
+		// A DISTINCT path: `mkConfig` names its file `config.json`, and the same path as the served
+		// config would make "explicit wins" and "is the served one" the same test.
+		const staleAlias = join(dir, "stale-alias.json");
+		writeFileSync(staleAlias, JSON.stringify({ version: 2, models: [{ alias: "flash-next", model: "qwen3.8.basalt", "expert-profile-save": join(dir, "stale.prof") }] }));
+		const byHand = laneMoe("flash-next", { configPath: staleAlias, proof: { routerConfigPath: served } });
+		assert.equal(byHand.state, "configured");
+		assert.match(byHand.note ?? "", /NOT live/, "an explicit path wins, and reading a config the router does not serve stays named");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 // ── GPU placement: the host runs 2 cards, so the expert tier belongs on both ──────────────────
 // The serve config carries the per-alias `gpu`, `vram-reserve-mib`, `ram-reserve-mib`; the engine's
 // health says what spilled to the file tier. Absent data is NAMED, never a zero: no health reading
@@ -164,6 +189,24 @@ test("2 devices and no spill = balanced", () => {
 		const rows = moeBalanceRows(["flash-next"], { configPath: cfg, healthByLane: { "flash-next": { spill_experts: 0, spill_total: 15360 } } });
 		assert.equal(rows[0].label, "MoE balance flash-next");
 		assert.match(rows[0].value, /^balanced · gpu 0,1 · 2 devices · no file-tier experts$/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("no spill line in the health reading: the row never claims the tier sits in VRAM", () => {
+	// The box's live shape: the router reports `spill.total` with no `spill.experts`, so the count is
+	// unmeasured. The config proves the SPLIT, so the verdict stays `balanced`, and the row names the
+	// file tier UNMEASURED instead of asserting "no file-tier experts" from an absent reading.
+	const dir = mkdtempSync(join(tmpdir(), "orch-moe-"));
+	try {
+		const cfg = mkConfig(dir, [{ alias: "flash-next", model: "qwen3.8.basalt", gpu: "0,1" }]);
+		const b = moeBalance("flash-next", { configPath: cfg, health: { spill_total: 24576 } });
+		assert.equal(b.verdict, "balanced");
+		assert.equal(b.spill_experts, undefined);
+		assert.match(b.note, /file tier is UNMEASURED/, b.note);
+		const rows = moeBalanceRows(["flash-next"], { configPath: cfg, healthByLane: { "flash-next": { spill_total: 24576 } } });
+		assert.match(rows[0].value, /^balanced · gpu 0,1 · 2 devices · file tier UNMEASURED \(router reported no spill line\)$/, rows[0].value);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

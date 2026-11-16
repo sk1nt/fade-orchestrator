@@ -32,6 +32,10 @@
 //  15. the state write is async and COALESCED (`writeJsonAsync`/`coalesceWrite`): at the phase
 //      boundary the rig reads, `state.json` parses as a whole record and no `.tmp` sibling
 //      survives the rename.
+//  16. ONE orchestrator per ROUTER: a start on a claimed router is refused, naming the holder's
+//      pid, run, repo and host, paying ZERO lane load and writing no state; a free router is
+//      claimed at the start, naming this pid and the new run; `stop` releases the claim. The rig
+//      isolates the claim plane in `FADE_ORCHESTRATE_LOCK_DIR`, never the operator's.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
@@ -77,6 +81,11 @@ writeFileSync(join(repo, "a.ts"), "seed\n");
 writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), "{}\n");
 gitAt("add", "-A");
 gitAt("commit", "-q", "-m", "rig seed");
+
+// The router claim lives per router under `~/.local/state/fade-orchestrator/<router>` by default.
+// The rig owns a fixture plane, so it names its own: a test run must never claim (or refuse on) the
+// router the operator is using.
+process.env.FADE_ORCHESTRATE_LOCK_DIR = join(repo, "var", "orchestrator-claim");
 
 // ---- stub router: counts requests, tracks the resident lane ----
 const reqLog = [];
@@ -933,6 +942,43 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the gate names the row AS IT RUNS", working.some((m) => typeof m === "string" && /^fade_orchestrate: gate 1\/2: sleep 0\.3/.test(m)), JSON.stringify(working.slice(0, 3)));
   ok("the gate clears the working message when it lands", working.at(-1) === null, JSON.stringify(working.slice(-2)));
   ok("the gate verdict is said out loud with its cost", notes.slice(notesBefore25).some((n) => /gate GREEN in \d+\.\ds/.test(n)), JSON.stringify(notes.slice(notesBefore25)));
+}
+
+// 26. ONE orchestrator per ROUTER. The router carries one resident lane, one live-turn ledger and
+//     one flip guard, so a second session on the same router is a correctness problem, not a
+//     concurrency one: each one's pre-swap gate judges the other's working tree. The claim is taken
+//     before the pack load, so a refusal is free, and released by the run that held it.
+{
+  const claimDir = process.env.FADE_ORCHESTRATE_LOCK_DIR;
+  const claimFile = join(claimDir, "orchestrator.lock");
+  ok("the rig owns its claim plane", claimDir.startsWith(repo), claimDir);
+  rmSync(claimFile, { force: true });
+  // A FOREIGN live owner: `kill(1, 0)` answers EPERM, which is "this pid exists", so the claim is
+  // held, not stale. The rig must refuse, and refuse LEGIBLY.
+  mkdirSync(claimDir, { recursive: true });
+  const foreign = { pid: 1, run_id: "FOREIGN1", repo: "/home/elsewhere/checkout", started: "2030-01-01T00:00:00.000Z", host: "another-box" };
+  writeFileSync(claimFile, `${JSON.stringify(foreign)}\n`);
+  const base26 = loads();
+  notes.length = 0;
+  await commands.orchestrate.handler("a second goal on a claimed router", ctx);
+  const refusal = notes.join("\n");
+  ok("a start on a claimed router is refused, naming pid, run, repo and host", /is claimed by pid 1/.test(refusal) && refusal.includes("FOREIGN1") && refusal.includes("/home/elsewhere/checkout") && refusal.includes("another-box"), refusal.slice(0, 320));
+  ok("the refusal paid NO lane load (the claim is taken before the pack load)", loads() === base26, `${loads() - base26}`);
+  ok("the refusal wrote no run: the fixture state is untouched", readState().run_id === "GATE1", readState().run_id);
+  ok("the refusal left the foreign claim alone", existsSync(claimFile), claimFile);
+  // The owner finishes. The same keystroke now starts, and the claim names THIS process and the run.
+  rmSync(claimFile, { force: true });
+  resident = "deepseek"; // the start's preflight requires the think lane resident
+  notes.length = 0;
+  await commands.orchestrate.handler("--rounds 3 a claimable goal", ctx);
+  const claim = JSON.parse(readFileSync(claimFile, "utf8"));
+  const s26 = readState();
+  ok("a free router is claimed at the start, naming this pid, run and repo", claim.pid === process.pid && claim.run_id !== "FOREIGN1" && claim.repo === repo, JSON.stringify(claim));
+  ok("the run that claimed is the run on disk", s26.run_id === claim.run_id && s26.max_rounds === 3, `${s26.run_id} rounds ${s26.max_rounds}`);
+  await commands.orchestrate.handler("status", ctx);
+  ok("status names the claim as this process's", notes.join("\n").includes(`router claim this run (pid ${process.pid})`), notes.join("\n").slice(0, 240));
+  await commands.orchestrate.handler("stop --clear", ctx);
+  ok("`stop` releases the claim, so the next session is not refused", !existsSync(claimFile), claimFile);
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));
