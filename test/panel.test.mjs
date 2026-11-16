@@ -7,7 +7,23 @@
 // words, and every number nobody measured, named); and it must be LIVE (the panel re-reads on its
 // tick and stops the moment it is closed). Keyboard: select, scroll, the loop controls, close.
 import assert from "node:assert/strict";
-import { hostname } from "node:os";
+import { hostname, userInfo } from "node:os";
+
+/**
+ * The account the REDACTOR masks, resolved the way `ui.ts` `account()` resolves it: `$USER` first,
+ * the passwd entry as the fallback. A fixture that guessed (the old `"someone"` fallback) tested a
+ * string the redactor never masks: it passed only where `$USER` was set — the public CI — and went
+ * red in the fade-ci container, where `--user 1000:1000` leaves `$USER` empty (measured 2026-11-16).
+ */
+const account = () => {
+	const env = process.env.USER;
+	if (env && env.length > 1) return env;
+	try {
+		return userInfo().username || "";
+	} catch {
+		return "";
+	}
+};
 import test from "node:test";
 import { isEscape, openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
 
@@ -196,7 +212,7 @@ test("a protocol stall and a paused run are stated in words on the screen", () =
 });
 
 test("redaction: a screenshot of the screen carries no account, home, repo path or host", () => {
-	const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
+	const user = account() || "someone";
 	const repo = `/home/${user}/projects/sample-project`;
 	// The redactor knows the facts a screenshot LEAKS: this machine's hostname, this account, this
 	// repo. A made-up host string is not one of them, so the fixture uses the real one.
@@ -216,7 +232,7 @@ test("--demo-redact: every printed field is masked with markers, and OFF is byte
 	// capture. The identity rides in THREE fields on purpose (goal, reason, operator note) — a
 	// redactor that only patches the header fails here, and the markers must REPLACE the text so
 	// the screen stays readable (a screenshot with the fields deleted proves nothing to a viewer).
-	const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
+	const user = account() || "someone";
 	const repo = `/home/${user}/projects/sample-project`;
 	const host = hostname();
 	const d = data({
