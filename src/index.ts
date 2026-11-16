@@ -10,6 +10,7 @@
  *   /orchestrate [--rounds N] <goal>   start a run (default 6 rounds, max 6)
  *   /orchestrate status                state, lane, round, tasks, phase log, path
  *   /orchestrate stop [--clear]        mark the run stopped (leave the resident lane)
+ *   /orchestrate lanes reset           clear the flip ledger and land the owed lane (the THRASH BREAKER's release)
  *   Alt+F                              the live panel: tasks, phases, engine metrics, swap cost
  *                                      (keys s/v/r/p/c/h act on the selected task; esc closes)
  *   /lanes                             live router census: both entries + health
@@ -19,7 +20,7 @@ import { basename, dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipGuarded, flipState, listLanes, loadLane, observeSwaps, routerBusy, type RouterBusy } from "./router.ts";
+import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
 import {
 	ACTIVE_FILENAME,
 	DEFAULT_ROUNDS,
@@ -116,9 +117,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let run: RunState | undefined;
 	let runDir: string | undefined;
 	let pending: { lane: string; phase: string } | undefined;
-	/** The lane switch currently open. A pre-unload deferral keeps it open for the whole gate
-	 *  budget, and overlapping `POST /v1/load` calls are the ping-pong the gate prevents. */
-	let switching: string | undefined;
 	let settledNotified = false;
 	let metrics: MetricsSnapshot | undefined;
 	let laneBest = 0;
@@ -132,12 +130,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  extension loading, where the probe throws. */
 	let chordResolved = false;
 	let probeHasAnswered = false;
-	/** True once the disclosure's probe (or the fallback chord table) says the host's own table
-	 *  BINDS the configured chord. That binds the SHORTCUT registration only: the panel's chord is
-	 *  claimed at the raw-input layer, so the row keeps naming the configured chord whenever a byte
-	 *  form exists (`DELIVERED_KEY`). The flag drives the disclosure's wording — a row that
-	 *  advertises a chord the extension never claims is a row that advertises a dead key. */
-	let chordHeld = false;
 	let turnSeq = 0;
 	let turnPhase: string | undefined;
 	let turnSwapMs = 0;
@@ -146,7 +138,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	/** The lane churn the flip guard observed, as the surfaces render it. `undefined` when the
 	 *  window is quiet, so a healthy run never advertises a flip. */
 	let flipBadge: FlipBadge | undefined;
-	/** The lane the router is loading RIGHT NOW, as the status row renders it. Set by `switchLane`
+	/** The lane the router is loading RIGHT NOW, as the status row renders it. Set by `runSwitch`
 	 *  for the loop's own swap and refreshed from the swap watch's /health samples, so the row is
 	 *  multicolored only while a pack is actually coming in; cleared the moment it lands. */
 	let swapPill: SwapPill | undefined;
@@ -274,7 +266,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (!run) return;
 		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
 		const r = refreshChecks(run, live);
-		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
+		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.redrafted} re-declared, ${r.to} total`, "info");
 		const root = refreshRoot(run, live);
 		if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run — ${root.to} (was ${root.from})`, "info");
 		if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run — refused: ${root.refused}`, "warning");
@@ -378,7 +370,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Hold the lane load while the router is SERVING, and say so out loud. `switchLane` calls
+	 * Hold the lane load while the router is SERVING, and say so out loud. `runSwitch` calls
 	 * this BEFORE `setModel`/`loadLane`: a model switch issued into a lane that is still serving
 	 * queues the request the router answers by swapping BACK. The gate is bounded
 	 * (GATE_POLL_MS/GATE_BUDGET_MS) and visible — the first busy poll notifies, every poll
@@ -407,16 +399,64 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	// The lane switch as one callable unit: `agent_end` (the single load site) and the overlay's
-	// v/c keys run the SAME sequence — setModel, setThinkingLevel, the settle-then-load router
-	// call, persist, paint, briefing. No queued-request window exists while a slash command runs,
-	// so calling it from a command is the same boundary discipline.
-	const switchLane = async (lane: string, ctx: ExtensionContext): Promise<void> => {
+	// v/c keys run the SAME sequence — the idle gate, the thrash breaker, setModel,
+	// setThinkingLevel, the settle-then-load router call, persist, paint, briefing. No
+	// queued-request window exists while a slash command runs, so calling it from a command is the
+	// same boundary discipline.
+	/**
+	 * ONE switch at a time. `agent_end`, the panel's v/c keys and a pause-resume can each want a
+	 * lane, and two switches running at once is exactly the ping-pong this file exists to stop:
+	 * `setModel` + `POST /v1/load` issued twice, `pending` overwritten by the later request, the
+	 * swap pill painted by a watch whose switch is already dead, and a briefing sent for a lane a
+	 * newer switch has replaced. Every caller goes through `requestLane`: requests queue on
+	 * `switchChain` in arrival order and carry a generation, and a link the chain reaches after a
+	 * newer request arrived (`gen !== switchGen`) does NOTHING — it never touches the router.
+	 */
+	let switchGen = 0;
+	let switchChain: Promise<void> = Promise.resolve();
+	const requestLane = (lane: string, ctx: ExtensionContext): void => {
+		const gen = ++switchGen;
+		switchChain = switchChain.then(() => (gen === switchGen ? runSwitch(lane, ctx, gen) : undefined)).catch(() => undefined);
+	};
+
+	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number): Promise<void> => {
 		const model = ctx.modelRegistry.find(PROVIDER, lane);
 		if (!model) {
 			fail(ctx, `model ${PROVIDER}/${lane} is not in the registry`);
 			return;
 		}
+		// The pre-unload idle gate FIRST, before a byte is sent: a switch issued into a lane that
+		// is still SERVING queues the request the router answers by swapping BACK. The gate is a
+		// DEFERRAL — the caller keeps `pending`, so the owed lane survives the whole wait — and an
+		// over-budget wait pays the load anyway, because a loop that never lands its lane is a
+		// stalled run. That decision is written into `rejection_history`, not just notified.
+		const gate = await gateRouterIdle(lane, ctx);
+		if (gate.over_budget && run) {
+			pushRejection(run, "task", `the ${lane} load was paid after the idle gate ran its full ${Math.round(GATE_BUDGET_MS / 1000)}s: ${gate.polls} polls, ${gate.last.reason}`);
+			persist();
+		}
+		// THE THRASH BREAKER. Refusing to reload the resident entry and printing a badge leave the
+		// loop paying 13-25 s and 52-130 GiB every time a competing client names the other entry.
+		// Past `FLIP_BREAKER_AT` swaps away from the run's lane the load IS the flip-flop, so
+		// NOTHING is sent: no setModel, no `POST /v1/load`. The loop halts, the lane stays owed in
+		// `pending`, and the notify names the one command that clears the ledger and lands it.
+		await observeSwaps();
+		const flip = flipState(run?.lane ?? lane, FLIP_WINDOW_MS);
+		if (flipBreaker(flip)) {
+			const who = flip.competing.join(", ") || "the other lane";
+			if (run) {
+				run.paused = true;
+				run.operator_note = `lane thrash: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; the loop is HALTED and paid no ${lane} load — /orchestrate lanes reset clears the ledger and lands it`;
+				pushRejection(run, "task", `LANE THRASH: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; ${lane} refused, loop halted, ZERO load paid`);
+				pending = { lane, phase: turnPhase ?? "lane" };
+			}
+			persist();
+			paint(ctx);
+			ctx.ui.notify(`orchestrate: LANE THRASH — ${flip.flips} swaps in ${flip.window_s}s naming ${who}: the loop is HALTED and paid no load. /orchestrate lanes reset clears the ledger and lands ${lane}.`, "error");
+			return;
+		}
 		const switched = await pi.setModel(model);
+		if (gen !== switchGen) return; // a newer request owns the lane: this link is dead
 		if (switched !== true && (switched as unknown as { switched?: boolean } | null)?.switched !== true) {
 			fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
 			return;
@@ -435,12 +475,19 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// swap is what decides "warm start" vs the 91 tok/s cold ramp.
 		const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
 		const watch = startSwapWatch(lane, moe, (percent) => {
-			if (!swapPill) return;
+			// A superseded switch's watch must never paint: its lane is not the one loading.
+			if (gen !== switchGen || !swapPill) return;
 			swapPill = { ...swapPill, percent };
 			paint(ctx);
 		});
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
 		const loaded = await loadLane(lane);
+		if (gen !== switchGen) {
+			// The pill, the row and the briefing belong to the switch that superseded this one; the
+			// watch is the only thing here that outlives the call, so it is the thing cancelled.
+			watch.cancel();
+			return;
+		}
 		ctx.ui.setWorkingMessage();
 		swapPill = undefined;
 		if (!loaded.ok) {
@@ -456,7 +503,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		persist();
 		paint(ctx);
 		await applyToolPolicy(lane);
+		if (gen !== switchGen) return;
 		setTimeout(async () => {
+			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
 			await ensurePhaseTool();
 			const text =
 				run!.state === "repair"
@@ -512,9 +561,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (!run.paused && pending) {
 			const deferred = pending;
 			pending = undefined;
-			void switchLane(deferred.lane, ctx);
+			requestLane(deferred.lane, ctx);
 		}
-		if (dir.next) void switchLane(dir.next, ctx);
+		if (dir.next) requestLane(dir.next, ctx);
 	};
 
 	const showPanel = async (ctx: ExtensionContext): Promise<void> => {
@@ -622,28 +671,29 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * The chord fact, as TEXT — the caller decides whether it is said at all. The probe decides when
-	 * it answers, the chord table when it cannot (`session_start` fires inside the loading-phase
-	 * window, where the probe throws). A chord the host does not bind is NOT announced: the row
-	 * above the editor names the key every round of the run, and the operator who has run the loop
-	 * once does not need the key contract reprinted at every login. The full contract
-	 * (`FADE_ORCHESTRATE_KEY`, the registered fallback, the raw-byte claim) is in `docs/OVERLAY.md`
-	 * and is proved by `test/pty_rig.mjs`.
+	 * The ONE chord worth a line at login: the one that CANNOT open the screen. A delivered chord
+	 * says nothing — the row above the editor names it every round, `docs/OVERLAY.md` carries the
+	 * contract and `test/pty_rig.mjs` proves it, so a working keyboard is not re-explained at every
+	 * session. A configured CONTROL chord is different: the host acts on the raw byte before any
+	 * listener sees it, so the row would advertise a dead key. That line names the fallback and the
+	 * variable, once per process.
+	 *
+	 * The probe decides when it answers; the chord table decides when it cannot (`session_start`
+	 * fires inside the loading-phase window, where the probe throws). A control chord the table
+	 * does not name stays unannounced: claiming a conflict nothing reported would be an invented
+	 * one, and the listener and `registerShortcut` both attempt the chord either way.
 	 */
 	const resolveChord = (): string | undefined => {
-		if (!CHORD || chordResolved) return undefined;
+		if (!CHORD || chordResolved || RAW_DELIVERABLE) return undefined;
 		const conflict = hostConflict(FADE_KEY);
 		const owner = (conflict?.keybindings?.[0] ?? conflict?.owner) as string | undefined;
 		const held = conflict !== undefined || (!probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true);
 		chordResolved = true;
-		chordHeld = held;
 		if (conflictReported) return undefined;
 		conflictReported = true;
 		if (!held) return undefined;
 		const who = conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "its key table";
-		return RAW_DELIVERABLE
-			? `the host binds ${keyLabel(FADE_KEY)} (${who}) and the extension claims the raw byte: ${keyLabel(DELIVERED_KEY)} opens the screen, ${keyLabel(FALLBACK_KEY)} is the fallback`
-			: `the host binds ${keyLabel(FADE_KEY)} (${who}): the screen opens on ${keyLabel(FALLBACK_KEY)} (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE)`;
+		return `the host binds ${keyLabel(FADE_KEY)} (${who}): the screen opens on ${keyLabel(FALLBACK_KEY)} (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE)`;
 	};
 
 	/** Apply one validated phase; returns the lane to load and the resulting state. */
@@ -952,7 +1002,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
 			// `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
 			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
@@ -999,6 +1049,35 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify("orchestrate: condensed handover sent", "info");
 				return;
 			}
+
+			// `/orchestrate lanes reset` — the THRASH BREAKER's release, the verb the halt names.
+			// `reset` alone is the run reset, so the lane verb carries its noun (`lane reset` is
+			// accepted too). It clears THIS process's flip ledger — the recorder, the badge and the
+			// breaker all start from a quiet window — unpauses the loop and lands the lane that was
+			// owed when the churn stopped the loop, which is the point: the operator has just dealt
+			// with the competing client, and the loop resumes on the lane it was refused.
+			if (first === "lanes" || first === "lane") {
+				if ((raw.split(/\s+/)[1] ?? "") !== "reset") {
+					ctx.ui.notify("orchestrate: `/orchestrate lanes reset` clears the flip ledger and lands the owed lane", "warning");
+					return;
+				}
+				if (!run) {
+					ctx.ui.notify("orchestrate: no run active", "info");
+					return;
+				}
+				const owed = pending;
+				pending = undefined;
+				resetFlipLedger();
+				flipBadge = undefined;
+				run.paused = false;
+				run.operator_note = undefined;
+				const wanted = owed?.lane ?? run.lane;
+				ctx.ui.notify(`orchestrate: flip ledger cleared; landing ${wanted}`, "info");
+				persist();
+				paint(ctx);
+				void requestLane(wanted, ctx);
+				return;
+			}
 			if (first === "skip" || first === "verify" || first === "reset" || first === "pause" || first === "halt" || first === "code") {
 				if (!run) {
 					ctx.ui.notify("orchestrate: no run active", "info");
@@ -1022,9 +1101,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				if (!run.paused && pending) {
 					const deferred = pending;
 					pending = undefined;
-					await switchLane(deferred.lane, ctx);
+					requestLane(deferred.lane, ctx);
 				}
-				if (dir.next) await switchLane(dir.next, ctx);
+				if (dir.next) requestLane(dir.next, ctx);
 				return;
 			}
 			if (first === "stop") {
@@ -1145,9 +1224,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			});
 		}
 		// AT MOST one line per login, and NOTHING on a free chord with no run: the operator knows
-		// the commands. The chord fact rides on the SAME line as the adopted run — one notify, not a
-		// paragraph plus a status line plus a resume notice. Detail is `/orchestrate status`, the
-		// panel, and `docs/OVERLAY.md`.
+		// the commands. A delivered chord is never explained; only an undeliverable configured
+		// control chord earns a clause, riding on the adopted run's own line. Detail is
+		// `/orchestrate status`, the panel, and `docs/OVERLAY.md`.
 		const chordNote = resolveChord();
 		const repo = ctx.cwd;
 		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
@@ -1159,9 +1238,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			settledNotified = false;
 			paint(ctx);
 			startMetricsTimer();
-			const key = keyLabel(DELIVERED_KEY);
 			if (TERMINAL[state.state] === true) {
-				runNote = `run ${state.run_id} is ${state.state} (${statePath()}) — ${key} opens the screen`;
+				runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
 			} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
 				// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
 				// same line as everything else the login says.
@@ -1169,9 +1247,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
 					if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
 				}, 250);
-				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1) · ${key} opens the screen`;
+				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
 			} else {
-				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state · ${key} opens the screen`;
+				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
 			}
 		}
 		const line = [chordNote, runNote].filter((n): n is string => n !== undefined).join(" · ");
@@ -1252,7 +1330,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify(`orchestrate: coding_done synthesized from git + gate (round ${run.round}); the verifier swap is paid once`, "warning");
 				void recordTurn("synthesized");
 				settledNotified = false;
-				await switchLane(applied.next, ctx);
+				requestLane(applied.next, ctx);
 				return;
 			}
 			if (tier === "stall") {
@@ -1290,9 +1368,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		void recordTurn(turnPhase ?? next.phase);
 		// THE SINGLE LOAD SITE, at the turn boundary: the previous turn is closed, so nothing is
 		// queued at the router naming the lane we are leaving — that queue is what flips the lane
-		// back seconds after a swap. `loadLane` settles an in-flight swap and refuses to reload
-		// the resident entry, so a round that wants the lane already resident pays 0 s.
-		await switchLane(next.lane, ctx);
+		// back seconds after a swap. `requestLane` puts the switch on the serial chain (ONE switch at
+		// a time), where the idle gate can defer it and the thrash breaker can refuse it outright;
+		// `loadLane` settles an in-flight swap and refuses to reload the resident entry, so a round
+		// that wants the lane already resident pays 0 s.
+		requestLane(next.lane, ctx);
 	});
 
 	// Enforcement: the verifier lane is read-only. An edit/write/apply_patch attempted while the
