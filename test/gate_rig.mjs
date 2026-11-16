@@ -264,6 +264,16 @@ const writeState = (s) => {
 };
 const readState = () => JSON.parse(readFileSync(join(repo, "var", "omp-orchestrate", "state.json"), "utf8"));
 const loads = () => reqLog.filter((r) => r === "POST /v1/load").length;
+/** The switch is queued on the serial chain, so a load lands a few ticks after the call that asked
+ *  for it. A fixed sleep overran on the CI runner — the gate's polls, the stub's HTTP and the gate's
+ *  check children share one loop there — and read "0 loads" where the loop paid exactly one. So the
+ *  rig settles on the count, bounded. A "ZERO loads" contract keeps its fixed sleep: absence is
+ *  proved by waiting, not by settling on a number that never arrives. */
+const settleLoads = async (from, want = 1, cap = 4000) => {
+	const t0 = Date.now();
+	while (loads() - from < want && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
+	return loads() - from;
+};
 const exec = (phase, payload) => tools.fade_phase.execute("id", { phase, payload: JSON.stringify(payload) }, null, null, ctx);
 
 const mod = await import("../.test-build/index.mjs");
@@ -334,16 +344,26 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   // The switch is queued on the serial chain (`requestLane`), so the loader runs a few ticks after
   // `agent_end` returns — and with `metricsOn` true the stub reports a slot ACTIVE, so the queued
   // switch first runs the idle gate's whole (millisecond) budget and pays the load as over-budget.
-  await new Promise((r) => setTimeout(r, 150));
+  // The switch is queued on the serial chain, so the load lands a few ticks after `agent_end`
+  // returns. The rig WAITS for it, bounded: a fixed 150 ms sleep overran on the CI runner (the
+  // gate's polls, the stub's HTTP and the check children share one loop there) and read 0 loads.
+  const got = await settleLoads(before, 1);
+  await new Promise((r) => setTimeout(r, 200)); // a double-pay, if the chain ever did one, lands here
   const after = loads();
   const s = readState();
-  ok("green gate lets agent_end issue exactly one load", after - before === 1, `${after - before}`);
+  ok("green gate lets agent_end issue exactly one load", got >= 1 && after - before === 1, `${after - before}`);
   ok("green gate reaches verifying", s.state === "verifying", s.state);
   // The async persist: the phase's state reached disk through tmp → fdatasync → rename on
   // `fs.promises`, so the boundary the rig reads shows a WHOLE record — a half file would throw
-  // inside `readState`, so reading it IS the proof — and no temp file survived the publish.
+  // inside `readState`, so reading it IS the proof. No temp file survives the publish; the temp
+  // check is a bounded wait (the publish is async) and a leak still fails, naming the file.
   const stateFile = join(repo, "var", "omp-orchestrate", "state.json");
-  const tmpSiblings = readdirSync(join(repo, "var", "omp-orchestrate")).filter((n) => n.endsWith(".tmp"));
+  const tmpAt = () => readdirSync(join(repo, "var", "omp-orchestrate")).filter((n) => n.endsWith(".tmp"));
+  let tmpSiblings = tmpAt();
+  for (let t0 = Date.now(); tmpSiblings.length > 0 && Date.now() - t0 < 4000; ) {
+    await new Promise((r) => setTimeout(r, 10));
+    tmpSiblings = tmpAt();
+  }
   ok(
 	"the async coalesced persist leaves a readable state file and no temp sibling",
 	existsSync(stateFile) && tmpSiblings.length === 0 && readState().run_id === "GATE1" && s.state === "verifying",
@@ -401,6 +421,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("tier 1: the nudge is sent to the resident lane", sent.some((m) => m.includes("Protocol nudge 1/2")), sent.join(" | ").slice(0, 140));
 
 	await hooks.agent_end({}, ctx); // miss 2 → synthesize from git + gate
+	await settleLoads(base, 1);
 	await new Promise((r) => setTimeout(r, 150)); // the queued switch clears the gate budget, then pays the swap
 	s = readState();
 	ok("tier 2: coding_done SYNTHESIZED from git + gate", s.synthesized?.phase === "coding_done" && s.state === "verifying", `${s.synthesized?.phase}/${s.state}`);
@@ -541,6 +562,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	await new Promise((r) => setTimeout(r, 60));
 	ok("a paused turn boundary defers the verifier load", loads() === base && notes.some((n) => n.includes("load is deferred")), `loads=${loads() - base} · ${(notes.slice(-1)[0] ?? "").slice(0, 90)}`);
 	await commands.orchestrate.handler("pause", ctx); // resume → the deferred load is paid
+	await settleLoads(base, 1);
 	await new Promise((r) => setTimeout(r, 60));
 	ok("resuming pays the deferred load exactly once", loads() - base === 1, `${loads() - base}`);
 	ok("the resumed run sits on the verifier lane", readState().state === "verifying", readState().state);
@@ -649,6 +671,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("no load is paid inside the phase call itself", loads() === l1, `loads=${loads() - l1}`);
 	await hooks.agent_end({}, ctx);
 	// Queued on the serial chain, so the loader runs a few ticks after `agent_end` returns.
+	await settleLoads(l1, 1);
 	await new Promise((r) => setTimeout(r, 60));
 	ok("the verifier swap is paid once for the refreshed green tree", loads() - l1 === 1, `loads=${loads() - l1}`);
 }
@@ -762,6 +785,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   notes.length = 0;
   const lReset = loads();
   await commands.orchestrate.handler("lanes reset", ctx);
+  await settleLoads(lReset, 1);
   await new Promise((r) => setTimeout(r, 200));
   const sReset = readState();
   ok("lanes reset clears the badge: no `lane flip:` row", !hasRow((widgets.get("fade-top")?.lines ?? []).join("\n"), "lane flip:"), (widgets.get("fade-top")?.lines ?? []).join("\n").slice(0, 240));
@@ -902,6 +926,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const base23 = loads();
   const res23 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
+  await settleLoads(base23, 1);
   await new Promise((r) => setTimeout(r, 60));
   ok("over the threshold the verifier swap is paid EXACTLY once", loads() - base23 === 1, `${loads() - base23}`);
   ok("over the threshold the run reaches verifying, not complete", readState().state === "verifying" && res23?.details?.fast_path === undefined, `${readState().state}/${JSON.stringify(res23?.details)}`);
@@ -917,6 +942,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const base24 = loads();
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
+  await settleLoads(base24, 1);
   await new Promise((r) => setTimeout(r, 60));
   ok("a round with a rejection is not a FIRST TRY, so the swap is paid", loads() - base24 === 1 && readState().state === "verifying", `${loads() - base24}/${readState().state}`);
 }
