@@ -39,7 +39,7 @@
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -60,8 +60,18 @@ delete process.env.PI_SESSION_ID;
 // `ERR_MODULE_NOT_FOUND .test-build/router.mjs`, and the gate's acceptance command must not.
 buildTestBundle();
 
-const repo = join(tmpdir(), "orch-gate-rig");
-rmSync(repo, { recursive: true, force: true });
+// ONE fixture per process, the same hygiene `test/pty_rig.mjs` carries (`mkdtempSync`, never a
+// fixed name). The fixture root is the plane everything lives under — `state.json`, the ledgers,
+// the router claim, the git repo — and the rigs run in parallel. With a fixed name and a
+// `rmSync` at entry, the second rig deletes the tree the first is mid-assertion on, and its first
+// `git rm -r --cached var` lands in the repo the other rig created seconds earlier (measured as
+// `fatal: pathspec 'var' did not match any files`, exit 128, in a rig whose every check had
+// printed `ok`).
+const repo = mkdtempSync(join(tmpdir(), "fade-gate-rig-"));
+// The fixture is unique per process, so nothing sweeps a dead rig's tree at the next entry: this
+// hook removes it on the success path, on the `exit(1)` path, and on a throw between them — a rig
+// that dies mid-assertion leaves no multi-megabyte tree in /tmp for the next CI run to find.
+process.on("exit", () => rmSync(repo, { recursive: true, force: true }));
 mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
 
 // The run root IS a working tree BEFORE the extension loads. `isGitRepo` caches its probe for

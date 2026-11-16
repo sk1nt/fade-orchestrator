@@ -15,7 +15,7 @@ const task = (id, status, over = {}) => ({ id, objective: `${id} objective: ${"l
 
 const run = (over = {}) => ({
 	run_id: "20300101T113829Z-gbut",
-	goal: "complete the plugin work: Ctrl+O opens the orchestration screen with metrics",
+	goal: "complete the plugin work: Alt+F opens the orchestration screen with metrics",
 	lane: "deepseek",
 	round: 2,
 	max_rounds: 6,
@@ -45,7 +45,7 @@ const data = (over = {}) => ({
 	],
 	moe: [{ label: "MoE deepseek", value: "live · warm (4 slots)", tone: "ok" }],
 	turns: [],
-	swaps: [{ key: "fade.omp_orchestrate.swap.v1", at: "2030-01-01T12:10:00.000Z", from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "cold_ramp", load_percent: 100 }],
+	swaps: [{ key: "fade.omp_orchestrate.swap.v1", at: "2030-01-01T12:10:00.000Z", from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "cold_ramp" }],
 	context: { tokens: 41234, window: 1048576, percent: 3.9 },
 	gate: run().gate_last,
 	critique: "T3 died: the rig asserts a line that never renders",
@@ -110,6 +110,10 @@ test("the screen fits 120 columns and carries every section in one view", () => 
 	assert.ok(hasRow(s, "gate RED 1/2 failing"), "the gate result rides");
 	assert.ok(s.includes("LANE SWAPS"), "the swap table rides");
 	assert.ok(hasRow(s, "deepseek → flash-next 14.2s · 91→130 tok/s · cold ramp"), "the measured swap cost rides");
+	assert.ok(hasRow(s, "swaps this run 0 · older runs only"), "the run's own cost rides, and a ledger of unattributed rows prices it at nothing this run can prove");
+	const bill = r.lines.findIndex((l) => l.includes("swaps this run"));
+	const table = r.lines.findIndex((l) => l.includes("deepseek → flash-next"));
+	assert.ok(bill >= 0 && table >= 0 && bill < table, "the run's bill sits ABOVE the plane's swap table: two questions, in reading order");
 	assert.ok(s.includes("LAST VERIFIER CRITIQUE"), "the critique rides");
 	assert.ok(s.includes("RECENT REJECTIONS"), "the rejections ride");
 	assert.ok(s.includes("LANE FLIP"), "the flip guard rides");
@@ -476,4 +480,12 @@ test("esc: a kitty RELEASE, ESC+modifier, modifyOtherKeys of another key, and an
 	c.handleInput("q");
 	assert.deepEqual(closed, [{ key: "close" }], "q must still close");
 	c.dispose();
+});
+
+test("the swap block bills a run whose ledger rows carry its id", () => {
+	// The plane's ledger is shared by every run. The bill is the stamped rows only: the same fixture
+	// with the stamp present must read the measured cost, and never a zero for a paid swap.
+	const stamped = data({ swaps: [{ ...data().swaps[0], run_id: "20300101T113829Z-gbut" }] });
+	const s = joined(panelLines(stamped, 120, { sel: 0 }));
+	assert.ok(hasRow(s, "swaps this run 1 · 14.2s paid"), s.slice(0, 400));
 });

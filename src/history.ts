@@ -5,20 +5,20 @@
  * pack swap is only justifiable once what swaps cost has been measured.
  *
  * Alongside it, the per-turn telemetry ledger: `metrics.jsonl`, one JSON record per completed
- * turn, append-only — the per-turn `pp`/`tg`/`ttft`/`kv_hit_pct`/`swap_ms` record a postmortem
- * reads line by line.
+ * turn, appended until the byte cap rotates it (`appendTurn`) — the per-turn
+ * `pp`/`tg`/`ttft`/`kv_hit_pct`/`swap_ms` record a postmortem reads line by line.
  *
  * Every read and write here is `fs.promises`, and `readTurns` reads a TAIL (default
- * `turnTail()`, env `FADE_ORCHESTRATE_TURN_TAIL`), never the whole append-only file: the panel
- * asks for both ledgers on the Alt+F keystroke and on its 2 s refresh tick, on the TUI's loop.
+ * `turnTail()`, env `FADE_ORCHESTRATE_TURN_TAIL`), never the whole file: the panel asks for both
+ * ledgers on the Alt+F keystroke and on its 2 s refresh tick, on the TUI's loop.
  */
 import { join } from "node:path";
-import { appendFile, mkdir, open, type FileHandle } from "node:fs/promises";
+import { appendFile, mkdir, open, rename, stat, type FileHandle } from "node:fs/promises";
 import { readJsonAsync, writeJsonAsync } from "./core.ts";
 import type { LaneMoe } from "./moe.ts";
 
 export const HISTORY_FILENAME = "swap_history.json";
-/** Per-turn telemetry ledger: one JSON record per completed turn, append-only. */
+/** Per-turn telemetry ledger: one JSON record per completed turn, rotated past the byte cap. */
 export const METRICS_JSONL_FILENAME = "metrics.jsonl";
 /** The cold/hot decode boundary. 120 sits under deepseek's ~130 steady line and over its
  *  ~91 tok/s cold ramp, and well under flash-next's 480-647. */
@@ -47,6 +47,10 @@ export interface SwapRow {
 	/** The lane's MoE placement state at the moment the swap started (moe.ts): warm start or not. */
 	moe?: LaneMoe;
 	at: string;
+	/** The run that PAID this swap. A row written before the field existed has none, and
+	 *  `summarizeSwaps` never charges such a row to the run asking — the panel's `swaps this run`
+	 *  row names that gap instead of reading another run's cost as this run's. */
+	run_id?: string;
 }
 
 /**
@@ -70,9 +74,21 @@ export async function appendSwap(dir: string, row: SwapRow): Promise<void> {
  * The badge class for a first-completion rate. A restored placement map wins: that start was
  * warm by construction, whatever the first rate happens to read.
  */
+
 export function rampClass(decodeTps: number | undefined, mapRestored: boolean, threshold = HOT_STEADY_TPS): "cold_ramp" | "hot_steady" | "map_restored" {
 	if (mapRestored) return "map_restored";
 	return decodeTps !== undefined && decodeTps >= threshold ? "hot_steady" : "cold_ramp";
+}
+
+/**
+ * What ONE run paid in pack swaps, counted and summed over the rows stamped with its `run_id`.
+ * A row with no `run_id` is never charged to anyone: an unattributed cost is not this run's cost.
+ * The total is one decimal, the unit the screen and `/orchestrate status` both print.
+ */
+export function summarizeSwaps(rows: SwapRow[], runId: string): { count: number; total_elapsed_s: number } {
+	const mine = rows.filter((r) => r.run_id === runId);
+	const total = mine.reduce((s, r) => s + (typeof r.elapsed_s === "number" ? r.elapsed_s : 0), 0);
+	return { count: mine.length, total_elapsed_s: Math.round(total * 10) / 10 };
 }
 
 /**
@@ -137,10 +153,47 @@ export function turnRecordOrNull(m: TurnMetrics | undefined, id: TurnIdentity): 
 	};
 }
 
-/** Exactly one newline-terminated line per call, into `${dir}/metrics.jsonl` (dir created). */
+/** The ledger's size cap in bytes; `FADE_ORCHESTRATE_LEDGER_MAX_BYTES` moves it and `0` disables
+ *  rotation. Read at CALL time, like `turnTail()`: it is configuration, not a build constant. */
+export const LEDGER_MAX_BYTES_DEFAULT = 8_388_608;
+export const ledgerMaxBytes = (): number => {
+	const raw = process.env.FADE_ORCHESTRATE_LEDGER_MAX_BYTES;
+	if (raw === undefined || raw === "") return LEDGER_MAX_BYTES_DEFAULT;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : LEDGER_MAX_BYTES_DEFAULT;
+};
+
+/**
+ * Exactly one newline-terminated line per call, into `${dir}/metrics.jsonl` (dir created) — past
+ * the cap, rotate first.
+ *
+ * The ledger is append-only, so a long-lived plane grows it without bound. Past the cap the
+ * current file is ROTATED to `metrics.jsonl.1` (the older `.1` is replaced) and the append starts
+ * a fresh current file: one predecessor, enough for a postmortem, bounded on disk.
+ *
+ * `readTurns` reads the CURRENT file only, so a rotated-out tail is a postmortem file and not a
+ * screen row — the honest reading, and the one the panel can still reach in bounded time.
+ */
 export async function appendTurn(dir: string, rec: TurnRecord): Promise<void> {
 	await mkdir(dir, { recursive: true });
-	await appendFile(join(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}\n`);
+	const path = join(dir, METRICS_JSONL_FILENAME);
+	const cap = ledgerMaxBytes();
+	if (cap > 0) {
+		let size = 0;
+		try {
+			size = (await stat(path)).size;
+		} catch {
+			size = 0;
+		}
+		if (size > cap) {
+			try {
+				await rename(path, `${path}.1`);
+			} catch {
+				/* a rotation race loses to the winner: the append below still lands, in one file */
+			}
+		}
+	}
+	await appendFile(path, `${JSON.stringify(rec)}\n`);
 }
 
 /** The tail bound: how many of the newest turn records a reader ever asks for. */

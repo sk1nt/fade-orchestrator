@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { claimRow, clockOf, collectScreen, compactNumber, formatElapsed, gateRows, laneRows, nameResidentRow, sparkline, swapRows, turnRows } from "../.test-build/screendata.mjs";
+import { claimRow, clockOf, collectScreen, compactNumber, formatElapsed, gateRows, laneRows, nameResidentRow, sparkline, swapRows, swapSummaryRow, turnRows } from "../.test-build/screendata.mjs";
 import { moeCacheRow, tiersFromMetrics } from "../.test-build/livedata.mjs";
 import { moeRows } from "../.test-build/moe.mjs";
 
@@ -379,4 +379,33 @@ test("the claim row names this run, a foreign holder, free, and not measured, wi
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+// ── the run's own swap bill: a shared ledger, one run's cost ──────────────────────────────────
+// `swap_history.json` belongs to the plane, not to a run: every run appends to it. The screen's
+// per-run row therefore prices THIS run's stamped rows only, and both ways of paying nothing are
+// NAMED — an empty ledger, and a ledger whose rows all predate attribution. A cost is never
+// transferred from a neighbour's run to this one, and a paid swap is never shown as zero.
+const swapRow = (elapsed_s, run_id, at = "2030-01-01T12:10:00.000Z") => ({
+	from: "deepseek",
+	to: "flash-next",
+	elapsed_s,
+	first_tg: 91,
+	steady_tg: 130,
+	percent_path: [],
+	at,
+	...(run_id ? { run_id } : {}),
+});
+
+test("swaps this run prices this run, and names the two ways it paid nothing", () => {
+	assert.deepEqual(
+		swapSummaryRow([swapRow(14.04, "MINE"), swapRow(2.6, "MINE"), swapRow(30, "OTHER")], "MINE"),
+		{ label: "swaps this run", value: "2 · 16.6s paid", tone: "ok" },
+		"count and total over the stamped rows, the foreign row excluded",
+	);
+	assert.deepEqual(swapSummaryRow([swapRow(30, "OTHER")], "MINE"), { label: "swaps this run", value: "0 · older runs only", tone: "dim" }, "a ledger full of another run's swaps is not this run's bill");
+	assert.deepEqual(swapSummaryRow([swapRow(30)], "MINE"), { label: "swaps this run", value: "0 · older runs only", tone: "dim" }, "a row with no run_id predates attribution: never charged to a run");
+	assert.deepEqual(swapSummaryRow([], "MINE"), { label: "swaps this run", value: "0 · no swaps measured", tone: "dim" }, "an empty ledger is named, never a measured zero");
+	// The table below the bill is the plane's, newest first, and its rows are unchanged by the bill.
+	assert.equal(swapRows([swapRow(14.2, "OTHER")]).length, 1, "the per-swap table keeps reading the whole ledger");
 });

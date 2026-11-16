@@ -11,6 +11,7 @@
  *   /orchestrate status                state, lane, round, tasks, phase log, path
  *   /orchestrate stop [--clear]        mark the run stopped (leave the resident lane)
  *   /orchestrate lanes reset           clear the flip ledger and land the owed lane (the THRASH BREAKER's release)
+ *   /orchestrate runs                  the archived finished runs, newest first
  *   Alt+F                              the live panel: tasks, phases, engine metrics, swap cost
  *                                      (keys s/v/r/p/c/h act on the selected task; esc closes)
  *   /lanes                             live router census: both entries + health
@@ -46,12 +47,13 @@ import {
 } from "./core.ts";
 import { chordBytes, keyLabel, modelLabel, ORCH_STATUS_KEY, OVERLAY_WIDGET_KEY, statusLines, TOP_WIDGET_KEY, type FlipBadge, type SwapPill } from "./ui.ts";
 import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keymap.ts";
-import { appendTurn, turnRecordOrNull } from "./history.ts";
+import { appendTurn, readSwaps, summarizeSwaps, turnRecordOrNull } from "./history.ts";
 import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, startSwapWatch, type MetricsSnapshot } from "./livedata.ts";
 import { handoverText } from "./core.ts";
 import { engineProofInvalidate, laneMoe } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
 import { collectScreen, formatElapsed, type ScreenData } from "./screendata.ts";
+import { RUNS_DIRNAME, archiveRun, listRuns } from "./runs.ts";
 
 // The panel key. The default is `alt+f`, not `ctrl+o`: the host binds `ctrl+o` to
 // `app.tools.expand` and ACTS on its own bindings, so the screen cannot live there. The host's
@@ -564,7 +566,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		}
 		if (from && runDir && from !== lane) {
 			turnSwapMs += Math.round(loaded.elapsed_s * 1000);
-			void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
+			void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id).then(() => paint(ctx));
 		}
 		if (run) run.lane = lane;
 		await persist();
@@ -1076,7 +1078,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
 			// `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
 			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
@@ -1106,11 +1108,32 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// `started` prints no age rather than a guessed one.
 				const started = claim && Number.isFinite(Date.parse(claim.started)) ? Date.parse(claim.started) : NaN;
 				const held = Number.isFinite(started) ? ` · held ${formatElapsed(Math.max(0, (Date.now() - started) / 1000))}` : "";
+				// The swap cost THIS run paid, from the ledger rows stamped with its run_id. A run
+				// that paid no swap says so; it never prints a bare `0s`, which would read as a
+				// measured zero for a thing that never happened.
+				const cost = runDir ? summarizeSwaps(await readSwaps(runDir), run.run_id) : { count: 0, total_elapsed_s: 0 };
+				const paid = cost.count > 0 ? `swaps ${cost.count} · ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
+				return;
+			}
+			if (first === "runs") {
+				// The shelf the start writes. `state.json` is ONE slot, so a finished run is only
+				// answerable afterwards from `<dir>/runs/<run_id>.json`: this verb is how the
+				// operator reads it. Newest first, five lines: the last runs, not the whole shelf.
+				const dir = runDir ?? join(ctx.cwd, "var", "omp-orchestrate");
+				const archived = await listRuns(dir);
+				if (archived.length === 0) {
+					ctx.ui.notify(`orchestrate: no archived runs in ${join(dir, RUNS_DIRNAME)}`, "info");
+					return;
+				}
+				for (const r of archived.slice(0, 5)) {
+					ctx.ui.notify(`run ${r.run_id}: ${r.state} · ${r.rounds} rounds · ${r.tasks_passed}/${r.tasks_total} tasks · ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
+				}
+				if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join(dir, RUNS_DIRNAME)}`, "info");
 				return;
 			}
 			if (first === "overlay") {
@@ -1274,7 +1297,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
 				return;
 			}
+			// `state.json` is ONE slot: this keystroke overwrites the run it adopted, and the finished
+			// one is then unanswerable. Archive a TERMINAL previous run into ITS repo's `runs/` dir
+			// first, so the record stays with the tree it was paid on. A run that is not terminal is
+			// left alone — a run live in another session is not this keystroke's to rewrite.
+			const previous = run;
 			runDir = join(repo, "var", "omp-orchestrate");
+			if (previous && TERMINAL[previous.state] === true) {
+				const archived = await archiveRun(join(previous.repo || repo, "var", "omp-orchestrate"), previous);
+				if (archived) ctx.ui.notify(`orchestrate: the finished run ${previous.run_id} is archived at ${archived}`, "info");
+			}
 			run = {
 				key: STATE_KEY,
 				run_id: runId,

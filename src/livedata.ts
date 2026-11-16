@@ -220,8 +220,10 @@ export function coldHot(tok_s: number | undefined, laneBest: number | undefined)
 export interface SwapWatchHandle {
 	/** Stop sampling without writing a row (failure path). */
 	cancel(): void;
-	/** Await the swap completing (bounded), compute first/steady rates, append the history row. */
-	finish(from: string, to: string, elapsed_s: number, dir: string): Promise<SwapRow | undefined>;
+	/** Await the swap completing (bounded), compute first/steady rates, append the history row.
+	 *  `runId` stamps the row with the run that paid it, so the per-run cost is answerable from
+	 *  the ledger; a watch that names no run writes an unattributed row, never a guessed owner. */
+	finish(from: string, to: string, elapsed_s: number, dir: string, runId?: string): Promise<SwapRow | undefined>;
 }
 
 /**
@@ -258,7 +260,7 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 		cancel() {
 			stopped = true;
 		},
-		async finish(from, toLane, elapsed_s, dir) {
+		async finish(from, toLane, elapsed_s, dir, runId?) {
 			stopped = true;
 			if (!sawSwap && from === toLane) return undefined;
 			const m = await fetchJson<Record<string, any>>(`${ROUTER}/metrics`);
@@ -293,6 +295,7 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 				ramp: rampClass(first, mapRestored),
 				percent_path: percentPath.slice(0, 60),
 				...(moe ? { moe } : {}),
+				...(runId ? { run_id: runId } : {}),
 				at: new Date().toISOString(),
 			};
 			await appendSwap(dir, row);

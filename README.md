@@ -159,6 +159,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_FLIP_WINDOW_MS` / `_FLIP_MIN_SWAPS` / `_FLIP_BREAKER_AT` | `120000` / `2` / `4` | the flip window, the count that badges it, and the count that halts the loop. At the breaker a switch issues no `setModel` and no `POST /v1/load`, the run pauses with the flips named, and `/orchestrate lanes reset` clears the ledger and lands the owed lane |
 | `FADE_ORCHESTRATE_SWITCH_GLYPH` | U+F051F | the icon on the model-switch row, in the same Nerd Font private-use family as the status glyph; an empty value removes it and its space (`test/ui_status.test.mjs`) |
 | `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so the keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call, and a lane load drops the cache. Measured on this box (1103 processes): one walk 2-4 ms, so the TTL is what keeps that out of the panel's refresh path |
+| `FADE_ORCHESTRATE_LEDGER_MAX_BYTES` | `8388608` | the turn ledger's size cap: past it, `metrics.jsonl` rotates to `metrics.jsonl.1` (the older `.1` is replaced) and the append starts a fresh file. `0` disables rotation; `readTurns` reads the current file only, so the rotated-out tail is a postmortem file (`node --test test/history.test.mjs`) |
 
 ## Surface and commands
 
@@ -178,7 +179,7 @@ listener sees the byte gets a login clause: once per process, on the run's own l
 never prints a key that opens nothing.
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run. It claims the router first (one orchestrator per router: the router carries one resident lane, one live-turn ledger and one flip guard, so two runs on one router would each gate the other's working tree). A claim held by a live pid refuses, naming the pid, run, repo and host; a claim whose owner died is reclaimed. Then it preflights the router: the think lane must load.
-- `/orchestrate status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`
+- `/orchestrate status | overlay | runs | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]` — `status` ends with the swap cost this run paid (`swaps 3 · 41.2s paid`, or `0 swaps`); `runs` prints the archived finished runs, newest first
 - `/orchestrate handover` — send the condensed digest now (any time, mid-run).
 - `/lanes` — live router census (both entries' status + `/health`).
 
@@ -188,6 +189,13 @@ result, protocol counters, `paused` + `operator_note`, synthesized-phase marker,
 `swap_history.json`, `metrics_state.json`, `metrics.jsonl`. v1 files are migrated on resume. Every
 write is `.tmp` → `fsync` → rename → `fsync` of the directory, so a `kill -9` mid-write leaves the
 previous phase parseable.
+
+**A finished run stays readable.** `state.json` is one slot, so a start archives the TERMINAL run it
+is about to overwrite into `runs/<run_id>.json` (a run that is not terminal is left alone, and an
+archive already on the shelf is never rewritten); `/orchestrate runs` reads the shelf back.
+`metrics.jsonl` is append-only, so past `FADE_ORCHESTRATE_LEDGER_MAX_BYTES` it rotates to
+`metrics.jsonl.1`, one predecessor kept — the screen reads the current file, so a rotated-out tail is
+a postmortem file, not a panel row.
 
 ## MoE expert placement (last known placement between turns)
 
@@ -328,6 +336,7 @@ src/moe.ts        per-lane MoE placement: the serve config, the live/unsupported
 test/             unit tests, the gate rig (fake host), the RPC rig, the pty rig (real terminal)
 docs/OVERLAY.md   the surface: layout, metrics, keys, redaction, proof inventory
 docs/quant-choice.md the IQ1_M pin: the measurement, the method, the reproduce commands
+docs/FEATURES.md  the feature sweep: each proposal, the code that shows the gap, its cost, the command that accepts it
 ```
 
 ## License

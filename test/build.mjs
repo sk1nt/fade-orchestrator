@@ -37,6 +37,7 @@ export function buildTestBundle() {
     "src/ui.ts",
     "src/screendata.ts",
     "src/panel.ts",
+    "src/runs.ts",
     "src/router.ts",
     "--bundle",
     "--format=esm",

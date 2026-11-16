@@ -1,7 +1,7 @@
 {
   "name": "fade-orchestrator",
   "version": "0.1.0",
-  "description": "OMP extension: one session, two basalt router lanes — a thinking pack plans and verifies, a fast pack codes, driven by the fade_phase contract.",
+  "description": "Two-lane OMP coding-agent orchestrator for a local basalt router: phase contract, pre-swap gate, swap history, Alt+F overlay.",
   "type": "module",
   "license": "MIT",
   "engines": {

@@ -24,7 +24,7 @@
  */
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { OVERLAY_WIDGET_KEY, redact, redactOn, shortState } from "./ui.ts";
-import { compactNumber, formatElapsed, gateRows, swapRows, turnRows, clockOf, type MetricRow, type ScreenData } from "./screendata.ts";
+import { compactNumber, formatElapsed, gateRows, swapRows, swapSummaryRow, turnRows, clockOf, type MetricRow, type ScreenData } from "./screendata.ts";
 
 /** The panel's refresh tick. The router's /metrics is a local request; 2 s keeps it honest and cheap. */
 export const PANEL_REFRESH_MS = Math.max(500, Number(process.env.FADE_ORCHESTRATE_PANEL_REFRESH_MS ?? 2000));
@@ -195,9 +195,12 @@ function metricBlock(d: ScreenData, theme: PanelTheme | undefined, width: number
 function swapBlock(d: ScreenData, theme: PanelTheme | undefined, width: number): string[] {
 	const rows = swapRows(d.swaps);
 	const lines = [label(theme, "LANE SWAPS")];
-	if (rows.length === 0) return [...lines, "  (no swaps recorded yet)"];
-	// 22, not the metric cap: the label is a lane pair, and cutting it loses the lane the swap went to.
-	return [...lines, ...metricLines(rows, theme, width, 22)];
+	// The run's own cost, FIRST: the table below is the plane's last swaps, which answers a
+	// different question. Its label is metric-length, so it takes the metric cap (18), while the
+	// lane pairs below keep the 22-column cap that a lane pair needs.
+	const summary = metricLines([swapSummaryRow(d.swaps, d.run.run_id)], theme, width);
+	if (rows.length === 0) return [...lines, ...summary, "  (no swaps recorded yet)"];
+	return [...lines, ...summary, ...metricLines(rows, theme, width, 22)];
 }
 
 function tailBlocks(d: ScreenData, theme: PanelTheme | undefined, width: number): string[] {

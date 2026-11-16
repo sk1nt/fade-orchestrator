@@ -61,6 +61,14 @@ state read "ctrl+o opens nothing" — the row and the key disagreeing on one scr
 asserts the label in BOTH states (`[Alt+F]` delivered, `[Alt+Shift+I]` held), and `statusLines()`
 defaults to the delivered chord, never to `Ctrl+O`.
 
+**`/orchestrate status` is the line this row answers.** It prints the run id, state, lane, round,
+task count, phase count, the router claim with its age, and the swap cost the run paid — `swaps 3 ·
+41.2s paid`, summed by `summarizeSwaps` over the `swap_history.json` rows stamped with this run's
+`run_id`. A run that paid no swap prints `0 swaps`, never a `0s` that reads as a measured zero.
+`/orchestrate runs` reads the shelf a start writes: `<dir>/runs/<run_id>.json` for each finished
+run, newest first, five lines. `state.json` is one slot, so a start archives the TERMINAL run it is
+about to overwrite and leaves a run that is not terminal untouched.
+
 ## The panel's key: `alt+f` at the raw-input layer, the fallback, the escape encodings
 
 The key was chosen by two measurements; the first was insufficient.
@@ -237,6 +245,7 @@ is the ledger's, and it holds repo-wide: **an absent reading is named, never ren
 | `gate` | the run's last pre-swap gate | `no gate run this round`; a red gate prints every failing command under `  red` |
 | turn rows | `metrics.jsonl`, one line per turn | `no turn telemetry (the router reported no pp/tg)` |
 | swap rows | `swap_history.json` | `(no swaps recorded yet)` + a `NOT MEASURED` entry |
+| `swaps this run` | `summarizeSwaps` over `swap_history.json` rows whose `run_id` is this run's | `0 · no swaps measured` when the ledger is empty; `0 · older runs only` when every row predates this run — a cost is never charged to a run that paid none, and never read off another run's rows |
 
 **The fixture speaks the measured payload, not an invented one.** basalt 0.4.0 nests the tier fields
 under `engine`, answers `/health` `loaded` as a boolean with the lane under `model`, leaves

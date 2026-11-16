@@ -13,7 +13,7 @@
  */
 import type { GateResult, RunState } from "./core.ts";
 import type { InstanceLock } from "./core.ts";
-import { readTurns, readSwaps, type SwapRow, type TurnRecord } from "./history.ts";
+import { readTurns, readSwaps, summarizeSwaps, type SwapRow, type TurnRecord } from "./history.ts";
 import { fetchMetrics, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
 import { moeBalanceRows, moeRows } from "./moe.ts";
 import { ROUTER } from "./router.ts";
@@ -153,6 +153,20 @@ export function swapRows(swaps: SwapRow[]): MetricRow[] {
 			value: `${s.elapsed_s.toFixed(1)}s · ${Math.round(s.first_tg)}→${Math.round(s.steady_tg)} tok/s · ${ramp} · ${clockOf(s.at)}`,
 		};
 	});
+}
+
+/**
+ * The run's OWN swap cost, printed above the table of individual swaps.
+ *
+ * Three readings, and the absent one is named, never a zero this run is charged with:
+ * `0 · no swaps measured` for an empty ledger; `0 · older runs only` when every row predates this
+ * run (the ledger is shared by the plane, so another run's cost is not this run's); and
+ * `<count> · <total>s paid` for the rows stamped with this run's `run_id`.
+ */
+export function swapSummaryRow(swaps: SwapRow[], runId: string): MetricRow {
+	const { count, total_elapsed_s } = summarizeSwaps(swaps, runId);
+	if (count > 0) return { label: "swaps this run", value: `${count} · ${total_elapsed_s.toFixed(1)}s paid`, tone: "ok" };
+	return { label: "swaps this run", value: swaps.length === 0 ? "0 · no swaps measured" : "0 · older runs only", tone: "dim" };
 }
 
 /** The pre-swap gate as one row: a red gate is the reason a round repeated. */
