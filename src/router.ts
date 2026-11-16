@@ -286,6 +286,15 @@ export async function routerBusy(): Promise<RouterBusy> {
  */
 export const FLIP_WINDOW_MS = Number(process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS ?? 120_000);
 export const FLIP_MIN_SWAPS = Number(process.env.FADE_ORCHESTRATE_FLIP_MIN_SWAPS ?? 2);
+/**
+ * The THRASH BREAKER's count. `FLIP_MIN_SWAPS` is the point where the churn is loud enough to
+ * NAME on the row; this is the point where the loop STOPS PAYING for it. At this many swaps away
+ * from the run's lane inside the window, the next `POST /v1/load` is not a lane change, it is one
+ * flip of a flip-flop the router has already measured at 13-25 s and 52-130 GiB each, so the load
+ * is refused and the loop halts with the evidence in front of the operator. One above the guard,
+ * so a run is never halted by churn the badge alone already reports.
+ */
+export const FLIP_BREAKER_AT = Number(process.env.FADE_ORCHESTRATE_FLIP_BREAKER_AT ?? 4);
 
 /** One swap the router reported, as observed by this process. */
 export interface RouterSwapRow {
@@ -307,6 +316,17 @@ export interface FlipState {
 
 const swapLog: RouterSwapRow[] = [];
 let lastSwapSig = "";
+
+/**
+ * Forget THIS process's observation of the router's swap lines: the recorder, the badge and the
+ * breaker start from a quiet window. It does not touch the router — a swap in flight there is
+ * still in flight and the next `/health` read records it — it clears the loop's memory of the
+ * churn it has watched, which is what the operator asks for once the competing client is gone.
+ */
+export function resetFlipLedger(): void {
+	swapLog.length = 0;
+	lastSwapSig = "";
+}
 
 /** The entry the router is holding right now, or `undefined` when it names none. */
 export async function residentLane(): Promise<string | undefined> {
@@ -349,6 +369,9 @@ export function flipState(resident: string | undefined, windowMs = FLIP_WINDOW_M
 
 /** True once the window holds enough churn to call it a flip. */
 export const flipGuarded = (f: FlipState): boolean => f.flips >= FLIP_MIN_SWAPS;
+
+/** True once a flip is the plan: the next load is the thrash, so the loop refuses it and halts. */
+export const flipBreaker = (f: FlipState): boolean => f.flips >= FLIP_BREAKER_AT;
 
 /** The clause a load detail carries when the guard is active, so the cost is never silent. */
 export const flipNote = (f: FlipState): string => (flipGuarded(f) ? ` — FLIP GUARD: ${f.flips} swaps in ${f.window_s}s, requests naming ${f.competing.join(", ") || "the other lane"}` : "");
