@@ -152,11 +152,12 @@ opts into the host's status-bar row. The single authority for the surface — th
 format, the ramp, the model-naming rule, the chord's measured history, the panel's rows and keys,
 redaction, and the proof inventory — is [`docs/OVERLAY.md`](docs/OVERLAY.md).
 
-**A login says at most one line.** With no run and a chord the host leaves free, it says nothing:
-the row above the editor names the key every round, and `/orchestrate status` answers the run. A
-contended chord is named **once per process**, riding on the same line as the adopted run — the key
-contract (fallback chord, `FADE_ORCHESTRATE_KEY`, the raw-byte claim) lives in the docs, not in
-every session's scrollback.
+**A login says at most one line, and it is about the run.** With no run it says nothing: the row
+above the editor names the key every round, and `/orchestrate status` answers the run. A delivered
+chord is never explained at login — the key contract (fallback chord, `FADE_ORCHESTRATE_KEY`, the
+raw-byte claim) lives in the docs. Only a configured control chord, which the host acts on before
+any listener sees the byte, earns a clause: once per process, on the run's own line, so the row
+can never advertise a key that opens nothing.
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run (preflights the router: think lane must load).
 - `/orchestrate status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`
@@ -244,13 +245,14 @@ Ways to load it:
 ## Tests
 
 ```bash
-npm test                 # 156 unit tests: keymap, state v2, gate (off the event loop, and its
+npm test                 # unit tests: keymap, state v2, gate (off the event loop, and its
                         # total budget kills a hung row), MoE, history, livedata, the screen's
                         # renderer (every ESC encoding closes), the screen's data contract, the
                         # status line
 npm run test:gate        # the gate rig — a host-less CI gate (fake pi + stub router): the whole
                          # phase protocol, the pre-swap gate (zero loads on red, the row named as
-                         # it runs), the Alt+F raw listener, the ONE login line, the fast path, the
+                         # it runs), the Alt+F raw listener, the login line that names only the
+                         # run, the fast path, the
                          # --demo-redact surface, the top-widget surface
 node test/load_hostile.mjs # the pre-unload gate against a hostile /health (error state,
                          # zero/low VRAM, no model, swap in flight, unreachable): ZERO
