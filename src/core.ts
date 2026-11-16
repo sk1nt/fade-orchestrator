@@ -746,7 +746,7 @@ export function applyDone(run: RunState, done: DoneEntry[]): Task[] {
 
 /**
  * The run root's git state, said out loud where it changes what the loop can prove. Measured
- * 2026-11-15 on run 20261115T193201Z-vsuq (repo fade-fabric, NOT a git repo): the T2 phase
+ * a run rooted in a directory that is NOT a git repo: the T2 phase
  * synthesizer reads `git status --porcelain`, so EVERY task landed `blocked` with the sentinel
  * tail, and the operator met a wall of six red rows two rounds after a clean-looking start. The
  * cause is knowable at the first keystroke, so the first keystroke says it.

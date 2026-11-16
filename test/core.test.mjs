@@ -764,7 +764,7 @@ test("gateRows: the as-expected rows are labelled and counted, and the gate read
 });
 
 // ── the non-git run root: named at the first keystroke, not as a wall of red rows two rounds later ─
-// Measured 2026-11-15, run 20261115T193201Z-vsuq in fade-fabric (no git): the T2 synthesizer reads
+// Measured in a run rooted outside any git repo: the T2 synthesizer reads
 // `git status --porcelain`, so all six tasks landed `blocked` with the sentinel tail.
 test("gitCaveat and the briefings name a non-git run root, and stay silent in a working tree", () => {
 	const plain = mkdtempSync(join(tmpdir(), "orch-nogit-"));

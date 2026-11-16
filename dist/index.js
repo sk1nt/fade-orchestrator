@@ -540,12 +540,17 @@ function roundWindow(run) {
   const blocked = open.filter((t) => !taken.has(t.id)).map((t) => ({ id: t.id, blockedBy: unmet(t) })).filter((b) => b.blockedBy.length > 0);
   return { readyNow, blocked, open };
 }
+var gitCaveat = (repo) => isGitRepo(repo) ? "" : [
+  "The run root " + repo + " is NOT a git repo: git status/git diff evidence does not exist here, so the phase synthesizer names every task blocked and the checkpoint tags are unavailable.",
+  "The act is `git init " + repo + "` (or start the run inside a working tree)."
+].join(" ");
 var briefings = {
   plan: (run) => [
     `Phase 0 (planning), round ${run.round} of orchestrated run ${run.run_id}.`,
     `Goal: ${run.goal}`,
     `Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
     `Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
+    gitCaveat(run.repo),
     `Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`
   ].join("\n"),
   code: (run) => [
@@ -553,6 +558,7 @@ var briefings = {
     `Goal: ${run.goal}`,
     `Tasks: ${JSON.stringify(run.tasks)}`,
     `Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`,
+    gitCaveat(run.repo),
     `Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`
   ].join("\n"),
   /**
@@ -587,7 +593,8 @@ var briefings = {
       critiques.length > 0 ? `Rejected before \u2014 the verifier's critique for the tasks of THIS window, by task id; a task rejected twice has already had this diff tried, so change the cause:` : "",
       ...critiques,
       `Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections \u2014 nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
-      `Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`
+      `Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
+      gitCaveat(run.repo)
     ].filter(Boolean).join("\n");
   },
   verify: (run) => [
@@ -614,6 +621,7 @@ var briefings = {
       checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
       `Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections \u2014 no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
       `Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
+      gitCaveat(run.repo),
       `Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`
     ].filter(Boolean).join("\n");
   },
@@ -2360,6 +2368,7 @@ ${SCHEMA_HINT}` : text);
       }
       const runId = `${(/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
       const repo = ctx.cwd;
+      if (!isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${gitCaveat(repo)}`, "warning");
       runDir = join5(repo, "var", "omp-orchestrate");
       run = {
         key: STATE_KEY,

@@ -1066,8 +1066,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const runId = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
 			const repo = ctx.cwd;
 			// A non-git run root is knowable at this keystroke and changes what the loop can prove; say it
-			// now, not two rounds later as a wall of red `blocked` rows (measured 2026-11-15, fade-fabric
-			// run 20261115T193201Z-vsuq: the synthesizer has no git evidence, every task landed blocked).
+			// now, not two rounds later as a wall of red `blocked` rows: in a non-git root the phase
+			// synthesizer has no git evidence at all, so every task lands `blocked`.
 			if (!isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${gitCaveat(repo)}`, "warning");
 			runDir = join(repo, "var", "omp-orchestrate");
 			run = {
