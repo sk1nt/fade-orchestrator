@@ -23,8 +23,14 @@ One line, docked on the host's **top widget** (`setWidget(TOP_WIDGET_KEY, lines,
   **multicolored** — a per-character hue ramp (`ramp()` in `src/ui.ts`) whose phase rides the load
   percent, so each /health sample repaints a moving row. Color means *working*: the steady line
   ships no escape codes. The incoming model is named exactly once, abbreviated:
-  `󰚩 Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]`;
-- a lane flip the guard saw adds a second line naming the competing entries.
+  `󰚩 Orchestrator: <switch icon> switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]`. The
+  switch icon is a second private-use codepoint (U+F051F), overridable with
+  `FADE_ORCHESTRATE_SWITCH_GLYPH`; an empty value removes it and its space;
+- a lane flip the guard saw adds a second line naming the competing entries. Past
+  `FADE_ORCHESTRATE_FLIP_BREAKER_AT` flips in the window the loop stops paying: no `setModel`, no
+  `POST /v1/load`, the run pauses with the flips, the window and the competing entry in its operator
+  note, and `/orchestrate lanes reset` clears this process's ledger and lands the owed lane
+  (`test/gate_rig.mjs` drives both sides).
 
 The line **clears** — the widget is removed, not blanked — when there is no run, when the run is
 terminal (`complete` / `failed` / `stopped`, including a run adopted from disk at `session_start`),
@@ -302,7 +308,7 @@ and the login emits one line).
 | `test/panel_data.test.mjs` (guard) | a run state written mid-plan can lack `phases`; the screen reads it as no critique and renders — measured as a throw in the rpc rig (`undefined is not an object (evaluating 'src.run.phases.length')`), which turned the panel into an error notify |
 | `test/panel_data.test.mjs` | the data contract: rows from a real-shaped `/metrics` snapshot, the named-absent states, the abbreviated model named once |
 | `test/ui_status.test.mjs` | the status line: the row's grammar, the terminal/no-run clear rule, the swap pill, the flip line, the chord bytes (`ESC f` is the delivered chord, `ESC I` the fallback, and why `ctrl+shift+<letter>` has no byte form), the key label, the row's key hint |
-| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row, **the gate runs off the event loop** (a 300 ms row leaves the rig's 20 ms timer ticking) and names the row on the working message, and a login emits **one** line with the chord fact riding on the run line |
+| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row, **the gate runs off the event loop** (a 300 ms row leaves the rig's 20 ms timer ticking) and names the row on the working message, a login emits **one** line naming only the run, N rapid switches pay **one** `POST /v1/load` and the pill/lane/briefing of a superseded switch never land, past the breaker a switch pays **zero** loads and pauses the run, and `/orchestrate lanes reset` clears the ledger and lands the owed lane in exactly one load |
 | `test/load_hostile.mjs` | the pre-unload gate against a hostile `/health`: an `error` state, a `cuda_fatal` state, zero VRAM, VRAM under the floor, a negative nested reading, a loaded context naming no model, and a swap in flight each issue **zero** `POST /v1/load` with the class named; the measured healthy line loads exactly once; a closed server is refused as `unreachable` |
 | `test/pty_rig.mjs` | the real terminal: tmux + the `omp` binary + the live extension, the row on screen, the `ESC f` bytes (`-H 1b 66`, measured as one 2-byte read) opening the panel, the keys, the legacy Escape **and** the injected Kitty CSI-u escape closing, halt clearing, and both chord states (DEFAULT: the **one** login line names `Alt+F` and the fallback on the run's own line, with the key-contract paragraph ABSENT, and `ctrl+o` stays the host's, no panel; HELD: that line names the conflict and `ESC I` opens) (`FADE_ORCHESTRATE_LIVE_SMOKE=1`) |
 | `test/rpc_rig.mjs` | the headless surface through `omp --mode rpc`: the row's pill (`[Alt+F]`), the overlay's panel frames, the redaction-OFF half (the seeded file name rides unmasked), skip/halt persistence, the clear on halt |

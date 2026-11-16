@@ -31,6 +31,12 @@ carries no host-specific code.
   the queued requests name — measured live as a 0–2 s ping-pong. `loadLane` settles an in-flight
   swap first and returns without reloading the resident pack, so a load the resident entry already
   covers never re-reads 52 GiB.
+- **Lane thrash breaker.** Swaps the router reports away from the run's lane are counted in a
+  window. Past `FADE_ORCHESTRATE_FLIP_BREAKER_AT` (4) the loop stops paying: no `setModel`, no
+  `POST /v1/load`, the run pauses with the flips, the window and the competing entry in its operator
+  note, and the owed lane stays recorded. `/orchestrate lanes reset` clears this process's ledger,
+  unpauses and lands the owed lane in one swap. Lane switches are serialised behind one generation
+  token, so a superseded switch sets no pill, no lane and sends no briefing (`test/gate_rig.mjs`).
 - **Pre-swap gate.** `coding_done` runs every planned check on the code lane *before* the verifier
   swap is issued. A red gate keeps the coding lane resident (0 s), records a rejection, and sends
   the failing output back as the next briefing. The checks run as child processes **off the event
@@ -142,6 +148,9 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | the fast path's bound — a gate-green round that touched ≤ 1 file and < 15 changed lines on the FIRST try completes with zero lane loads; the same round on a 20-line diff takes exactly one swap (`test/gate_rig.mjs` measures both sides) |
 | `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | the pre-unload floor. A router that reports free VRAM under it — or zero/negative, an error state, a loaded context that names no model, a swap still in flight, or no answer at all — **refuses** the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
 | `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the gate reports the health line observed when the window ends. The rigs shrink it so the hung-context class is proved in milliseconds |
+| `FADE_ORCHESTRATE_FLIP_WINDOW_MS` / `_FLIP_MIN_SWAPS` / `_FLIP_BREAKER_AT` | `120000` / `2` / `4` | the flip guard's window, the count that badges it, and the count that HALTS the loop: at the breaker a switch issues no `setModel` and no `POST /v1/load`, the run pauses with the flips named, and `/orchestrate lanes reset` clears this process's ledger and lands the owed lane (`test/gate_rig.mjs` proves both sides in milliseconds) |
+| `FADE_ORCHESTRATE_SWITCH_GLYPH` | U+F051F | the icon on the model-switch row, in the same Nerd Font private-use family as the status glyph; an empty value removes it and its space (`test/ui_status.test.mjs`) |
+| `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so a panel keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call. A lane load drops the cache |
 
 ## Surface and commands
 
@@ -161,7 +170,7 @@ listener sees the byte gets a login clause: once per process, on the run's own l
 never prints a key that opens nothing.
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run (preflights the router: think lane must load).
-- `/orchestrate status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`
+- `/orchestrate status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`
 - `/orchestrate handover` — send the condensed digest now (any time, mid-run).
 - `/lanes` — live router census (both entries' status + `/health`).
 
