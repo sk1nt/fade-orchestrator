@@ -1,7 +1,7 @@
 // src/index.ts
 import { unlinkSync as unlinkSync2 } from "node:fs";
 import { basename, dirname, join as join5 } from "node:path";
-import { execFileSync as execFileSync2 } from "node:child_process";
+import { readFile as readFile2, stat } from "node:fs/promises";
 import { Type } from "typebox";
 
 // src/router.ts
@@ -147,10 +147,10 @@ async function routerBusy() {
   if (running > 0 || waiting > 0) {
     return { busy: true, running, waiting, reason: `slot busy: ${typeof live.state === "string" ? live.state : "serving"}${phase}; ${counters}` };
   }
-  const open = openRequestRow(metrics);
-  if (open) {
-    const pp = prefillRate(open);
-    return { busy: true, running, waiting, reason: `request ${open.id ?? "?"} is prompting (pp=${pp === void 0 ? "?" : Math.round(pp)} tok/s) with no decode_tok_s and no ttft_s yet${phase}; ${counters}` };
+  const open3 = openRequestRow(metrics);
+  if (open3) {
+    const pp = prefillRate(open3);
+    return { busy: true, running, waiting, reason: `request ${open3.id ?? "?"} is prompting (pp=${pp === void 0 ? "?" : Math.round(pp)} tok/s) with no decode_tok_s and no ttft_s yet${phase}; ${counters}` };
   }
   const resident = health?.model ?? (typeof health?.loaded === "string" ? health.loaded : void 0) ?? "?";
   return { busy: false, running, waiting, reason: `idle: ${resident} resident, no swap, no open request${metrics === void 0 ? ", /metrics unread" : ""}; ${counters}` };
@@ -200,8 +200,17 @@ var flipNote = (f) => flipGuarded(f) ? ` \u2014 FLIP GUARD: ${f.flips} swaps in 
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 var execFileAsync = promisify(execFile);
+async function execGitAsync(repo, args, opts = {}) {
+  const { stdout } = await execFileAsync("git", ["-C", repo, ...args], {
+    timeout: opts.timeout ?? 5e3,
+    maxBuffer: opts.maxBuffer ?? 1 << 20,
+    encoding: "utf8"
+  });
+  return `${stdout}`;
+}
 var STATE_KEY = "fade.omp_orchestrate.v1";
 var ACTIVE_FILENAME = "ACTIVE.json";
 var STATE_FILENAME = "state.json";
@@ -241,20 +250,23 @@ function classifyTurnEnd(run, hadPhase) {
   if (run.stall_count >= STALL_SYNTHESIZE_AT) return "synthesize";
   return "nudge";
 }
+var repoProbe;
 function isGitRepo(repo) {
-  try {
-    execFileSync("git", ["-C", repo, "rev-parse", "--git-dir"], { timeout: 5e3, maxBuffer: 1 << 20, encoding: "utf8", stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
-  }
+  const ttl = Number(process.env.FADE_ORCHESTRATE_REPO_PROBE_TTL_MS ?? 15e3);
+  if (repoProbe && repoProbe.repo === repo && (ttl <= 0 || Date.now() - repoProbe.at < ttl)) return repoProbe.answer;
+  const answer = execGitAsync(repo, ["rev-parse", "--git-dir"]).then(
+    () => true,
+    () => false
+  );
+  repoProbe = { repo, at: Date.now(), answer };
+  return answer;
 }
 var notARepo = (repo) => `(not a git repo: ${repo} \u2014 no git evidence; start the run inside a working tree, or run \`git init\` in it)`;
-function porcelain(repo) {
-  if (!isGitRepo(repo)) return notARepo(repo);
+async function porcelain(repo) {
+  if (!await isGitRepo(repo)) return notARepo(repo);
   try {
-    const out = execFileSync("git", ["-C", repo, "status", "--porcelain"], { timeout: 5e3, maxBuffer: 1 << 20, encoding: "utf8" });
-    const head = `${out}`.replace(/\n+$/, "").split("\n").slice(0, 200).join("\n");
+    const out = await execGitAsync(repo, ["status", "--porcelain"]);
+    const head = out.replace(/\n+$/, "").split("\n").slice(0, 200).join("\n");
     return head || "(working tree clean)";
   } catch (e) {
     return `(git status failed: ${msg(e)} in ${repo})`;
@@ -369,19 +381,19 @@ function refreshChecks(run, live) {
     redrafted
   };
 }
-function refreshRoot(run, live, probe = isGitRepo) {
+async function refreshRoot(run, live, probe = isGitRepo) {
   if (!live || live.run_id !== run.run_id || typeof live.repo !== "string" || live.repo === "") return { changed: false, from: run.repo, to: run.repo };
   if (live.repo === run.repo) return { changed: false, from: run.repo, to: run.repo };
-  if (!probe(live.repo)) return { changed: false, from: run.repo, to: run.repo, refused: `${live.repo} is not a git working tree` };
+  if (!await probe(live.repo)) return { changed: false, from: run.repo, to: run.repo, refused: `${live.repo} is not a git working tree` };
   const from = run.repo;
   run.repo = live.repo;
   return { changed: true, from, to: live.repo };
 }
-function diffStat(repo) {
-  if (!isGitRepo(repo)) return notARepo(repo);
+async function diffStat(repo) {
+  if (!await isGitRepo(repo)) return notARepo(repo);
   try {
-    const out = execFileSync("git", ["-C", repo, "diff", "--stat"], { timeout: 5e3, maxBuffer: 1 << 20, encoding: "utf8" });
-    const tail = `${out}`.trim().split("\n").slice(-6).join("\n");
+    const out = await execGitAsync(repo, ["diff", "--stat"]);
+    const tail = out.trim().split("\n").slice(-6).join("\n");
     return tail || "(working tree clean)";
   } catch (e) {
     return `(git diff failed: ${msg(e)} in ${repo})`;
@@ -415,10 +427,9 @@ function gateSummary(run) {
   const asExp = g.results.filter((r) => r.as_expected).length;
   return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}${asExp ? ` (${asExp} as expected)` : ""}: ${parts.join(" | ") || "no checks"}`;
 }
-function synthesizeCodingDone(run, repo) {
-  const raw = porcelain(repo);
+async function synthesizeCodingDone(run, repo) {
+  const [raw, stat2] = await Promise.all([porcelain(repo), diffStat(repo)]);
   const entries = porcelainEntries(raw);
-  const stat = diffStat(repo);
   const gate = gateSummary(run);
   const tasks = run.tasks.length > 0 ? run.tasks : run.repair_tasks;
   const done = tasks.map((t) => {
@@ -430,16 +441,16 @@ function synthesizeCodingDone(run, repo) {
     return { id: t.id, status: "passed", result: `synthesize: git status --porcelain shows ${hits.length} ${hits.length === 1 ? "entry" : "entries"} touching this task's declared files [${quoted}]` };
   });
   run.synthesized = { phase: "coding_done", round: run.round, at: (/* @__PURE__ */ new Date()).toISOString() };
-  return { done, sources: { porcelain: raw, diffStat: stat, gate } };
+  return { done, sources: { porcelain: raw, diffStat: stat2, gate } };
 }
 function checkpointName(run, taskId) {
   return `omp-ckpt/${run.run_id}/${taskId}-passed`;
 }
-function tagCheckpoint(repo, run, taskId) {
+async function tagCheckpoint(repo, run, taskId) {
   const tag = checkpointName(run, taskId);
-  if (!isGitRepo(repo)) return { tag, ok: false, error: `not a git repo: ${repo} \u2014 no checkpoint tag is possible` };
+  if (!await isGitRepo(repo)) return { tag, ok: false, error: `not a git repo: ${repo} \u2014 no checkpoint tag is possible` };
   try {
-    execFileSync("git", ["-C", repo, "tag", "-f", tag], { timeout: 5e3, maxBuffer: 1 << 20, encoding: "utf8" });
+    await execGitAsync(repo, ["tag", "-f", tag]);
     if (typeof run.checkpoints !== "object" || run.checkpoints === null) run.checkpoints = {};
     run.checkpoints[taskId] = tag;
     return { tag, ok: true };
@@ -457,7 +468,7 @@ function critiquesFor(run, ids) {
   }
   return out;
 }
-function handover(run) {
+async function handover(run) {
   const stable = [
     `Resume of orchestrated run ${run.run_id} (${run.state}, round ${run.round}/${run.max_rounds}).`,
     `Goal: ${run.goal}`,
@@ -476,12 +487,12 @@ function handover(run) {
         run.rejection_history.slice(-5).map((r) => ({ round: r.round, kind: r.kind, task: r.task_id, reason: r.reason }))
       )}`
     ] : [],
-    `Working tree: ${diffStat(run.repo)}`
+    `Working tree: ${await diffStat(run.repo)}`
   ];
   return { stable, volatile };
 }
-function handoverText(run) {
-  const h = handover(run);
+async function handoverText(run) {
+  const h = await handover(run);
   return [
     ...h.stable,
     "",
@@ -490,12 +501,72 @@ function handoverText(run) {
     `Continue from here: the resident lane is ${run.lane}. Report the next phase with fade_phase.`
   ].join("\n");
 }
-function readJson(path) {
+function parseJson(text) {
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    return JSON.parse(text);
   } catch {
     return void 0;
   }
+}
+async function readJsonAsync(path) {
+  try {
+    return parseJson(await readFile(path, "utf8"));
+  } catch {
+    return void 0;
+  }
+}
+async function writeJsonAsync(path, value) {
+  const dir = join(path, "..");
+  await mkdir(dir, { recursive: true });
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const h = await open(tmp, "w");
+  try {
+    await h.writeFile(`${JSON.stringify(value, null, 2)}
+`);
+    await h.sync();
+  } finally {
+    await h.close();
+  }
+  try {
+    await rename(tmp, path);
+  } catch (e) {
+    await unlink(tmp).catch(() => {
+    });
+    throw e;
+  }
+  try {
+    const d = await open(dir, "r");
+    try {
+      await d.sync();
+    } finally {
+      await d.close();
+    }
+  } catch {
+  }
+}
+var coalesced = /* @__PURE__ */ new Map();
+function coalesceWrite(path, value) {
+  const slot = coalesced.get(path) ?? {
+    tail: Promise.resolve(),
+    settled: Promise.resolve(),
+    pending: void 0
+  };
+  coalesced.set(path, slot);
+  const queued = slot.pending !== void 0;
+  slot.pending = { value };
+  if (queued) return slot.settled;
+  const drain = async () => {
+    while (slot.pending) {
+      const v = slot.pending.value;
+      slot.pending = void 0;
+      await writeJsonAsync(path, v);
+    }
+    if (coalesced.get(path) === slot) coalesced.delete(path);
+  };
+  const run = slot.tail.then(drain);
+  slot.tail = run.catch(() => void 0);
+  slot.settled = run;
+  return slot.settled;
 }
 function writeJson(path, value) {
   const dir = join(path, "..");
@@ -582,31 +653,31 @@ function roundWindow(run) {
   const pool = windowPool(run);
   const resolved = new Set(pool.filter((t) => t.status === "passed").map((t) => t.id));
   const unmet = (t) => t.dependencies.filter((d) => !resolved.has(d));
-  const open = pool.filter((t) => t.status !== "passed");
-  const readyNow = open.filter((t) => unmet(t).length === 0).slice(0, MAX_WINDOW_TASKS);
+  const open3 = pool.filter((t) => t.status !== "passed");
+  const readyNow = open3.filter((t) => unmet(t).length === 0).slice(0, MAX_WINDOW_TASKS);
   const taken = new Set(readyNow.map((t) => t.id));
-  const blocked = open.filter((t) => !taken.has(t.id)).map((t) => ({ id: t.id, blockedBy: unmet(t) })).filter((b) => b.blockedBy.length > 0);
-  return { readyNow, blocked, open };
+  const blocked = open3.filter((t) => !taken.has(t.id)).map((t) => ({ id: t.id, blockedBy: unmet(t) })).filter((b) => b.blockedBy.length > 0);
+  return { readyNow, blocked, open: open3 };
 }
-var gitCaveat = (repo) => isGitRepo(repo) ? "" : [
+var gitCaveat = async (repo) => await isGitRepo(repo) ? "" : [
   "The run root " + repo + " is NOT a git repo: git status/git diff evidence does not exist here, so the phase synthesizer names every task blocked and the checkpoint tags are unavailable.",
   "The act is `git init " + repo + "` (or start the run inside a working tree)."
 ].join(" ");
 var briefings = {
-  plan: (run) => [
+  plan: async (run) => [
     `Phase 0 (planning), round ${run.round} of orchestrated run ${run.run_id}.`,
     `Goal: ${run.goal}`,
     `Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
     `Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
-    gitCaveat(run.repo),
+    await gitCaveat(run.repo),
     `Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`
   ].join("\n"),
-  code: (run) => [
+  code: async (run) => [
     `Phase 1 (coding), round ${run.round} of orchestrated run ${run.run_id}.`,
     `Goal: ${run.goal}`,
     `Tasks: ${JSON.stringify(run.tasks)}`,
     `Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`,
-    gitCaveat(run.repo),
+    await gitCaveat(run.repo),
     `Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`
   ].join("\n"),
   /**
@@ -618,18 +689,18 @@ var briefings = {
    * is the half that kills the per-task window (the refusal in `validateDone` is the other
    * half).
    */
-  window: (run) => {
-    const { readyNow, blocked, open } = roundWindow(run);
+  window: async (run) => {
+    const { readyNow, blocked, open: open3 } = roundWindow(run);
     const inWindow = new Set(readyNow.map((t) => t.id));
     const blockedIds = new Set(blocked.map((b) => b.id));
-    const deferred = open.filter((t) => !inWindow.has(t.id) && !blockedIds.has(t.id)).map((t) => t.id);
+    const deferred = open3.filter((t) => !inWindow.has(t.id) && !blockedIds.has(t.id)).map((t) => t.id);
     const critiques = run.round > 1 ? critiquesFor(run, readyNow.map((t) => t.id)) : [];
     const entry = (id) => `{"id":"${id}","status":"passed"|"failed"|"blocked","result":"what the acceptance command observed"}`;
     return [
-      `Phase 1 (coding) \u2014 ONE WINDOW, round ${run.round}/${run.max_rounds} \xB7 T${readyNow.length}/${open.length} \xB7 lane ${run.lane} \xB7 orchestrated run ${run.run_id}.`,
+      `Phase 1 (coding) \u2014 ONE WINDOW, round ${run.round}/${run.max_rounds} \xB7 T${readyNow.length}/${open3.length} \xB7 lane ${run.lane} \xB7 orchestrated run ${run.run_id}.`,
       `Goal: ${run.goal}`,
       readyNow.length > 0 ? `Window contract: this ONE turn implements EVERY task below in ${run.repo} and reports them ALL in ONE coding_done payload: {"done":[${readyNow.map((t) => entry(t.id)).join(",")}]}. Do not report after one task and do not take a second coding turn for these tasks \u2014 one window, one coding_done, one lane swap.` : `The window is EMPTY: every open task is blocked by an unpassed dependency. There is nothing to implement in this turn \u2014 do not send a coding_done naming a blocked task; report the blockers and end the turn.`,
-      readyNow.length > 0 ? `Tasks in this window (${readyNow.length} of ${open.length} open), each card in full:` : `Tasks in this window: none.`,
+      readyNow.length > 0 ? `Tasks in this window (${readyNow.length} of ${open3.length} open), each card in full:` : `Tasks in this window: none.`,
       ...readyNow.flatMap((t) => [
         `  ${t.id} [${t.status ?? "pending"}] objective: ${t.objective}`,
         `      files: ${t.files.join(", ")}`,
@@ -642,7 +713,7 @@ var briefings = {
       ...critiques,
       `Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections \u2014 nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
       `Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
-      gitCaveat(run.repo)
+      await gitCaveat(run.repo)
     ].filter(Boolean).join("\n");
   },
   verify: (run) => [
@@ -652,7 +723,7 @@ var briefings = {
     `Read the diff (run "git diff" in ${run.repo} yourself) and re-run every check: ${JSON.stringify(run.checks)}.`,
     `Then call the fade_phase tool: phase="verification_done", payload={"verdict":"accepted"|"needs_repair","checks":[["cmd","observed"]],"notes":"...","tasks":[...]}; accepted ends the run, needs_repair must name the tasks for round ${run.round + 1}.`
   ].join("\n"),
-  repair: (run) => {
+  repair: async (run) => {
     const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
     const ids = (run.repair_tasks ?? []).map((t) => t.id);
     const critiques = critiquesFor(run, ids);
@@ -665,11 +736,11 @@ var briefings = {
       ...critiques.length > 0 ? ["Rejected before \u2014 the verifier's words, BY TASK:", ...critiques] : [],
       ...prior.length > 0 ? ["Previously rejected \u2014 fix the cause, do not repeat the attempt:", ...prior.map((p) => `  ${p}`)] : [],
       // Compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
-      `Working tree: ${diffStat(run.repo)}`,
+      `Working tree: ${await diffStat(run.repo)}`,
       checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
       `Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections \u2014 no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
       `Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
-      gitCaveat(run.repo),
+      await gitCaveat(run.repo),
       `Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`
     ].filter(Boolean).join("\n");
   },
@@ -718,7 +789,7 @@ var briefings = {
    * left as it is, and this is the diagnostic an operator acts on: what the machine saw, what
    * is RED, what git says, and the exact files to open.
    */
-  stalled: (run) => {
+  stalled: async (run) => {
     const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
     const phases = (run.phases ?? []).slice(-3).map((p) => `${p.phase} round ${p.round} accepted=${p.accepted}${p.notes ? ` notes=${p.notes}` : ""}`);
     const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok).map((r) => `  RED: ${r.cmd}
@@ -732,7 +803,7 @@ var briefings = {
       `Deterministic gate: ${gateSummary(run)}`,
       ...failing.length > 0 ? ["Checks that are RED:", ...failing] : [],
       ...rejections.length > 0 ? ["Recent rejections:", ...rejections] : [],
-      `Working tree: ${diffStat(run.repo)}`,
+      `Working tree: ${await diffStat(run.repo)}`,
       run.operator_note ? `Operator note: ${run.operator_note}` : "",
       `Act on it: read ${path}, run the plan's own checks in ${run.repo}, then /orchestrate pause to unpause in place, /orchestrate code to resume on the code lane, or /orchestrate stop to end the run.`
     ].filter(Boolean).join("\n");
@@ -898,20 +969,20 @@ function actCode(run) {
 
 // src/history.ts
 import { join as join2 } from "node:path";
-import { appendFileSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2 } from "node:fs";
+import { appendFile, mkdir as mkdir2, open as open2 } from "node:fs/promises";
 var HISTORY_FILENAME = "swap_history.json";
 var METRICS_JSONL_FILENAME = "metrics.jsonl";
 var HOT_STEADY_TPS = 120;
 var MAX_ROWS = 200;
-function readSwaps(dir) {
-  const rows = readJson(join2(dir, HISTORY_FILENAME));
+async function readSwaps(dir) {
+  const rows = await readJsonAsync(join2(dir, HISTORY_FILENAME));
   return Array.isArray(rows?.rows) ? rows.rows : [];
 }
-function appendSwap(dir, row) {
-  const rows = readSwaps(dir);
+async function appendSwap(dir, row) {
+  const rows = await readSwaps(dir);
   rows.unshift(row);
   if (rows.length > MAX_ROWS) rows.length = MAX_ROWS;
-  writeJson(join2(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
+  await writeJsonAsync(join2(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
 }
 function rampClass(decodeTps, mapRestored, threshold = HOT_STEADY_TPS) {
   if (mapRestored) return "map_restored";
@@ -933,29 +1004,48 @@ function turnRecordOrNull(m, id) {
     round_outcome: id.round_outcome
   };
 }
-function appendTurn(dir, rec) {
-  mkdirSync2(dir, { recursive: true });
-  appendFileSync(join2(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}
+async function appendTurn(dir, rec) {
+  await mkdir2(dir, { recursive: true });
+  await appendFile(join2(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}
 `);
 }
-function readTurns(dir, n) {
-  let raw;
+var TURN_TAIL_DEFAULT = 500;
+var turnTail = () => Math.max(1, Number(process.env.FADE_ORCHESTRATE_TURN_TAIL ?? TURN_TAIL_DEFAULT));
+var TURN_RECORD_BYTES = 4096;
+async function readTurns(dir, n = turnTail()) {
+  const limit = Math.max(1, Math.floor(n));
+  let fh;
   try {
-    raw = readFileSync2(join2(dir, METRICS_JSONL_FILENAME), "utf8");
+    fh = await open2(join2(dir, METRICS_JSONL_FILENAME), "r");
   } catch {
     return [];
   }
+  let text = "";
+  let partial = false;
+  try {
+    const size = (await fh.stat()).size;
+    if (size === 0) return [];
+    const start = Math.max(0, size - limit * TURN_RECORD_BYTES);
+    const buf = Buffer.alloc(size - start);
+    await fh.read(buf, 0, buf.length, start);
+    text = buf.toString("utf8");
+    partial = start > 0;
+  } finally {
+    await fh.close();
+  }
   const recs = [];
-  for (const line of raw.split("\n")) {
-    const text = line.trim();
-    if (text === "") continue;
+  const lines = text.split("\n");
+  if (partial) lines.shift();
+  for (const line of lines) {
+    const s = line.trim();
+    if (s === "") continue;
     try {
-      const rec = JSON.parse(text);
+      const rec = JSON.parse(s);
       if (rec && typeof rec === "object" && typeof rec.pp === "number" && typeof rec.tg === "number") recs.push(rec);
     } catch {
     }
   }
-  return recs.slice(Math.max(0, recs.length - n));
+  return recs.slice(Math.max(0, recs.length - limit));
 }
 
 // src/livedata.ts
@@ -1118,7 +1208,7 @@ function startSwapWatch(to, moe, onSample) {
         ...moe ? { moe } : {},
         at: (/* @__PURE__ */ new Date()).toISOString()
       };
-      appendSwap(dir, row);
+      await appendSwap(dir, row);
       return row;
     }
   };
@@ -1144,18 +1234,18 @@ function laneBestRate(s, lane) {
   const rates = (s.requests ?? []).filter((r) => typeof r.model !== "string" || r.model.replace(":", "") === slug).map(rateFromRequest).filter((r) => r !== void 0);
   return rates.length > 0 ? Math.max(...rates) : void 0;
 }
-function persistMetrics(dir, snap) {
-  writeJson(join3(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
+async function persistMetrics(dir, snap) {
+  await writeJsonAsync(join3(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
 }
 
 // src/moe.ts
-import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
+import { readdirSync, readFileSync as readFileSync2, statSync } from "node:fs";
 import { join as join4, resolve } from "node:path";
 var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
 function readServeConfig(path) {
   if (!path) return void 0;
   try {
-    const raw = JSON.parse(readFileSync3(path, "utf8"));
+    const raw = JSON.parse(readFileSync2(path, "utf8"));
     const models = {};
     for (const m of raw.models ?? []) {
       const alias = String(m.alias ?? m.model ?? "");
@@ -1172,7 +1262,7 @@ function engineProof() {
     for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
       let cmd;
       try {
-        cmd = readFileSync3(join4("/proc", pid, "cmdline"), "utf8");
+        cmd = readFileSync2(join4("/proc", pid, "cmdline"), "utf8");
       } catch {
         continue;
       }
@@ -1201,12 +1291,15 @@ function engineProofCached() {
   proofCache = { proof: engineProof(), at: Date.now() };
   return proofCache.proof;
 }
+function engineProofInvalidate() {
+  proofCache = void 0;
+}
 function processStartEpoch(pid) {
   try {
-    const stat = readFileSync3(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const stat2 = readFileSync2(`/proc/${pid}/stat`, "utf8");
+    const fields = stat2.slice(stat2.lastIndexOf(")") + 2).split(" ");
     const starttime = Number(fields[19]);
-    const uptime = Number(readFileSync3("/proc/uptime", "utf8").split(" ")[0]);
+    const uptime = Number(readFileSync2("/proc/uptime", "utf8").split(" ")[0]);
     if (!Number.isFinite(starttime) || !Number.isFinite(uptime)) return void 0;
     return Math.floor(Date.now() / 1e3 - (uptime - starttime / 100));
   } catch {
@@ -1364,9 +1457,11 @@ function nameResidentRow(tiers, metrics, names) {
 }
 async function collectScreen(src) {
   const now = (src.now ?? (() => /* @__PURE__ */ new Date()))();
-  const metrics = src.metrics ?? await fetchMetrics();
-  const swaps = src.swaps ?? readSwaps(src.runDir);
-  const turns = src.turns ?? readTurns(src.runDir, SCREEN_TURNS);
+  const [metrics, swaps, turns] = await Promise.all([
+    src.metrics ?? fetchMetrics(),
+    src.swaps ?? readSwaps(src.runDir),
+    src.turns ?? readTurns(src.runDir, SCREEN_TURNS)
+  ]);
   const moe = moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath });
   const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
   const missing = [];
@@ -1752,7 +1847,7 @@ function fadeOrchestrate(pi) {
     const s = await fetchMetrics();
     if (!s) return;
     metrics = s;
-    if (runDir) persistMetrics(runDir, s);
+    if (runDir) await persistMetrics(runDir, s);
     if (run) {
       const b = laneBestRate(s, run.lane);
       if (b && b > laneBest) laneBest = b;
@@ -1800,7 +1895,7 @@ function fadeOrchestrate(pi) {
     });
     turnPhase = void 0;
     turnSwapMs = 0;
-    if (rec) appendTurn(runDir, rec);
+    if (rec) await appendTurn(runDir, rec);
   };
   const applyToolPolicy = async (lane) => {
     const active = pi.getActiveTools();
@@ -1827,15 +1922,36 @@ function fadeOrchestrate(pi) {
     }
   };
   const statePath = () => runDir ? join5(runDir, STATE_FILENAME) : "<unset>";
-  const persist = () => {
-    if (run && runDir) writeJson(statePath(), run);
+  const persist = () => run && runDir ? coalesceWrite(statePath(), run) : Promise.resolve();
+  let lastWriteWarn = "";
+  const warnWrite = (ctx, what) => (e) => {
+    const msg2 = `${what}: ${e instanceof Error ? e.message : String(e)}`;
+    if (msg2 === lastWriteWarn) return;
+    lastWriteWarn = msg2;
+    ctx.ui.notify(`orchestrate: the state write failed \u2014 ${msg2}`, "warning");
   };
-  const gateChecks = (ctx) => {
+  let liveCache;
+  const liveState = async () => {
+    if (!runDir) return void 0;
+    const path = join5(runDir, STATE_FILENAME);
+    try {
+      const s = await stat(path);
+      const key = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
+      if (liveCache && liveCache.key === key) return liveCache.state;
+      const state = parseJson(await readFile2(path, "utf8"));
+      liveCache = { key, state };
+      return state;
+    } catch {
+      liveCache = void 0;
+      return void 0;
+    }
+  };
+  const gateChecks = async (ctx) => {
     if (!run) return;
-    const live = runDir ? readJson(join5(runDir, STATE_FILENAME)) : void 0;
+    const live = await liveState();
     const r = refreshChecks(run, live);
     if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} \u2014 ${r.removed.length} replaced, ${r.added.length} added, ${r.redrafted} re-declared, ${r.to} total`, "info");
-    const root = refreshRoot(run, live);
+    const root = await refreshRoot(run, live);
     if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run \u2014 ${root.to} (was ${root.from})`, "info");
     if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run \u2014 refused: ${root.refused}`, "warning");
   };
@@ -1852,10 +1968,12 @@ function fadeOrchestrate(pi) {
     );
     return gate;
   };
-  const fastPathDiff = (repo) => {
+  const fastPathDiff = async (repo) => {
     try {
-      const numstat = execFileSync2("git", ["-C", repo, "diff", "--numstat", "HEAD"], { encoding: "utf8" });
-      const untracked = execFileSync2("git", ["-C", repo, "ls-files", "--others", "--exclude-standard"], { encoding: "utf8" });
+      const [numstat, untracked] = await Promise.all([
+        execGitAsync(repo, ["diff", "--numstat", "HEAD"]),
+        execGitAsync(repo, ["ls-files", "--others", "--exclude-standard"])
+      ]);
       let lines = 0;
       let files = 0;
       for (const row of numstat.split("\n")) {
@@ -1898,7 +2016,7 @@ function fadeOrchestrate(pi) {
     if (run) {
       run.state = "failed";
       run.reason = reason;
-      persist();
+      void persist().catch(warnWrite(ctx, "fail"));
       paint(ctx);
     }
     ctx.ui.notify(`fade_orchestrate: ${reason}`, "error");
@@ -1935,7 +2053,7 @@ function fadeOrchestrate(pi) {
     const gate = await gateRouterIdle(lane, ctx);
     if (gate.over_budget && run) {
       pushRejection(run, "task", `the ${lane} load was paid after the idle gate ran its full ${Math.round(GATE_BUDGET_MS / 1e3)}s: ${gate.polls} polls, ${gate.last.reason}`);
-      persist();
+      await persist();
     }
     await observeSwaps();
     const flip = flipState(run?.lane ?? lane, FLIP_WINDOW_MS);
@@ -1947,7 +2065,7 @@ function fadeOrchestrate(pi) {
         pushRejection(run, "task", `LANE THRASH: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; ${lane} refused, loop halted, ZERO load paid`);
         pending = { lane, phase: turnPhase ?? "lane" };
       }
-      persist();
+      await persist();
       paint(ctx);
       ctx.ui.notify(`orchestrate: LANE THRASH \u2014 ${flip.flips} swaps in ${flip.window_s}s naming ${who}: the loop is HALTED and paid no load. /orchestrate lanes reset clears the ledger and lands ${lane}.`, "error");
       return;
@@ -1962,6 +2080,7 @@ function fadeOrchestrate(pi) {
     const from = run?.lane ?? "";
     swapPill = { from, to: modelLabel(model.name ?? lane) };
     paint(ctx);
+    engineProofInvalidate();
     const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
     const watch = startSwapWatch(lane, moe, (percent) => {
       if (gen !== switchGen || !swapPill) return;
@@ -1986,14 +2105,14 @@ function fadeOrchestrate(pi) {
       void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
     }
     if (run) run.lane = lane;
-    persist();
+    await persist();
     paint(ctx);
     await applyToolPolicy(lane);
     if (gen !== switchGen) return;
     setTimeout(async () => {
       if (gen !== switchGen) return;
       await ensurePhaseTool();
-      const text = run.state === "repair" ? briefings.repair(run) : lane === CODE_LANE && run.gate_last && run.gate_last.passed === false ? briefings.gate(run) : lane === CODE_LANE ? briefings.code(run) : briefings.verify(run);
+      const text = await (run.state === "repair" ? briefings.repair(run) : lane === CODE_LANE && run.gate_last && run.gate_last.passed === false ? briefings.gate(run) : lane === CODE_LANE ? briefings.code(run) : briefings.verify(run));
       pi.sendUserMessage(text);
     }, 0);
   };
@@ -2005,7 +2124,7 @@ function fadeOrchestrate(pi) {
       const s = await fetchMetrics();
       if (s) {
         metrics = s;
-        persistMetrics(dir, s);
+        void persistMetrics(dir, s).catch(warnWrite(ctx, "metrics tick"));
       }
       return collectScreen({
         run: state,
@@ -2023,7 +2142,7 @@ function fadeOrchestrate(pi) {
     if (!run) return;
     const dir = a.key === "s" ? actSkip(run, a.taskId) : a.key === "v" ? actVerify(run) : a.key === "r" ? actReset(run) : a.key === "p" ? actPause(run) : a.key === "c" ? actCode(run) : a.key === "h" ? actHalt(run) : void 0;
     if (!dir) return;
-    persist();
+    void persist().catch(warnWrite(ctx, "panel key"));
     paint(ctx);
     ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
     if (!run.paused && pending) {
@@ -2255,7 +2374,7 @@ function fadeOrchestrate(pi) {
         if (run) {
           run.schema_retries += 1;
           pushRejection(run, "schema", text);
-          persist();
+          await persist();
           throw new Error(run.schema_retries >= 2 ? `${text}
 ${SCHEMA_HINT}` : text);
         }
@@ -2267,21 +2386,21 @@ ${SCHEMA_HINT}` : text);
       let checkpointNote = "";
       if (params.phase === "verification_done" && applied.nextState === "complete") {
         const st = run;
-        const tags = st.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st.repo, st, t.id));
+        const tags = await Promise.all(st.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st.repo, st, t.id)));
         const ok = tags.filter((t) => t.ok).map((t) => t.tag);
         if (ok.length > 0) checkpointNote = `; checkpoints ${ok.join(", ")}`;
         const refused = tags.filter((t) => !t.ok);
         if (refused.length > 0) checkpointNote += `; checkpoint FAILED ${refused.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
       }
       if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
-        gateChecks(ctx);
+        await gateChecks(ctx);
         const gate = await runGateLogged(run.checks, run.repo, ctx);
         run.gate_last = gate;
         if (!gate.passed) {
           const failing = gate.results.filter((r) => !r.ok);
           pushRejection(run, "task", `pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
           run.state = "coding";
-          persist();
+          await persist();
           paint(ctx);
           pending = { lane: CODE_LANE, phase: "gate" };
           settledNotified = false;
@@ -2296,17 +2415,17 @@ ${SCHEMA_HINT}` : text);
         const st2 = run;
         const firstTry = !(st2.rejection_history ?? []).some((r) => r.round === st2.round && (r.kind === "task" || r.kind === "verification"));
         const allPassed = st2.tasks.length > 0 && st2.tasks.every((t) => t.status === "passed");
-        const diff = firstTry && allPassed ? fastPathDiff(st2.repo) : void 0;
+        const diff = firstTry && allPassed ? await fastPathDiff(st2.repo) : void 0;
         if (diff && diff.files >= 1 && diff.files <= FASTPATH_FILES && diff.lines < FASTPATH_LINES) {
           st2.phases.push({ phase: "verification_done", lane: st2.lane, accepted: true, round: st2.round, at: (/* @__PURE__ */ new Date()).toISOString(), notes: `fast path: ${diff.files} file(s), ${diff.lines} changed lines < ${FASTPATH_LINES}, gate green on the first try \u2014 the verifier swap was not paid` });
           st2.state = "complete";
-          const tags2 = st2.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st2.repo, st2, t.id));
+          const tags2 = await Promise.all(st2.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st2.repo, st2, t.id)));
           const ok2 = tags2.filter((t) => t.ok).map((t) => t.tag);
           const refused2 = tags2.filter((t) => !t.ok);
           checkpointNote = ok2.length > 0 ? `; checkpoints ${ok2.join(", ")}` : "";
           if (refused2.length > 0) checkpointNote += `; checkpoint FAILED ${refused2.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
           turnPhase = "verification_done";
-          persist();
+          await persist();
           paint(ctx);
           pending = void 0;
           settledNotified = false;
@@ -2317,7 +2436,7 @@ ${SCHEMA_HINT}` : text);
           };
         }
       }
-      persist();
+      await persist();
       paint(ctx);
       pending = applied.nextState === "failed" || applied.nextState === "complete" ? void 0 : { lane: applied.next, phase: params.phase };
       settledNotified = false;
@@ -2394,7 +2513,7 @@ ${SCHEMA_HINT}` : text);
           ctx.ui.notify("orchestrate: no run active", "info");
           return;
         }
-        pi.sendUserMessage(handoverText(run));
+        pi.sendUserMessage(await handoverText(run));
         ctx.ui.notify("orchestrate: condensed handover sent", "info");
         return;
       }
@@ -2415,7 +2534,7 @@ ${SCHEMA_HINT}` : text);
         run.operator_note = void 0;
         const wanted = owed?.lane ?? run.lane;
         ctx.ui.notify(`orchestrate: flip ledger cleared; landing ${wanted}`, "info");
-        persist();
+        await persist();
         paint(ctx);
         void requestLane(wanted, ctx);
         return;
@@ -2426,7 +2545,7 @@ ${SCHEMA_HINT}` : text);
           return;
         }
         const dir = first === "skip" ? actSkip(run, raw.split(/\s+/)[1]) : first === "verify" ? actVerify(run) : first === "reset" ? actReset(run) : first === "pause" ? actPause(run, raw.split(/\s+/).slice(1).join(" ") || void 0) : first === "halt" ? actHalt(run) : actCode(run);
-        persist();
+        await persist();
         paint(ctx);
         ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
         if (!run.paused && pending) {
@@ -2444,7 +2563,7 @@ ${SCHEMA_HINT}` : text);
         }
         if (TERMINAL[run.state] !== true) {
           run.state = "stopped";
-          persist();
+          if (runDir) writeJson(statePath(), run);
         }
         pending = void 0;
         clearSurface(ctx);
@@ -2482,6 +2601,7 @@ ${SCHEMA_HINT}` : text);
         return;
       }
       ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
+      engineProofInvalidate();
       const loaded = await loadLane(THINK_LANE);
       ctx.ui.setWorkingMessage();
       if (!loaded.ok) {
@@ -2496,7 +2616,7 @@ ${SCHEMA_HINT}` : text);
       }
       const runId = `${(/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
       const repo = ctx.cwd;
-      if (!isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${gitCaveat(repo)}`, "warning");
+      if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
       runDir = join5(repo, "var", "omp-orchestrate");
       run = {
         key: STATE_KEY,
@@ -2516,8 +2636,8 @@ ${SCHEMA_HINT}` : text);
         started_utc: (/* @__PURE__ */ new Date()).toISOString()
       };
       settledNotified = false;
-      writeJson(join5(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
-      persist();
+      await writeJsonAsync(join5(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+      await persist();
       const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
       if (!model) {
         fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
@@ -2532,7 +2652,7 @@ ${SCHEMA_HINT}` : text);
       paint(ctx);
       startMetricsTimer();
       await ensurePhaseTool();
-      pi.sendUserMessage(briefings.plan(run));
+      pi.sendUserMessage(await briefings.plan(run));
     }
   });
   pi.on("session_start", async (_event, ctx) => {
@@ -2547,8 +2667,8 @@ ${SCHEMA_HINT}` : text);
     }
     const chordNote = resolveChord();
     const repo = ctx.cwd;
-    const active = readJson(join5(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
-    const state = readJson(join5(repo, "var", "omp-orchestrate", STATE_FILENAME));
+    const active = await readJsonAsync(join5(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
+    const state = await readJsonAsync(join5(repo, "var", "omp-orchestrate", STATE_FILENAME));
     let runNote;
     if (active && state) {
       runDir = join5(repo, "var", "omp-orchestrate");
@@ -2559,9 +2679,9 @@ ${SCHEMA_HINT}` : text);
       if (TERMINAL[state.state] === true) {
         runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
       } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-        setTimeout(() => {
+        setTimeout(async () => {
           const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-          if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
+          if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
         }, 250);
         runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
       } else {
@@ -2601,7 +2721,7 @@ ${SCHEMA_HINT}` : text);
       const tier = classifyTurnEnd(run, false);
       if (tier === "nudge") {
         pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT})`);
-        persist();
+        await persist();
         paint(ctx);
         ctx.ui.notify(`orchestrate: protocol nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT} \u2014 round ${run.round} unspent, no swap paid`, "warning");
         await ensurePhaseTool();
@@ -2610,13 +2730,13 @@ ${SCHEMA_HINT}` : text);
         return;
       }
       if (tier === "synthesize" && (run.state === "coding" || run.state === "repair")) {
-        gateChecks(ctx);
+        await gateChecks(ctx);
         const gate = run.checks.length > 0 ? await runGateLogged(run.checks, run.repo, ctx) : void 0;
         if (gate) run.gate_last = gate;
         if (gate && !gate.passed) {
           const failing = gate.results.filter((r) => !r.ok);
           pushRejection(run, "task", `synthesized round refused: pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
-          persist();
+          await persist();
           paint(ctx);
           pending = { lane: CODE_LANE, phase: "gate" };
           settledNotified = false;
@@ -2625,10 +2745,10 @@ ${SCHEMA_HINT}` : text);
           void recordTurn("gate_red");
           return;
         }
-        const syn = synthesizeCodingDone(run, run.repo);
+        const syn = await synthesizeCodingDone(run, run.repo);
         pushRejection(run, "protocol", `coding_done SYNTHESIZED from git status/diff + gate exit codes after ${run.stall_count} phase-less turns`);
         const applied = applyPhase("coding_done", { done: syn.done });
-        persist();
+        await persist();
         paint(ctx);
         ctx.ui.notify(`orchestrate: coding_done synthesized from git + gate (round ${run.round}); the verifier swap is paid once`, "warning");
         void recordTurn("synthesized");
@@ -2642,14 +2762,14 @@ ${SCHEMA_HINT}` : text);
         run.paused = true;
         run.reason = `${run.protocol_retries ?? 0} turn(s) ended with no fade_phase call from state ${stalledFrom}`;
         pushRejection(run, "protocol", `circuit breaker: ${run.reason}`);
-        persist();
+        await persist();
         paint(ctx);
-        ctx.ui.notify(briefings.stalled(run), "error");
+        ctx.ui.notify(await briefings.stalled(run), "error");
         void recordTurn("stalled_protocol_error");
         return;
       }
       pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (tier ${tier})`);
-      persist();
+      await persist();
       paint(ctx);
       await ensurePhaseTool();
       pi.sendUserMessage(`${briefings.nudge(run)}
@@ -2668,14 +2788,14 @@ ${SCHEMA_HINT}`);
     void recordTurn(turnPhase ?? next.phase);
     requestLane(next.lane, ctx);
   });
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", async (event) => {
     if (!run || isDelegatedSession()) return void 0;
-    const live = runDir ? readJson(join5(runDir, STATE_FILENAME)) : void 0;
+    const live = await liveState();
     if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return void 0;
     const name = event.toolName ?? "";
     if (MUTATING_TOOLS[name] !== true) return void 0;
     pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);
-    persist();
+    await persist();
     return { block: true, reason: `fade_orchestrate: the verifier lane is read-only \u2014 ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
   });
   pi.on("session_shutdown", async (_event, ctx) => {
