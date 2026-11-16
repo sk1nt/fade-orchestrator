@@ -238,6 +238,25 @@ test("refreshChecks: the gate honors an on-disk repair of the plan's checks, key
 	assert.deepEqual(run.checks, [["good", "check"]]);
 });
 
+test("refreshChecks: re-declaring a row's accepted state (the second element) reaches the gate", () => {
+	// The defect this pins: a row is judged from its expected text — expectation() reads the head
+	// words ("fails:", "exits 1", "no output:") to decide whether a non-zero exit is the PASS. A
+	// command-keyed refresh treats a re-declared state as `changed: false`, so the gate keeps
+	// scoring the stale prose and the row is red every round on a tree that satisfies it.
+	const run = mkRun({ checks: [[".venv/bin/python -m fabric verify", "rc=1 and PASS count 0: the unmeasured contract holds"]] });
+	const redrafted = refreshChecks(run, {
+		...run,
+		checks: [[".venv/bin/python -m fabric verify", "exits 1 with PASS count 0 — an unmeasured tree must never report PASS"]],
+	});
+	assert.equal(redrafted.changed, true, "the same command with a new accepted state IS a change");
+	assert.equal(redrafted.redrafted, 1, "the re-declaration is counted, not shown as an added row");
+	assert.deepEqual(redrafted.added, [], "no row was added");
+	assert.deepEqual(redrafted.removed, [], "no row was removed");
+	assert.match(run.checks[0][1], /^exits 1/, "the gate now reads the declared state");
+	const again = refreshChecks(run, { ...run, checks: run.checks });
+	assert.equal(again.changed, false, "an equal file of PAIRS is a silent no-op");
+});
+
 test("refreshRoot: the gate re-roots when the state file names another working tree, keyed by run_id", () => {
 	// The livelock this pins: a run started in repo A and aimed at repo B. Every check is
 	// `bash -lc <cmd>` at run.repo, so B's src/, ci/ and benches/ do not exist, B's package is
