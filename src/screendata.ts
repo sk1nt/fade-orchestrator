@@ -209,13 +209,19 @@ export function nameResidentRow(tiers: MetricRow[], metrics: MetricsSnapshot | u
 
 /**
  * The whole screen, assembled. Every source is read once; the router request is the only network
- * call, and it is skipped when the caller already holds a snapshot.
+ * call, and it is skipped when the caller already holds a snapshot. The two ledgers
+ * (`swap_history.json`, the `metrics.jsonl` tail) are read ASYNC and TOGETHER — this runs on the
+ * Alt+F keystroke and on the panel's 2 s refresh tick, and the old synchronous whole-file reads
+ * there were the worst freeze in the product: the keystroke painted nothing while the append-only
+ * ledger was parsed line by line.
  */
 export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 	const now = (src.now ?? (() => new Date()))();
-	const metrics = src.metrics ?? (await fetchMetrics());
-	const swaps = src.swaps ?? readSwaps(src.runDir);
-	const turns = src.turns ?? readTurns(src.runDir, SCREEN_TURNS);
+	const [metrics, swaps, turns] = await Promise.all([
+		src.metrics ?? fetchMetrics(),
+		src.swaps ?? readSwaps(src.runDir),
+		src.turns ?? readTurns(src.runDir, SCREEN_TURNS),
+	]);
 	const moe = moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath });
 	const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
 	const missing: string[] = [];

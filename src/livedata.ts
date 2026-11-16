@@ -19,7 +19,7 @@ import { ROUTER } from "./router.ts";
 import type { TierRow } from "./ui.ts";
 import { appendSwap, rampClass, type SwapRow, type TurnMetrics } from "./history.ts";
 import type { LaneMoe } from "./moe.ts";
-import { writeJson } from "./core.ts";
+import { writeJsonAsync } from "./core.ts";
 
 export const METRICS_FILENAME = "metrics_state.json";
 
@@ -295,7 +295,7 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 				...(moe ? { moe } : {}),
 				at: new Date().toISOString(),
 			};
-			appendSwap(dir, row);
+			await appendSwap(dir, row);
 			return row;
 		},
 	};
@@ -343,6 +343,6 @@ export function laneBestRate(s: MetricsSnapshot, lane: string): number | undefin
 }
 
 /** Persist the latest snapshot next to state.json, so the tiers survive a router that goes away. */
-export function persistMetrics(dir: string, snap: MetricsSnapshot): void {
-	writeJson(join(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
+export async function persistMetrics(dir: string, snap: MetricsSnapshot): Promise<void> {
+	await writeJsonAsync(join(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
 }

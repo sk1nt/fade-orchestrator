@@ -6,7 +6,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, open, readFile, rename } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { msg } from "./router.ts";
@@ -665,7 +665,11 @@ export async function readJsonAsync<T>(path: string): Promise<T | undefined> {
 export async function writeJsonAsync(path: string, value: unknown): Promise<void> {
 	const dir = join(path, "..");
 	await mkdir(dir, { recursive: true });
-	const tmp = `${path}.tmp`;
+	// A temp name PRIVATE to this call, not a shared `${path}.tmp`: two writers of one file
+	// interleave the moment writes are async (the metrics tick and a panel refresh both publish
+	// `metrics_state.json`), and the loser's `rename` then reports ENOENT for a source the other
+	// already published. Atomicity is the rename; the name only has to be private.
+	const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
 	const h = await open(tmp, "w");
 	try {
 		await h.writeFile(`${JSON.stringify(value, null, 2)}\n`);
@@ -673,7 +677,12 @@ export async function writeJsonAsync(path: string, value: unknown): Promise<void
 	} finally {
 		await h.close();
 	}
-	await rename(tmp, path);
+	try {
+		await rename(tmp, path);
+	} catch (e) {
+		await unlink(tmp).catch(() => {});
+		throw e;
+	}
 	try {
 		const d = await open(dir, "r");
 		try {
@@ -687,7 +696,7 @@ export async function writeJsonAsync(path: string, value: unknown): Promise<void
 }
 
 /** One path's coalescing slot: the chain of writes in flight, and the payload that replaces them. */
-const coalesced = new Map<string, { tail: Promise<void>; pending: { value: unknown } | undefined }>();
+const coalesced = new Map<string, { tail: Promise<void>; settled: Promise<void>; pending: { value: unknown } | undefined }>();
 
 /**
  * A durable write that COALESCES per path: ONE write in flight, and a newer payload REPLACES the
@@ -698,11 +707,15 @@ const coalesced = new Map<string, { tail: Promise<void>; pending: { value: unkno
  * reads.
  */
 export function coalesceWrite(path: string, value: unknown): Promise<void> {
-	const slot = coalesced.get(path) ?? { tail: Promise.resolve(), pending: undefined };
+	const slot: { tail: Promise<void>; settled: Promise<void>; pending: { value: unknown } | undefined } = coalesced.get(path) ?? {
+		tail: Promise.resolve(),
+		settled: Promise.resolve(),
+		pending: undefined,
+	};
 	coalesced.set(path, slot);
 	const queued = slot.pending !== undefined;
 	slot.pending = { value };
-	if (queued) return slot.tail;
+	if (queued) return slot.settled;
 	const drain = async (): Promise<void> => {
 		while (slot.pending) {
 			const v = slot.pending.value;
@@ -711,8 +724,14 @@ export function coalesceWrite(path: string, value: unknown): Promise<void> {
 		}
 		if (coalesced.get(path) === slot) coalesced.delete(path);
 	};
-	slot.tail = slot.tail.then(drain, drain);
-	return slot.tail;
+	// The chain a later call joins must never carry an EARLIER write's failure. The state directory
+	// is the operator's: a janitor, a `reset` or a rig can remove it mid-run, and the write that
+	// lands after the wipe used to poison every later phase and reach the host's loop as an
+	// unhandled rejection. The caller that awaited THIS write still sees the error; the chain moves on.
+	const run = slot.tail.then(drain);
+	slot.tail = run.catch(() => undefined);
+	slot.settled = run;
+	return slot.settled;
 }
 
 /**
@@ -1045,28 +1064,28 @@ export function applyDone(run: RunState, done: DoneEntry[]): Task[] {
  * tail, and the operator met a wall of six red rows two rounds after a clean-looking start. The
  * cause is knowable at the first keystroke, so the first keystroke says it.
  */
-export const gitCaveat = (repo: string): string =>
-	isGitRepo(repo)
+export const gitCaveat = async (repo: string): Promise<string> =>
+	(await isGitRepo(repo))
 		? ""
 		: ["The run root " + repo + " is NOT a git repo: git status/git diff evidence does not exist here, so the phase synthesizer names every task blocked and the checkpoint tags are unavailable.",
 		  "The act is `git init " + repo + "` (or start the run inside a working tree)."].join(" ");
 export const briefings = {
-	plan: (run: RunState): string =>
+	plan: async (run: RunState): Promise<string> =>
 		[
 			`Phase 0 (planning), round ${run.round} of orchestrated run ${run.run_id}.`,
 			`Goal: ${run.goal}`,
 			`Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
 			`Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
-			gitCaveat(run.repo),
+			await gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`,
 		].join("\n"),
-	code: (run: RunState): string =>
+	code: async (run: RunState): Promise<string> =>
 		[
 			`Phase 1 (coding), round ${run.round} of orchestrated run ${run.run_id}.`,
 			`Goal: ${run.goal}`,
 			`Tasks: ${JSON.stringify(run.tasks)}`,
 			`Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`,
-			gitCaveat(run.repo),
+			await gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
 		].join("\n"),
 	/**
@@ -1078,7 +1097,7 @@ export const briefings = {
 	 * is the half that kills the per-task window (the refusal in `validateDone` is the other
 	 * half).
 	 */
-	window: (run: RunState): string => {
+	window: async (run: RunState): Promise<string> => {
 		const { readyNow, blocked, open } = roundWindow(run);
 		const inWindow = new Set(readyNow.map((t) => t.id));
 		const blockedIds = new Set(blocked.map((b) => b.id));
@@ -1108,7 +1127,7 @@ export const briefings = {
 			...critiques,
 			`Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections — nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
 			`Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
-			gitCaveat(run.repo),
+			await gitCaveat(run.repo),
 		].filter(Boolean).join("\n");
 	},
 	verify: (run: RunState): string =>
@@ -1119,7 +1138,7 @@ export const briefings = {
 			`Read the diff (run "git diff" in ${run.repo} yourself) and re-run every check: ${JSON.stringify(run.checks)}.`,
 			`Then call the fade_phase tool: phase="verification_done", payload={"verdict":"accepted"|"needs_repair","checks":[["cmd","observed"]],"notes":"...","tasks":[...]}; accepted ends the run, needs_repair must name the tasks for round ${run.round + 1}.`,
 		].join("\n"),
-	repair: (run: RunState): string => {
+	repair: async (run: RunState): Promise<string> => {
 		const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
 		const ids = (run.repair_tasks ?? []).map((t) => t.id);
 		const critiques = critiquesFor(run, ids);
@@ -1132,11 +1151,11 @@ export const briefings = {
 			...(critiques.length > 0 ? ["Rejected before — the verifier's words, BY TASK:", ...critiques] : []),
 			...(prior.length > 0 ? ["Previously rejected — fix the cause, do not repeat the attempt:", ...prior.map((p) => `  ${p}`)] : []),
 			// Compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
-			`Working tree: ${diffStat(run.repo)}`,
+			`Working tree: ${await diffStat(run.repo)}`,
 			checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
 			`Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections — no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
 			`Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
-			gitCaveat(run.repo),
+			await gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
 		].filter(Boolean).join("\n");
 	},
@@ -1183,7 +1202,7 @@ export const briefings = {
 	 * left as it is, and this is the diagnostic an operator acts on: what the machine saw, what
 	 * is RED, what git says, and the exact files to open.
 	 */
-	stalled: (run: RunState): string => {
+	stalled: async (run: RunState): Promise<string> => {
 		const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
 		const phases = (run.phases ?? []).slice(-3).map((p) => `${p.phase} round ${p.round} accepted=${p.accepted}${p.notes ? ` notes=${p.notes}` : ""}`);
 		const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok).map((r) => `  RED: ${r.cmd}\n    expected: ${r.expected}\n    observed: ${r.tail}`);
@@ -1195,7 +1214,7 @@ export const briefings = {
 			`Deterministic gate: ${gateSummary(run)}`,
 			...(failing.length > 0 ? ["Checks that are RED:", ...failing] : []),
 			...(rejections.length > 0 ? ["Recent rejections:", ...rejections] : []),
-			`Working tree: ${diffStat(run.repo)}`,
+			`Working tree: ${await diffStat(run.repo)}`,
 			run.operator_note ? `Operator note: ${run.operator_note}` : "",
 			`Act on it: read ${path}, run the plan's own checks in ${run.repo}, then /orchestrate pause to unpause in place, /orchestrate code to resume on the code lane, or /orchestrate stop to end the run.`,
 		].filter(Boolean).join("\n");

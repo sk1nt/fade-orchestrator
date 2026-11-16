@@ -17,7 +17,7 @@
  */
 import { unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
@@ -30,13 +30,13 @@ import {
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, refreshRoot, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, coalesceWrite, execGitAsync, normalizeRun, parseJson, pushRejection, readJsonAsync, refreshChecks, refreshRoot, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
 	TERMINAL,
 	briefings,
-	readJson,
 	validateChecks,
 	validateTasks,
 	writeJson,
+	writeJsonAsync,
 	type GateResult,
 	type PhaseLog,
 	type RunState,
@@ -49,7 +49,7 @@ import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keym
 import { appendTurn, turnRecordOrNull } from "./history.ts";
 import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, startSwapWatch, type MetricsSnapshot } from "./livedata.ts";
 import { handoverText } from "./core.ts";
-import { laneMoe } from "./moe.ts";
+import { engineProofInvalidate, laneMoe } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
 import { collectScreen, type ScreenData } from "./screendata.ts";
 
@@ -147,7 +147,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const s = await fetchMetrics();
 		if (!s) return;
 		metrics = s;
-		if (runDir) persistMetrics(runDir, s);
+		if (runDir) await persistMetrics(runDir, s);
 		if (run) {
 			const b = laneBestRate(s, run.lane);
 			if (b && b > laneBest) laneBest = b;
@@ -209,7 +209,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		});
 		turnPhase = undefined;
 		turnSwapMs = 0;
-		if (rec) appendTurn(runDir, rec);
+		if (rec) await appendTurn(runDir, rec);
 	};
 
 	// The thinking lane's tool set: setActiveTools removes the mutating tools on entry to the
@@ -254,20 +254,64 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	const statePath = (): string => (runDir ? join(runDir, STATE_FILENAME) : "<unset>");
-	const persist = (): void => {
-		if (run && runDir) writeJson(statePath(), run);
+	/**
+	 * The state write, COALESCED (`coalesceWrite`): ONE write in flight per path, and a newer
+	 * payload REPLACES the pending one — so a phase boundary that persists three times (the phase,
+	 * the rejection, the lane) pays ONE write carrying the LAST state, not three. Every step of
+	 * each write is `fs.promises` (tmp → fdatasync → rename → directory sync), which is what kills
+	 * the freeze: the fsync pair used to run inside the panel's refresh tick and inside every phase
+	 * transition, on the TUI's own loop, and the host stopped painting for the length of it.
+	 */
+	const persist = (): Promise<void> => (run && runDir ? coalesceWrite(statePath(), run) : Promise.resolve());
+
+	/**
+	 * A fire-and-forget durable write must never reach the host as an unhandled rejection. The state
+	 * directory is the operator's: a janitor, an `rm -rf var/` or the gate rig's reset can remove it
+	 * mid-run, and the write that lands after the wipe used to take the rig down. Say the class ONCE
+	 * per process and drop the identical repeats; the in-memory run stays authoritative for the loop.
+	 */
+	let lastWriteWarn = "";
+	const warnWrite = (ctx: ExtensionContext, what: string) => (e: unknown): void => {
+		const msg = `${what}: ${e instanceof Error ? e.message : String(e)}`;
+		if (msg === lastWriteWarn) return;
+		lastWriteWarn = msg;
+		ctx.ui.notify(`orchestrate: the state write failed — ${msg}`, "warning");
+	};
+
+	/**
+	 * The ON-DISK run, for the verifier sandbox, which asks on EVERY tool call. `readFileSync` +
+	 * `JSON.parse` there parsed the whole state per call, on the host's loop. The file's
+	 * `(mtimeMs, ctimeMs, size)` stamp is the guard: unchanged, the last parse IS the live state,
+	 * so a steady run pays one `stat` per tool call. The writer is this session's own coalescing
+	 * persist, so the stamp moves exactly when the record changes.
+	 */
+	let liveCache: { key: string; state: RunState | undefined } | undefined;
+	const liveState = async (): Promise<RunState | undefined> => {
+		if (!runDir) return undefined;
+		const path = join(runDir, STATE_FILENAME);
+		try {
+			const s = await stat(path);
+			const key = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
+			if (liveCache && liveCache.key === key) return liveCache.state;
+			const state = parseJson<RunState>(await readFile(path, "utf8"));
+			liveCache = { key, state };
+			return state;
+		} catch {
+			liveCache = undefined;
+			return undefined;
+		}
 	};
 
 	/** The gate's checks AND its root are DATA: read the file, so an on-disk repair reaches the
 	 *  run object. Without this the gate is unrepairable in a live session — `state.json` can
 	 *  carry fixed commands, or a corrected `repo`, while the session re-judges the plan's
 	 *  original rows at the original root, every round. Both refreshes are announced. */
-	const gateChecks = (ctx: ExtensionContext): void => {
+	const gateChecks = async (ctx: ExtensionContext): Promise<void> => {
 		if (!run) return;
-		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
+		const live = await liveState();
 		const r = refreshChecks(run, live);
 		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.redrafted} re-declared, ${r.to} total`, "info");
-		const root = refreshRoot(run, live);
+		const root = await refreshRoot(run, live);
 		if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run — ${root.to} (was ${root.from})`, "info");
 		if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run — refused: ${root.refused}`, "warning");
 	};
@@ -294,11 +338,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 
 	/** The diff the fast path prices — changed paths and changed lines in the working tree vs
 	 *  HEAD, with untracked files counted as paths. `files: -1` names a tree git cannot speak
-	 *  for, which is never fast-path eligible. */
-	const fastPathDiff = (repo: string): { files: number; lines: number } => {
+	 *  for, which is never fast-path eligible. ASYNC, and the two calls run TOGETHER: the sync pair
+	 *  sat on the `coding_done` return path and held the paint loop for both spawns. The bounds are
+	 *  `execGitAsync`'s (5 s, 1 MiB), the same ones the sync form carried. */
+	const fastPathDiff = async (repo: string): Promise<{ files: number; lines: number }> => {
 		try {
-			const numstat = execFileSync("git", ["-C", repo, "diff", "--numstat", "HEAD"], { encoding: "utf8" });
-			const untracked = execFileSync("git", ["-C", repo, "ls-files", "--others", "--exclude-standard"], { encoding: "utf8" });
+			const [numstat, untracked] = await Promise.all([
+				execGitAsync(repo, ["diff", "--numstat", "HEAD"]),
+				execGitAsync(repo, ["ls-files", "--others", "--exclude-standard"]),
+			]);
 			let lines = 0;
 			let files = 0;
 			for (const row of numstat.split("\n")) {
@@ -363,7 +411,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (run) {
 			run.state = "failed";
 			run.reason = reason;
-			persist();
+			void persist().catch(warnWrite(ctx, "fail"));
 			paint(ctx);
 		}
 		ctx.ui.notify(`fade_orchestrate: ${reason}`, "error");
@@ -433,7 +481,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const gate = await gateRouterIdle(lane, ctx);
 		if (gate.over_budget && run) {
 			pushRejection(run, "task", `the ${lane} load was paid after the idle gate ran its full ${Math.round(GATE_BUDGET_MS / 1000)}s: ${gate.polls} polls, ${gate.last.reason}`);
-			persist();
+			await persist();
 		}
 		// THE THRASH BREAKER. Refusing to reload the resident entry and printing a badge leave the
 		// loop paying 13-25 s and 52-130 GiB every time a competing client names the other entry.
@@ -450,7 +498,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				pushRejection(run, "task", `LANE THRASH: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; ${lane} refused, loop halted, ZERO load paid`);
 				pending = { lane, phase: turnPhase ?? "lane" };
 			}
-			persist();
+			await persist();
 			paint(ctx);
 			ctx.ui.notify(`orchestrate: LANE THRASH — ${flip.flips} swaps in ${flip.window_s}s naming ${who}: the loop is HALTED and paid no load. /orchestrate lanes reset clears the ledger and lands ${lane}.`, "error");
 			return;
@@ -473,6 +521,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// Optimal MoE loading (moe.ts): the Flash-Next pack saves its learned
 		// adaptive-tier placement and starts from it; the profile's existence + age BEFORE this
 		// swap is what decides "warm start" vs the 91 tok/s cold ramp.
+		// The lane load STARTS here, so the placement proof the swap records is a FRESH `/proc`
+		// scan: a load changes which engine is running, and the panel's proof is cached (moe.ts
+		// `PROOF_TTL_MS`). Reading the stale one would label a warm start off the pre-swap engine.
+		engineProofInvalidate();
 		const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
 		const watch = startSwapWatch(lane, moe, (percent) => {
 			// A superseded switch's watch must never paint: its lane is not the one loading.
@@ -500,21 +552,22 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			void watch.finish(from, lane, loaded.elapsed_s, runDir).then(() => paint(ctx));
 		}
 		if (run) run.lane = lane;
-		persist();
+		await persist();
 		paint(ctx);
 		await applyToolPolicy(lane);
 		if (gen !== switchGen) return;
 		setTimeout(async () => {
 			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
 			await ensurePhaseTool();
-			const text =
+			const text = await (
 				run!.state === "repair"
 					? briefings.repair(run!)
 					: lane === CODE_LANE && run!.gate_last && run!.gate_last.passed === false
 						? briefings.gate(run!)
 						: lane === CODE_LANE
 							? briefings.code(run!)
-							: briefings.verify(run!);
+							: briefings.verify(run!)
+			);
 			pi.sendUserMessage(text);
 		}, 0);
 	};
@@ -533,7 +586,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const s = await fetchMetrics();
 			if (s) {
 				metrics = s;
-				persistMetrics(dir, s);
+				void persistMetrics(dir, s).catch(warnWrite(ctx, "metrics tick"));
 			}
 			return collectScreen({
 				run: state,
@@ -554,7 +607,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const dir =
 			a.key === "s" ? actSkip(run, a.taskId) : a.key === "v" ? actVerify(run) : a.key === "r" ? actReset(run) : a.key === "p" ? actPause(run) : a.key === "c" ? actCode(run) : a.key === "h" ? actHalt(run) : undefined;
 		if (!dir) return;
-		persist();
+		void persist().catch(warnWrite(ctx, "panel key"));
 		paint(ctx);
 		ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
 		// [p]/[c] resumed a paused loop: pay the lane load that pausing deferred.
@@ -862,7 +915,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				if (run) {
 					run.schema_retries += 1;
 					pushRejection(run, "schema", text);
-					persist();
+					await persist();
 					throw new Error(run.schema_retries >= 2 ? `${text}\n${SCHEMA_HINT}` : text);
 				}
 				throw new Error(text);
@@ -881,7 +934,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// Tag the tree at the moment each task was accepted, namespaced per run.
 				// `run` is a mutable `let`, so the closure below loses the guard's narrowing.
 				const st: RunState = run;
-				const tags = st.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st.repo, st, t.id));
+				const tags = await Promise.all(st.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st.repo, st, t.id)));
 				const ok = tags.filter((t) => t.ok).map((t) => t.tag);
 				if (ok.length > 0) checkpointNote = `; checkpoints ${ok.join(", ")}`;
 				const refused = tags.filter((t) => !t.ok);
@@ -892,14 +945,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// resident (loadLane on the resident entry costs 0 s), records the rejection, and
 			// sends the gate briefing with the observed tails — self-repair without a swap.
 			if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
-				gateChecks(ctx);
+				await gateChecks(ctx);
 				const gate = await runGateLogged(run.checks, run.repo, ctx);
 				run.gate_last = gate;
 				if (!gate.passed) {
 					const failing = gate.results.filter((r) => !r.ok);
 					pushRejection(run, "task", `pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
 					run.state = "coding";
-					persist();
+					await persist();
 					paint(ctx);
 					pending = { lane: CODE_LANE, phase: "gate" };
 					settledNotified = false;
@@ -921,17 +974,17 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				const st2: RunState = run;
 				const firstTry = !(st2.rejection_history ?? []).some((r) => r.round === st2.round && (r.kind === "task" || r.kind === "verification"));
 				const allPassed = st2.tasks.length > 0 && st2.tasks.every((t) => t.status === "passed");
-				const diff = firstTry && allPassed ? fastPathDiff(st2.repo) : undefined;
+				const diff = firstTry && allPassed ? await fastPathDiff(st2.repo) : undefined;
 				if (diff && diff.files >= 1 && diff.files <= FASTPATH_FILES && diff.lines < FASTPATH_LINES) {
 					st2.phases.push({ phase: "verification_done", lane: st2.lane, accepted: true, round: st2.round, at: new Date().toISOString(), notes: `fast path: ${diff.files} file(s), ${diff.lines} changed lines < ${FASTPATH_LINES}, gate green on the first try — the verifier swap was not paid` });
 					st2.state = "complete";
-					const tags2 = st2.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st2.repo, st2, t.id));
+					const tags2 = await Promise.all(st2.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st2.repo, st2, t.id)));
 					const ok2 = tags2.filter((t) => t.ok).map((t) => t.tag);
 					const refused2 = tags2.filter((t) => !t.ok);
 					checkpointNote = ok2.length > 0 ? `; checkpoints ${ok2.join(", ")}` : "";
 					if (refused2.length > 0) checkpointNote += `; checkpoint FAILED ${refused2.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
 					turnPhase = "verification_done";
-					persist();
+					await persist();
 					paint(ctx);
 					pending = undefined;
 					settledNotified = false;
@@ -942,7 +995,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					};
 				}
 			}
-			persist();
+			await persist();
 			paint(ctx);
 			pending = applied.nextState === "failed" || applied.nextState === "complete" ? undefined : { lane: applied.next, phase: params.phase };
 			settledNotified = false;
@@ -1045,7 +1098,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// Condensed, STABLE-FIRST handover (core.handover): the new lane or a resumed
 				// session gets goal + phase contract + task definitions as an invariant prefix
 				// (high conversation-cache hit) and statuses/rejections/diff as the volatile tail.
-				pi.sendUserMessage(handoverText(run));
+				pi.sendUserMessage(await handoverText(run));
 				ctx.ui.notify("orchestrate: condensed handover sent", "info");
 				return;
 			}
@@ -1073,7 +1126,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				run.operator_note = undefined;
 				const wanted = owed?.lane ?? run.lane;
 				ctx.ui.notify(`orchestrate: flip ledger cleared; landing ${wanted}`, "info");
-				persist();
+				await persist();
 				paint(ctx);
 				void requestLane(wanted, ctx);
 				return;
@@ -1095,7 +1148,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 									: first === "halt"
 										? actHalt(run)
 										: actCode(run);
-				persist();
+				await persist();
 				paint(ctx);
 				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
 				if (!run.paused && pending) {
@@ -1113,7 +1166,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				}
 				if (TERMINAL[run.state] !== true) {
 					run.state = "stopped";
-					persist();
+					// The SYNC write, kept on purpose for this ONE site: `stop` is the run's shutdown
+					// path and the session can close in the same keystroke, so the terminal state is
+					// durable before this command returns, with no write left in flight.
+					if (runDir) writeJson(statePath(), run);
 				}
 				pending = undefined;
 				clearSurface(ctx);
@@ -1151,6 +1207,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return;
 			}
 			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
+			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
+			// in this run reads a pre-load engine state.
+			engineProofInvalidate();
 			const loaded = await loadLane(THINK_LANE);
 			ctx.ui.setWorkingMessage();
 			if (!loaded.ok) {
@@ -1168,7 +1227,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// A non-git run root is knowable at this keystroke and changes what the loop can prove; say it
 			// now, not two rounds later as a wall of red `blocked` rows: in a non-git root the phase
 			// synthesizer has no git evidence at all, so every task lands `blocked`.
-			if (!isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${gitCaveat(repo)}`, "warning");
+			if (!(await isGitRepo(repo))) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
 			runDir = join(repo, "var", "omp-orchestrate");
 			run = {
 				key: STATE_KEY,
@@ -1188,8 +1247,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				started_utc: new Date().toISOString(),
 			};
 			settledNotified = false;
-			writeJson(join(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
-			persist();
+			await writeJsonAsync(join(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+			await persist();
 			const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
 			if (!model) {
 				fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
@@ -1204,7 +1263,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			paint(ctx);
 			startMetricsTimer();
 			await ensurePhaseTool();
-			pi.sendUserMessage(briefings.plan(run));
+			pi.sendUserMessage(await briefings.plan(run));
 		},
 	});
 
@@ -1229,8 +1288,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// `/orchestrate status`, the panel, and `docs/OVERLAY.md`.
 		const chordNote = resolveChord();
 		const repo = ctx.cwd;
-		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
-		const state = readJson<RunState>(join(repo, "var", "omp-orchestrate", STATE_FILENAME));
+		const active = await readJsonAsync<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
+		const state = await readJsonAsync<RunState>(join(repo, "var", "omp-orchestrate", STATE_FILENAME));
 		let runNote: string | undefined;
 		if (active && state) {
 			runDir = join(repo, "var", "omp-orchestrate");
@@ -1243,9 +1302,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
 				// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
 				// same line as everything else the login says.
-				setTimeout(() => {
+				setTimeout(async () => {
 					const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-					if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
+					if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
 				}, 250);
 				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
 			} else {
@@ -1295,7 +1354,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const tier = classifyTurnEnd(run, false);
 			if (tier === "nudge") {
 				pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT})`);
-				persist();
+				await persist();
 				paint(ctx);
 				ctx.ui.notify(`orchestrate: protocol nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT} — round ${run.round} unspent, no swap paid`, "warning");
 				await ensurePhaseTool();
@@ -1307,13 +1366,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// Tier-2: the result is built from what the machine can prove — the plan's own
 				// checks (exit codes) and git. A RED gate keeps the coder lane resident, exactly
 				// like the tool's pre-swap gate: the swap is paid only for a green tree.
-				gateChecks(ctx);
+				await gateChecks(ctx);
 				const gate = run.checks.length > 0 ? await runGateLogged(run.checks, run.repo, ctx) : undefined;
 				if (gate) run.gate_last = gate;
 				if (gate && !gate.passed) {
 					const failing = gate.results.filter((r) => !r.ok);
 					pushRejection(run, "task", `synthesized round refused: pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
-					persist();
+					await persist();
 					paint(ctx);
 					pending = { lane: CODE_LANE, phase: "gate" };
 					settledNotified = false;
@@ -1322,10 +1381,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					void recordTurn("gate_red");
 					return;
 				}
-				const syn = synthesizeCodingDone(run, run.repo);
+				const syn = await synthesizeCodingDone(run, run.repo);
 				pushRejection(run, "protocol", `coding_done SYNTHESIZED from git status/diff + gate exit codes after ${run.stall_count} phase-less turns`);
 				const applied = applyPhase("coding_done", { done: syn.done });
-				persist();
+				await persist();
 				paint(ctx);
 				ctx.ui.notify(`orchestrate: coding_done synthesized from git + gate (round ${run.round}); the verifier swap is paid once`, "warning");
 				void recordTurn("synthesized");
@@ -1340,16 +1399,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				run.paused = true;
 				run.reason = `${run.protocol_retries ?? 0} turn(s) ended with no fade_phase call from state ${stalledFrom}`;
 				pushRejection(run, "protocol", `circuit breaker: ${run.reason}`);
-				persist();
+				await persist();
 				paint(ctx);
-				ctx.ui.notify(briefings.stalled(run), "error");
+				ctx.ui.notify(await briefings.stalled(run), "error");
 				void recordTurn("stalled_protocol_error");
 				return;
 			}
 			// A phase-less turn in a state git cannot speak for (planning, verifying): nudge harder,
 			// with the schemas attached, and never spend a round.
 			pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (tier ${tier})`);
-			persist();
+			await persist();
 			paint(ctx);
 			await ensurePhaseTool();
 			pi.sendUserMessage(`${briefings.nudge(run)}\n${SCHEMA_HINT}`);
@@ -1382,19 +1441,21 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// write past it. `task` is NOT refused — it writes nothing itself, its spawned sessions are
 	// inert by `isDelegatedSession`, and refusing it would only block the coding session that
 	// owns the run.
-	pi.on("tool_call", (event: { toolName?: string }) => {
+	pi.on("tool_call", async (event: { toolName?: string }) => {
 		// The guard reads the ON-DISK run, not this session's copy: a session started before a
 		// lane change would otherwise enforce a lane that no longer exists, with no way to
 		// unblock the session. Enforcement is the VERIFIER'S TURN only — `state: verifying` is
 		// the state the row names — and never inside a delegated session, which is inert by
-		// `isDelegatedSession`.
+		// `isDelegatedSession`. The read is `liveState`: this hook fires on EVERY tool call, and
+		// its whole-file `readFileSync` + parse of `state.json` was a per-keystroke stall of the
+		// host's loop; the mtime guard makes a steady run pay one `stat`.
 		if (!run || isDelegatedSession()) return undefined;
-		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
+		const live = await liveState();
 		if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return undefined;
 		const name = event.toolName ?? "";
 		if (MUTATING_TOOLS[name] !== true) return undefined;
 		pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);
-		persist();
+		await persist();
 		return { block: true, reason: `fade_orchestrate: the verifier lane is read-only — ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
 	});
 

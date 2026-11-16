@@ -5,14 +5,15 @@
  * The Tier-1 protocol gate: the nudge→synthesize→stall ladder costing no round, the
  * git-synthesized coding_done, the crash-safe state write, the checkpoint tags, and the
  * nudge/stalled briefings.
- * The single-instance lock: the exclusive claim, the live-holder refusal (foreign pid and this
- * pid included), and the reclaim of a corpse, an ownerless file, and corrupt JSON.
+ * The freeze audit's helpers: `writeJsonAsync` round-trips durably, `coalesceWrite` pays ONE
+ * on-disk write for a burst, `execGitAsync` answers the git calls that used to block the TUI's
+ * loop, and `readTurns` honours its TAIL bound instead of parsing the whole append-only ledger.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,9 +24,11 @@ import {
 	checkParses,
 	checkpointName,
 	classifyTurnEnd,
+	coalesceWrite,
 	countRejections,
 	critiquesFor,
 	diffStat,
+	execGitAsync,
 	expectation,
 	gateSummary,
 	gitCaveat,
@@ -35,11 +38,11 @@ import {
 	LOCK_FILENAME,
 	MAX_WINDOW_TASKS,
 	normalizeRun,
+	parseJson,
 	porcelain,
 	porcelainEntries,
 	pushRejection,
 	readInstanceLock,
-	readJson,
 	refreshChecks,
 	refreshRoot,
 	releaseInstanceLock,
@@ -53,8 +56,10 @@ import {
 	validateDone,
 	validateTasks,
 	writeJson,
+	writeJsonAsync,
 } from "../.test-build/core.mjs";
 import { gateRows } from "../.test-build/screendata.mjs";
+import { TURN_TAIL_DEFAULT, appendTurn, readTurns } from "../.test-build/history.mjs";
 import { commitAll, initRepo } from "./fixture.mjs";
 
 const mkRun = (over = {}) =>
@@ -98,12 +103,12 @@ test("pushRejection appends newest-last and caps at 50", () => {
 	assert.equal(run.rejection_history[0].reason, "refusal 10", "oldest dropped");
 });
 
-test("the repair briefing carries the last rejections and omits the section when there are none", () => {
+test("the repair briefing carries the last rejections and omits the section when there are none", async () => {
 	const bare = mkRun();
 	assert.equal(bare.rejection_history.length, 0);
-	assert.equal(briefings.repair(bare).includes("Previously rejected"), false);
+	assert.equal((await briefings.repair(bare)).includes("Previously rejected"), false);
 	pushRejection(bare, "verification", "verdict needed real acceptance output", "T1");
-	const text = briefings.repair(bare);
+	const text = await briefings.repair(bare);
 	assert.match(text, /Previously rejected/);
 	assert.match(text, /round 2 \[verification\] T1: verdict needed real acceptance output/);
 });
@@ -183,10 +188,10 @@ test("the gate briefing names each failing command and its expected text", () =>
 	assert.equal(text.includes("FAIL: true"), false, "green checks are not listed");
 });
 
-test("handover is stable-first: definitions before statuses (the cache-hitting prefix)", () => {
+test("handover is stable-first: definitions before statuses (the cache-hitting prefix)", async () => {
 	const run = mkRun({ repo: process.cwd(), state: "coding", round: 3 });
 	pushRejection(run, "verification", "T1 verdict skipped a check", "T1");
-	const text = handoverText(run);
+	const text = await handoverText(run);
 	const stable = text.indexOf("Task definitions");
 	const volatile = text.indexOf("Task state");
 	const rej = text.indexOf("Rejections so far");
@@ -194,23 +199,23 @@ test("handover is stable-first: definitions before statuses (the cache-hitting p
 	assert.match(text, /Phase contract/);
 });
 
-test("handover carries the gate failure tail", () => {
+test("handover carries the gate failure tail", async () => {
 	const run = mkRun({
 		gate_last: { at: "x", passed: false, results: [{ cmd: "cargo check", expected: "0", ok: false, tail: "error[E0308]" }] },
 	});
-	assert.match(handoverText(run), /Last pre-swap gate FAILED/);
-	assert.match(handoverText(run), /E0308/);
+	assert.match(await handoverText(run), /Last pre-swap gate FAILED/);
+	assert.match(await handoverText(run), /E0308/);
 });
 
-test("diffStat names the working-tree change or the clean state", () => {
+test("diffStat names the working-tree change or the clean state", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-diff-"));
 	try {
 		initRepo(dir);
 		writeFileSync(join(dir, "f.ts"), "x");
 		commitAll(dir);
-		assert.match(diffStat(dir), /working tree clean/);
+		assert.match(await diffStat(dir), /working tree clean/);
 		writeFileSync(join(dir, "f.ts"), "y");
-		assert.match(diffStat(dir), /f\.ts/);
+		assert.match(await diffStat(dir), /f\.ts/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -257,48 +262,48 @@ test("refreshChecks: re-declaring a row's accepted state (the second element) re
 	assert.equal(again.changed, false, "an equal file of PAIRS is a silent no-op");
 });
 
-test("refreshRoot: the gate re-roots when the state file names another working tree, keyed by run_id", () => {
+test("refreshRoot: the gate re-roots when the state file names another working tree, keyed by run_id", async () => {
 	// The livelock this pins: a run started in repo A and aimed at repo B. Every check is
 	// `bash -lc <cmd>` at run.repo, so B's src/, ci/ and benches/ do not exist, B's package is
 	// "No module named", and no change made inside B can ever pay the gate.
 	const run = mkRun({ repo: "/repo/A" });
-	const moved = refreshRoot(run, { ...run, repo: "/repo/B" }, (p) => p === "/repo/B");
+	const moved = await refreshRoot(run, { ...run, repo: "/repo/B" }, (p) => p === "/repo/B");
 	assert.equal(moved.changed, true);
 	assert.equal(run.repo, "/repo/B", "the gate runs where the code is");
 	assert.deepEqual([moved.from, moved.to], ["/repo/A", "/repo/B"], "the move is named, never silent");
-	assert.equal(refreshRoot(run, { ...run, repo: "/repo/B" }, () => true).changed, false, "an equal root is a no-op");
-	const notGit = refreshRoot(run, { ...run, repo: "/repo/C" }, () => false);
+	assert.equal((await refreshRoot(run, { ...run, repo: "/repo/B" }, () => true)).changed, false, "an equal root is a no-op");
+	const notGit = await refreshRoot(run, { ...run, repo: "/repo/C" }, () => false);
 	assert.equal(notGit.changed, false, "a path that is not a working tree is refused");
 	assert.match(notGit.refused ?? "", /not a git working tree/, "the refusal names its reason");
 	assert.equal(run.repo, "/repo/B", "the refusal left the run where it was");
-	assert.equal(refreshRoot(run, { ...run, run_id: "OTHER-RUN", repo: "/repo/D" }, () => true).changed, false, "a state file from another run is never adopted");
-	assert.equal(refreshRoot(run, undefined, () => true).changed, false, "no state file is a no-op");
-	assert.equal(refreshRoot(run, { ...run, repo: "" }, () => true).changed, false, "an empty repo string is never adopted");
+	assert.equal((await refreshRoot(run, { ...run, run_id: "OTHER-RUN", repo: "/repo/D" }, () => true)).changed, false, "a state file from another run is never adopted");
+	assert.equal((await refreshRoot(run, undefined, () => true)).changed, false, "no state file is a no-op");
+	assert.equal((await refreshRoot(run, { ...run, repo: "" }, () => true)).changed, false, "an empty repo string is never adopted");
 	const here = process.cwd();
-	assert.equal(refreshRoot(mkRun({ repo: here }), { ...mkRun({ repo: here }), repo: here }).changed, false, "the default probe agrees: an equal path never moves");
+	assert.equal((await refreshRoot(mkRun({ repo: here }), { ...mkRun({ repo: here }), repo: here })).changed, false, "the default probe agrees: an equal path never moves");
 });
 
-test("a non-repo run root degrades by name: git's --no-index usage page never reaches a briefing", () => {
+test("a non-repo run root degrades by name: git's --no-index usage page never reaches a briefing", async () => {
 	// The defect: a run root that is not a working tree. Outside a tree `git diff` does not fail —
 	// it switches to --no-index mode and prints ~60 lines of usage, which rides into the briefing as
 	// the `Working tree:` line and into the TUI as a warning.
 	const dir = mkdtempSync(join(tmpdir(), "orch-norepo-"));
 	try {
-		assert.equal(isGitRepo(dir), false, "a bare temp dir is not a working tree");
-		const cases = [["diffStat", diffStat(dir)], ["porcelain", porcelain(dir)]];
+		assert.equal(await isGitRepo(dir), false, "a bare temp dir is not a working tree");
+		const cases = [["diffStat", await diffStat(dir)], ["porcelain", await porcelain(dir)]];
 		for (const [name, text] of cases) {
 			assert.match(text, /not a git repo/, `${name} names the condition`);
 			for (const leak of ["usage:", "no-index", "pathspec", "Not a git repository"]) {
 				assert.ok(!text.includes(leak), `${name} never carries git's usage text (${leak})`);
 			}
 		}
-		assert.equal(porcelainEntries(porcelain(dir)).length, 0, "the sentinel parses to ZERO entries");
+		assert.equal(porcelainEntries(await porcelain(dir)).length, 0, "the sentinel parses to ZERO entries");
 		const run = mkRun({ repo: dir, state: "coding", round: 2, tasks: [mkTask("T1", ["a.ts"])], repair_tasks: [] });
-		const syn = synthesizeCodingDone(run, dir);
+		const syn = await synthesizeCodingDone(run, dir);
 		assert.equal(syn.done[0].status, "blocked");
 		assert.match(syn.done[0].result, /not a git repo/, "the synthesizer's evidence names the missing repo");
-		assert.match(handoverText(run), /not a git repo/, "the working-tree line is the sentinel");
-		const ckpt = tagCheckpoint(dir, run, "T1");
+		assert.match(await handoverText(run), /not a git repo/, "the working-tree line is the sentinel");
+		const ckpt = await tagCheckpoint(dir, run, "T1");
 		assert.equal(ckpt.ok, false);
 		assert.match(ckpt.error ?? "", /not a git repo/, "the refused checkpoint tag is named");
 	} finally {
@@ -349,7 +354,7 @@ test("countRejections separates schema refusals from verification bounces; the r
 	assert.equal(run.round, 3, "a schema refusal is reported as schema_error and never spends a round");
 });
 
-test("synthesizeCodingDone reads real git: passed for the task whose file moved, blocked for the one that did not", () => {
+test("synthesizeCodingDone reads real git: passed for the task whose file moved, blocked for the one that did not", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-synth-"));
 	try {
 		initRepo(dir);
@@ -366,7 +371,7 @@ test("synthesizeCodingDone reads real git: passed for the task whose file moved,
 			repair_tasks: [],
 			gate_last: { at: "2030-01-01T00:00:00Z", passed: false, results: [{ cmd: "npm test", expected: "0 failures", ok: false, tail: "1 failed" }] },
 		});
-		const s = synthesizeCodingDone(run, dir);
+		const s = await synthesizeCodingDone(run, dir);
 		const byId = Object.fromEntries(s.done.map((d) => [d.id, d]));
 		assert.equal(byId.T1.status, "passed");
 		assert.match(byId.T1.result, /src\/a\.ts/, "the result quotes the porcelain entry it used");
@@ -394,7 +399,7 @@ test("porcelainEntries keeps the XY code and takes a rename's destination path",
 	assert.deepEqual(porcelainEntries("(working tree clean)"), [], "the sentinel is not an entry");
 });
 
-test("checkpointName is run-namespaced and tagCheckpoint writes the tag, records it, and reports failure", () => {
+test("checkpointName is run-namespaced and tagCheckpoint writes the tag, records it, and reports failure", async () => {
 	const run = mkRun();
 	assert.equal(checkpointName(run, "T3"), "omp-ckpt/R/T3-passed");
 	const dir = mkdtempSync(join(tmpdir(), "orch-ckpt-"));
@@ -402,15 +407,15 @@ test("checkpointName is run-namespaced and tagCheckpoint writes the tag, records
 		initRepo(dir);
 		writeFileSync(join(dir, "f.ts"), "x");
 		commitAll(dir);
-		const first = tagCheckpoint(dir, run, "T1");
+		const first = await tagCheckpoint(dir, run, "T1");
 		assert.equal(first.ok, true, first.error);
 		assert.equal(first.tag, "omp-ckpt/R/T1-passed");
 		assert.equal(run.checkpoints.T1, first.tag);
 		const listed = execFileSync("git", ["-C", dir, "tag", "--list"], { encoding: "utf8" });
 		assert.match(listed, /^omp-ckpt\/R\/T1-passed$/m);
-		assert.equal(tagCheckpoint(dir, run, "T1").ok, true, "a re-passed task moves its tag forward");
+		assert.equal((await tagCheckpoint(dir, run, "T1")).ok, true, "a re-passed task moves its tag forward");
 		assert.equal(checkpointName(run, "T1"), checkpointName(run, "T1"), "the name is stable per run+task");
-		const bad = tagCheckpoint(join(dir, "not-a-repo"), run, "T2");
+		const bad = await tagCheckpoint(join(dir, "not-a-repo"), run, "T2");
 		assert.equal(bad.ok, false);
 		assert.ok(bad.error && bad.error.length > 0, "the failure is named, never silent");
 		assert.equal(run.checkpoints.T2, undefined, "a failed tag is never recorded");
@@ -425,10 +430,10 @@ test("writeJson is crash-safe: fsync + rename leaves no .tmp and the record pars
 		const path = join(dir, "runs", "state.json");
 		writeJson(path, { run_id: "R", round: 3 });
 		assert.equal(existsSync(`${path}.tmp`), false, "the temp file is renamed, never left behind");
-		assert.deepEqual(readJson(path), { run_id: "R", round: 3 });
+		assert.deepEqual(parseJson(readFileSync(path, "utf8")), { run_id: "R", round: 3 });
 		assert.equal(JSON.parse(readFileSync(path, "utf8")).round, 3, "fsync ran and the bytes are on disk");
 		writeJson(path, { run_id: "R", round: 4 });
-		assert.equal(readJson(path).round, 4, "a rewrite over a live record stays atomic");
+		assert.equal(parseJson(readFileSync(path, "utf8")).round, 4, "a rewrite over a live record stays atomic");
 		assert.equal(existsSync(`${path}.tmp`), false);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -447,7 +452,7 @@ test("the nudge briefing names the owed phase, the unspent round, and the cost o
 	assert.match(text, /stalled_protocol_error/, "the lane is told what the next miss costs");
 });
 
-test("the stalled briefing is the Tier-3 diagnostic: halted state, RED gate tails, git state, the resume path", () => {
+test("the stalled briefing is the Tier-3 diagnostic: halted state, RED gate tails, git state, the resume path", async () => {
 	const run = mkRun({
 		state: "coding",
 		protocol_retries: 3,
@@ -459,7 +464,7 @@ test("the stalled briefing is the Tier-3 diagnostic: halted state, RED gate tail
 		gate_last: { at: "x", passed: false, results: [{ cmd: "npm test", expected: "0 failures", ok: false, tail: "2 failed" }] },
 	});
 	pushRejection(run, "schema", "payload is not JSON", "T1");
-	const text = briefings.stalled(run);
+	const text = await briefings.stalled(run);
 	assert.match(text, /HALTED: stalled_protocol_error/);
 	assert.match(text, /3 turn\(s\) ended with no fade_phase call/);
 	assert.match(text, /RED: npm test/);
@@ -515,7 +520,7 @@ test("roundWindow: T3 -> T1 leaves T1+T2 for ONE coder window and names T3's blo
 	assert.equal(ids(w.open), "T1,T2,T3", "every unpassed task is open");
 });
 
-test("roundWindow caps at MAX_WINDOW_TASKS, drops passed tasks, and counts a passed dependency as met", () => {
+test("roundWindow caps at MAX_WINDOW_TASKS, drops passed tasks, and counts a passed dependency as met", async () => {
 	const run = winRun([
 		{ ...winTask("T1"), status: "passed" },
 		winTask("T2"),
@@ -529,8 +534,8 @@ test("roundWindow caps at MAX_WINDOW_TASKS, drops passed tasks, and counts a pas
 	assert.equal(w.readyNow.length, MAX_WINDOW_TASKS, "the window is capped, not the plan");
 	assert.equal(ids(w.readyNow), "T2,T3,T4,T5", "T4's dependency is passed, so it is ready, in plan order");
 	assert.deepEqual(w.blocked, [], "a passed dependency blocks nothing; the task cut by the cap is the NEXT window's work");
-	assert.match(briefings.window(run), /past the 4-task window cap/, "the briefing names the cap that deferred it");
-	assert.match(briefings.window(run), /cap.*T6/, "and the task it deferred");
+	assert.match(await briefings.window(run), /past the 4-task window cap/, "the briefing names the cap that deferred it");
+	assert.match(await briefings.window(run), /cap.*T6/, "and the task it deferred");
 });
 
 test("a coding_done reporting T1+T2 marks BOTH passed and spends no extra round (one window, one swap)", () => {
@@ -548,10 +553,10 @@ test("a coding_done reporting T1+T2 marks BOTH passed and spends no extra round 
 	assert.equal(ids(roundWindow(run).readyNow), "T3", "T3 is the next window, unblocked by the batch, in the SAME round");
 });
 
-test("briefings.window carries every ready objective UNTRUNCATED, the blocked ids, and the header", () => {
+test("briefings.window carries every ready objective UNTRUNCATED, the blocked ids, and the header", async () => {
 	const long = "HEAD-OF-A-LONG-CONTRACT " + "keep-this-card-in-full ".repeat(30) + " TAIL-OF-THE-ACCEPTANCE";
 	const run = winRun([winTask("T1", [], long), winTask("T2"), winTask("T3", ["T1"])], { round: 1, max_rounds: 4 });
-	const text = briefings.window(run);
+	const text = await briefings.window(run);
 	assert.match(text, /round 1\/4 · T2\/3 · lane flash-next/, "the round · tasks · lane header the other briefings use");
 	assert.ok(text.includes(long), "the objective is verbatim: head AND tail present, nothing sliced");
 	assert.ok(text.includes("src/t1.ts") && text.includes("npm test -- T1"), "files and acceptance ride in full");
@@ -593,12 +598,12 @@ test("the window follows the repair pool while a repair round is in flight", () 
 	assert.equal(run.repair_tasks[0].status, "passed", "it is the repair task that was marked");
 });
 
-test("an all-blocked window says so and blocks the report it cannot make", () => {
+test("an all-blocked window says so and blocks the report it cannot make", async () => {
 	const run = winRun([{ ...winTask("T1", ["T2"]) }, { ...winTask("T2", ["T1"]) }]);
 	const w = roundWindow(run);
 	assert.deepEqual(w.readyNow, []);
 	assert.deepEqual(w.blocked, [{ id: "T1", blockedBy: ["T2"] }, { id: "T2", blockedBy: ["T1"] }], "a dependency cycle is reported, not swallowed");
-	assert.match(briefings.window(run), /window is EMPTY/);
+	assert.match(await briefings.window(run), /window is EMPTY/);
 	assert.equal(validateDone(run, [{ id: "T1", status: "passed", result: "x" }]).error, undefined, "with no window there is no window to skip");
 });
 
@@ -693,13 +698,13 @@ test("validateTasks carries a declared complexity and refuses a non-name by name
 	assert.match(bad.error ?? "", /complexity must be trivial\|standard\|deep/, "the refusal names the allowed set");
 });
 
-test("the loop reads the plan's cap — the window header and the nudge both say R/2", () => {
+test("the loop reads the plan's cap — the window header and the nudge both say R/2", async () => {
 	const run = mkRun({ max_rounds: roundsForTasks([tierTask("T1", "trivial")], 6), round: 2, state: "coding", repair_tasks: [], tasks: [winTask("T1")] });
-	assert.match(briefings.window(run), /round 2\/2/, "the coder sees the plan's budget, not the flat 6");
+	assert.match(await briefings.window(run), /round 2\/2/, "the coder sees the plan's budget, not the flat 6");
 	assert.match(briefings.nudge(run), /round 2\/2/, "and so does the protocol nudge");
 });
 
-test("a task rejected twice is briefed with ITS OWN critique, counted, and told the diff was tried", () => {
+test("a task rejected twice is briefed with ITS OWN critique, counted, and told the diff was tried", async () => {
 	const run = mkRun({
 		round: 3,
 		state: "repair",
@@ -713,7 +718,7 @@ test("a task rejected twice is briefed with ITS OWN critique, counted, and told 
 			rej(2, "task", "T2", "T2: no acceptance output in the report"),
 		],
 	});
-	const p = briefings.repair(run);
+	const p = await briefings.repair(run);
 	assert.match(p, /BY TASK:/, "the critique arrives grouped by task, not as a transcript");
 	assert.match(p, /T1 — rejected 2× \(latest round 2, verification\)/, "the count and the newest round are named");
 	assert.ok(p.includes("T1: same diff, the test still exits 1"), "the newest critique for T1 rides verbatim");
@@ -722,18 +727,18 @@ test("a task rejected twice is briefed with ITS OWN critique, counted, and told 
 	assert.ok(p.includes("T2: no acceptance output in the report"));
 });
 
-test("a task with no history earns no critique line (the block is data, not boilerplate)", () => {
-	const p = briefings.repair(mkRun({ round: 2, rejection_history: [] }));
+test("a task with no history earns no critique line (the block is data, not boilerplate)", async () => {
+	const p = await briefings.repair(mkRun({ round: 2, rejection_history: [] }));
 	assert.ok(!p.includes("BY TASK:"), "no rejections, no critique block");
 });
 
-test("the coding window carries the critique of the tasks IN the window, on the round that re-briefs them", () => {
+test("the coding window carries the critique of the tasks IN the window, on the round that re-briefs them", async () => {
 	const run = winRun([winTask("T1"), winTask("T2")], { round: 2, rejection_history: [rej(1, "verification", "T1", "T1: the cache key is stale")] });
-	const w = briefings.window(run);
+	const w = await briefings.window(run);
 	assert.match(w, /Rejected before — the verifier's critique/, "round 2 names the rejections the window inherits");
 	assert.ok(w.includes("T1: the cache key is stale"));
 	const first = winRun([winTask("T1"), winTask("T2")], { round: 1, rejection_history: [rej(1, "verification", "T1", "T1: the cache key is stale")] });
-	assert.ok(!briefings.window(first).includes("Rejected before"), "the FIRST window of a round has nothing to inherit");
+	assert.ok(!(await briefings.window(first)).includes("Rejected before"), "the FIRST window of a round has nothing to inherit");
 });
 
 test("critiquesFor reads the history BY TASK ID, newest last, and ignores schema/gate refusals", () => {
@@ -752,24 +757,24 @@ test("critiquesFor reads the history BY TASK ID, newest last, and ignores schema
 	assert.ok(lines[0].includes("T1: gate red again, same diff"), "the newest critique is the one quoted");
 });
 
-test("the repair prompt is the compact set — diff stat, checklist, last rejections, no prior-round tool logs", () => {
+test("the repair prompt is the compact set — diff stat, checklist, last rejections, no prior-round tool logs", async () => {
 	const run = mkRun({
 		round: 3,
 		repair_tasks: [{ id: "T1", objective: "fix", files: ["w.ts"], acceptance: "npm test -- w", dependencies: [], round: 3 }],
 		rejection_history: [rej(2, "verification", "T1", "T1: red gate")],
 	});
-	const p = briefings.repair(run);
+	const p = await briefings.repair(run);
 	assert.match(p, /^Working tree: /m, "the diff stat answers where the tree is");
 	assert.ok(p.includes("Checklist: T1: npm test -- w"), "the checklist is one line, not the transcript");
 	assert.match(p, /no prior-round tool logs/);
 	assert.ok(!/stdout|traceback|full log/i.test(p), "no prior-round log dumps ride");
 	assert.ok(p.length < 2500, `the repair prompt stays compact: ${p.length} chars`);
-	const h = handover(run);
+	const h = await handover(run);
 	assert.ok(h.stable.join("\n").includes("Task definitions:"), "the stable prefix (goal, contract, task definitions) leads");
 	assert.ok(h.volatile.join("\n").includes("Working tree:"), "the volatile tail goes last");
 });
 
-test("a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and the prompt names all 3 ids", () => {
+test("a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and the prompt names all 3 ids", async () => {
 	const run = winRun([winTask("T1"), winTask("T2"), winTask("T3")]);
 	assert.equal(ids(roundWindow(run).readyNow), "T1,T2,T3", "three tasks, one window, zero cuts");
 	const v = validateDone(run, [
@@ -779,7 +784,7 @@ test("a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and 
 	]);
 	assert.equal(v.error, undefined, v.error ?? "");
 	assert.match(
-		briefings.window(run),
+		await briefings.window(run),
 		/ONE coding_done payload: \{"done":\[\{"id":"T1".*\{"id":"T2".*\{"id":"T3"/,
 		"the contract the lane is briefed with names every id of the window",
 	);
@@ -849,21 +854,21 @@ test("gateRows: the as-expected rows are labelled and counted, and the gate read
 // ── the non-git run root: named at the first keystroke, not as a wall of red rows two rounds later ─
 // Measured in a run rooted outside any git repo: the T2 synthesizer reads
 // `git status --porcelain`, so all six tasks landed `blocked` with the sentinel tail.
-test("gitCaveat and the briefings name a non-git run root, and stay silent in a working tree", () => {
+test("gitCaveat and the briefings name a non-git run root, and stay silent in a working tree", async () => {
 	const plain = mkdtempSync(join(tmpdir(), "orch-nogit-"));
 	const tree = mkdtempSync(join(tmpdir(), "orch-git-"));
 	try {
 		execFileSync("git", ["-C", tree, "init", "-q"], { stdio: "pipe" });
-		assert.match(gitCaveat(plain), /NOT a git repo/);
-		assert.ok(gitCaveat(plain).includes("git init " + plain), "the act is the literal command");
-		assert.equal(gitCaveat(tree), "", "a working tree gets no caveat");
+		assert.match(await gitCaveat(plain), /NOT a git repo/);
+		assert.ok((await gitCaveat(plain)).includes("git init " + plain), "the act is the literal command");
+		assert.equal(await gitCaveat(tree), "", "a working tree gets no caveat");
 		const r = (repo) => mkRun({ repo });
-					const pairs = [["plan", briefings.plan(r(plain))], ["code", briefings.code(r(plain))], ["window", briefings.window(r(plain))], ["repair", briefings.repair(r(plain))]];
+		const pairs = [["plan", await briefings.plan(r(plain))], ["code", await briefings.code(r(plain))], ["window", await briefings.window(r(plain))], ["repair", await briefings.repair(r(plain))]];
 			for (const [name, text] of pairs) {
 			assert.match(text, /NOT a git repo/, `${name} briefing names the root state`);
 			assert.match(text, /git init/, `${name} briefing names the act`);
 		}
-		assert.doesNotMatch(briefings.plan(r(tree)), /NOT a git repo/, "the same briefing in a repo says nothing");
+		assert.doesNotMatch(await briefings.plan(r(tree)), /NOT a git repo/, "the same briefing in a repo says nothing");
 	} finally {
 		rmSync(plain, { recursive: true, force: true });
 		rmSync(tree, { recursive: true, force: true });
@@ -949,5 +954,106 @@ test("a lock that cannot name its owner is a corpse: corrupt JSON and a missing 
 	} finally {
 		rmSync(corrupt, { recursive: true, force: true });
 		rmSync(nopid, { recursive: true, force: true });
+	}
+});
+
+// ── the freeze audit's own helpers ────────────────────────────────────────────────────────────
+// The TUI froze because every durable write and every git call ran inside the host's own loop.
+// These four are the shapes the fix rests on: the async durable write, the slot that turns a
+// burst of persists into ONE write of the LAST payload, the git call that answers (and REJECTS
+// outside a tree, where the sync form leaked a usage page), and the ledger read that costs the
+// tail's size instead of the whole append-only file.
+
+test("writeJsonAsync round-trips and leaves no .tmp (the async form keeps the durability ordering)", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-json-async-"));
+	try {
+		const path = join(dir, "runs", "state.json");
+		await writeJsonAsync(path, { run_id: "R", round: 7 });
+		assert.equal(existsSync(`${path}.tmp`), false, "the temp file is renamed, never left behind");
+		assert.deepEqual(parseJson(readFileSync(path, "utf8")), { run_id: "R", round: 7 }, "the record parses back byte for byte");
+		await writeJsonAsync(path, { run_id: "R", round: 8 });
+		assert.equal(parseJson(readFileSync(path, "utf8")).round, 8, "a rewrite over a live record stays atomic");
+		assert.equal(existsSync(`${path}.tmp`), false, "no temp file survives the second write either");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("coalesceWrite pays ONE on-disk write for a burst, carrying the LAST payload", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-coalesce-"));
+	try {
+		const path = join(dir, "state.json");
+		const first = coalesceWrite(path, { round: 1, marker: "superseded" });
+		const second = coalesceWrite(path, { round: 2, marker: "last" });
+		assert.equal(first, second, "the rapid call rides the in-flight slot: it queued no second write");
+		await second;
+		assert.deepEqual(parseJson(readFileSync(path, "utf8")), { round: 2, marker: "last" }, "the record on disk is the LAST payload, so the superseded one was never written");
+		assert.equal(existsSync(`${path}.tmp`), false, "no temp file is left behind");
+		const third = coalesceWrite(path, { round: 3, marker: "next" });
+		assert.notEqual(third, second, "the slot is released once the queue drains, so a later write is its own chain");
+		await third;
+		assert.equal(parseJson(readFileSync(path, "utf8")).round, 3, "the released slot writes again");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a refused coalesced write rejects ITS call and leaves the chain usable", async () => {
+	// The state directory is the operator's. A write that cannot land (a janitor mid-run, a read-only
+	// mount, a full disk) used to poison the path's chain: every later phase rode a rejected promise,
+	// the loop stopped persisting, and the host's loop took an unhandled rejection.
+	if (typeof process.getuid === "function" && process.getuid() === 0) {
+		// root ignores the mode below, so there is nothing to refuse here; the gate rig proves the
+		// same shape on a tree that wiped its state dir mid-run.
+		return;
+	}
+	const dir = mkdtempSync(join(tmpdir(), "orch-coalesce-break-"));
+	try {
+		const path = join(dir, "state.json");
+		await coalesceWrite(path, { round: 1, marker: "written" });
+		chmodSync(dir, 0o500); // r-x: the directory is there, the tmp file is not writable
+		let refused = undefined;
+		try {
+			await coalesceWrite(path, { round: 2, marker: "refused" });
+		} catch (e) {
+			refused = e;
+		}
+		chmodSync(dir, 0o700);
+		assert.ok(refused, "the call that could not write is the one that reports it");
+		await coalesceWrite(path, { round: 3, marker: "after" });
+		assert.equal(parseJson(readFileSync(path, "utf8")).round, 3, "the chain keeps writing after a refused write");
+	} finally {
+		chmodSync(dir, 0o700);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("execGitAsync answers in a working tree and REJECTS outside one", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-execgit-"));
+	try {
+		initRepo(dir);
+		assert.match(await execGitAsync(dir, ["rev-parse", "--git-dir"]), /\.git/, "stdout is git's answer");
+		await assert.rejects(
+			() => execGitAsync(join(dir, "not-a-repo"), ["rev-parse", "--git-dir"]),
+			"outside a tree the call rejects, so every reader names the condition instead of printing git's usage page",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("readTurns honours its TAIL bound: 600 ledger lines, the bound's count, the newest present", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-tail-"));
+	try {
+		const total = TURN_TAIL_DEFAULT + 100;
+		for (let i = 1; i <= total; i++) await appendTurn(dir, { ts: `2030-01-01T00:00:${String(i % 60).padStart(2, "0")}Z`, run_id: "R", turn: i, round: 1, pp: 1000, tg: 130, swap_ms: 0, round_outcome: "accepted" });
+		const tail = await readTurns(dir);
+		assert.equal(tail.length, TURN_TAIL_DEFAULT, "the read is the bound, not the whole append-only ledger");
+		assert.equal(tail[tail.length - 1].turn, total, "the newest record is present");
+		assert.equal(tail[0].turn, total - TURN_TAIL_DEFAULT + 1, "the oldest kept is exactly the bound back, and no partial line parsed");
+		assert.equal((await readTurns(dir, 12)).length, 12, "the panel's explicit smaller bound is honoured too");
+		assert.equal((await readTurns(join(dir, "nope"))).length, 0, "no ledger yet is an empty list, never a crash");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });

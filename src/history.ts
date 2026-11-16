@@ -7,10 +7,14 @@
  * Alongside it, the per-turn telemetry ledger: `metrics.jsonl`, one JSON record per completed
  * turn, append-only — the per-turn `pp`/`tg`/`ttft`/`kv_hit_pct`/`swap_ms` record a postmortem
  * reads line by line.
+ *
+ * Every read and write here is `fs.promises`, and `readTurns` reads a TAIL (default
+ * `turnTail()`, env `FADE_ORCHESTRATE_TURN_TAIL`), never the whole append-only file: the panel
+ * asks for both ledgers on the Alt+F keystroke and on its 2 s refresh tick, on the TUI's loop.
  */
 import { join } from "node:path";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
-import { readJson, writeJson } from "./core.ts";
+import { appendFile, mkdir, open, type FileHandle } from "node:fs/promises";
+import { readJsonAsync, writeJsonAsync } from "./core.ts";
 import type { LaneMoe } from "./moe.ts";
 
 export const HISTORY_FILENAME = "swap_history.json";
@@ -45,16 +49,21 @@ export interface SwapRow {
 	at: string;
 }
 
-export function readSwaps(dir: string): SwapRow[] {
-	const rows = readJson<{ rows?: SwapRow[] }>(join(dir, HISTORY_FILENAME));
+/**
+ * The swap ledger. ASYNC: the panel reads it on the Alt+F keystroke and on its 2 s refresh tick,
+ * and a `readFileSync` there is a stall of the host's paint loop.
+ */
+export async function readSwaps(dir: string): Promise<SwapRow[]> {
+	const rows = await readJsonAsync<{ rows?: SwapRow[] }>(join(dir, HISTORY_FILENAME));
 	return Array.isArray(rows?.rows) ? rows!.rows! : [];
 }
 
-export function appendSwap(dir: string, row: SwapRow): void {
-	const rows = readSwaps(dir);
+/** Read → prepend → durable write, all off the TUI's loop (`writeJsonAsync`: tmp, fdatasync, rename). */
+export async function appendSwap(dir: string, row: SwapRow): Promise<void> {
+	const rows = await readSwaps(dir);
 	rows.unshift(row);
 	if (rows.length > MAX_ROWS) rows.length = MAX_ROWS;
-	writeJson(join(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
+	await writeJsonAsync(join(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
 }
 
 /**
@@ -129,30 +138,64 @@ export function turnRecordOrNull(m: TurnMetrics | undefined, id: TurnIdentity): 
 }
 
 /** Exactly one newline-terminated line per call, into `${dir}/metrics.jsonl` (dir created). */
-export function appendTurn(dir: string, rec: TurnRecord): void {
-	mkdirSync(dir, { recursive: true });
-	appendFileSync(join(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}\n`);
+export async function appendTurn(dir: string, rec: TurnRecord): Promise<void> {
+	await mkdir(dir, { recursive: true });
+	await appendFile(join(dir, METRICS_JSONL_FILENAME), `${JSON.stringify(rec)}\n`);
 }
 
-/** The last `n` records. A half-written or hand-corrupted line is skipped, never fatal. */
-export function readTurns(dir: string, n: number): TurnRecord[] {
-	let raw: string;
+/** The tail bound: how many of the newest turn records a reader ever asks for. */
+export const TURN_TAIL_DEFAULT = 500;
+/** Read at CALL time: it is configuration, and `FADE_ORCHESTRATE_TURN_TAIL` is how an operator
+ *  trades ledger depth for the panel's read size. */
+export const turnTail = (): number => Math.max(1, Number(process.env.FADE_ORCHESTRATE_TURN_TAIL ?? TURN_TAIL_DEFAULT));
+/** Bytes per requested record when sizing the tail read — a record is ~300 B, this is headroom. */
+const TURN_RECORD_BYTES = 4096;
+
+/**
+ * The last `n` records (default: the tail bound, `turnTail()`).
+ *
+ * A TAIL read, not a whole-file read. The ledger is append-only and a long run leaves thousands
+ * of lines in it; the old reader read and parsed ALL of them on the panel's every 2 s tick, on
+ * the TUI's own loop, to show twelve rows. This opens the file, stats it, and reads the last
+ * `n * TURN_RECORD_BYTES` bytes at an offset — so the cost is the tail's size, not the ledger's.
+ * A tail that starts mid-file starts INSIDE a record: that first partial line is dropped, never
+ * parsed. A half-written or hand-corrupted line is skipped, never fatal, and a missing ledger is
+ * an empty list, never a crash and never a fabricated row.
+ */
+export async function readTurns(dir: string, n: number = turnTail()): Promise<TurnRecord[]> {
+	const limit = Math.max(1, Math.floor(n));
+	let fh: FileHandle | undefined;
 	try {
-		raw = readFileSync(join(dir, METRICS_JSONL_FILENAME), "utf8");
+		fh = await open(join(dir, METRICS_JSONL_FILENAME), "r");
 	} catch {
 		return [];
 	}
+	let text = "";
+	let partial = false;
+	try {
+		const size = (await fh.stat()).size;
+		if (size === 0) return [];
+		const start = Math.max(0, size - limit * TURN_RECORD_BYTES);
+		const buf = Buffer.alloc(size - start);
+		await fh.read(buf, 0, buf.length, start);
+		text = buf.toString("utf8");
+		partial = start > 0;
+	} finally {
+		await fh.close();
+	}
 	const recs: TurnRecord[] = [];
-	for (const line of raw.split("\n")) {
-		const text = line.trim();
-		if (text === "") continue;
+	const lines = text.split("\n");
+	if (partial) lines.shift();
+	for (const line of lines) {
+		const s = line.trim();
+		if (s === "") continue;
 		try {
-			const rec = JSON.parse(text) as TurnRecord;
+			const rec = JSON.parse(s) as TurnRecord;
 			// A line without the two numbers the store exists for is not a record.
 			if (rec && typeof rec === "object" && typeof rec.pp === "number" && typeof rec.tg === "number") recs.push(rec);
 		} catch {
 			/* corrupt line: skipped */
 		}
 	}
-	return recs.slice(Math.max(0, recs.length - n));
+	return recs.slice(Math.max(0, recs.length - limit));
 }

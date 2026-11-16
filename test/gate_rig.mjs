@@ -29,10 +29,13 @@
 //      loop pays ZERO `POST /v1/load` and HALTS with the churn in the operator note, and
 //      `/orchestrate lanes reset` clears the ledger and lands the owed lane in exactly ONE load;
 //      two back-to-back switch requests for one lane pay ONE load (the chain is serialised).
+//  15. the state write is async and COALESCED (`writeJsonAsync`/`coalesceWrite`): at the phase
+//      boundary the rig reads, `state.json` parses as a whole record and no `.tmp` sibling
+//      survives the rename.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -56,6 +59,24 @@ buildTestBundle();
 const repo = join(tmpdir(), "orch-gate-rig");
 rmSync(repo, { recursive: true, force: true });
 mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
+
+// The run root IS a working tree BEFORE the extension loads. `isGitRepo` caches its probe for
+// `FADE_ORCHESTRATE_REPO_PROBE_TTL_MS` (15 s, longer than this rig's whole run), so a repo that
+// appears mid-rig leaves every later git reader riding a cached `false` — measured as the
+// checkpoint tags vanishing from a run that completed. A tag also needs a HEAD, so the tree gets an
+// identity and a first commit here, exactly as the operator's run root has one.
+const gitAt = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+gitAt("init", "-q");
+gitAt("config", "user.email", "rig@localhost");
+gitAt("config", "user.name", "fade-orchestrator-rig");
+writeFileSync(join(repo, "a.ts"), "seed\n");
+// Git tracks files, not directories, and the run plane under `var/` is empty at this instant. The
+// fast-path block later runs `git rm -r --cached var` (the real repo gitignores `var/`, so the
+// orchestrator's own ledger must not be priced as the coder's diff), which needs `var/` to have
+// been tracked once. A seed record makes that true, as the runs' own state files did before.
+writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), "{}\n");
+gitAt("add", "-A");
+gitAt("commit", "-q", "-m", "rig seed");
 
 // ---- stub router: counts requests, tracks the resident lane ----
 const reqLog = [];
@@ -309,6 +330,16 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const s = readState();
   ok("green gate lets agent_end issue exactly one load", after - before === 1, `${after - before}`);
   ok("green gate reaches verifying", s.state === "verifying", s.state);
+  // The async persist: the phase's state reached disk through tmp → fdatasync → rename on
+  // `fs.promises`, so the boundary the rig reads shows a WHOLE record — a half file would throw
+  // inside `readState`, so reading it IS the proof — and no temp file survived the publish.
+  const stateFile = join(repo, "var", "omp-orchestrate", "state.json");
+  const tmpSiblings = readdirSync(join(repo, "var", "omp-orchestrate")).filter((n) => n.endsWith(".tmp"));
+  ok(
+	"the async coalesced persist leaves a readable state file and no temp sibling",
+	existsSync(stateFile) && tmpSiblings.length === 0 && readState().run_id === "GATE1" && s.state === "verifying",
+	`${stateFile} round ${s.round} tmp=[${tmpSiblings.join(",")}]`,
+  );
 }
 
 // 6. needs_repair records the verifier critique
@@ -345,13 +376,8 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 // 9. Tier-1 protocol gate: a turn that ends with no `fade_phase` is protocol debt. The
 //    round budget and the lane swap are the two currencies here, so the gate must touch NEITHER.
 {
-	const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
-	git("init", "-q");
-	git("config", "user.email", "rig@localhost");
-	git("config", "user.name", "fade-orchestrator-rig");
-	writeFileSync(join(repo, "a.ts"), "seed\n");
-	git("add", "-A");
-	git("commit", "-q", "-m", "rig seed");
+	// The tree, its identity and the seed commit landed at the rig's start (see the note there), so
+	// the probe cache cannot miss them. This block measures the coder lane's edit.
 	writeFileSync(join(repo, "a.ts"), "changed by the coder lane\n");
 
 	writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, rejection_history: [], protocol_retries: 0, stall_count: 0, paused: false });

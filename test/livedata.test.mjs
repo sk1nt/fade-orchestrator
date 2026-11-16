@@ -128,17 +128,17 @@ test("laneBestRate: max over the lane's requests, other lanes ignored", () => {
 	assert.equal(laneBestRate(snap, "strata-flash/none"), undefined);
 });
 
-test("swap history: newest-first, capped at 200, survives re-read", () => {
+test("swap history: newest-first, capped at 200, survives re-read", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-hist-"));
 	try {
 		for (let i = 0; i < 210; i++) {
-			appendSwap(dir, { from: "a", to: "b", elapsed_s: i, first_tg: 91, steady_tg: 130, percent_path: [10, 42, 100], at: `2030-01-01T00:00:${String(i % 60).padStart(2, "0")}Z` });
+			await appendSwap(dir, { from: "a", to: "b", elapsed_s: i, first_tg: 91, steady_tg: 130, percent_path: [10, 42, 100], at: `2030-01-01T00:00:${String(i % 60).padStart(2, "0")}Z` });
 		}
-		const rows = readSwaps(dir);
+		const rows = await readSwaps(dir);
 		assert.equal(rows.length, 200);
 		assert.equal(rows[0].elapsed_s, 209, "newest first");
 		assert.deepEqual(rows[0].percent_path, [10, 42, 100]);
-		assert.equal(readSwaps(join(dir, "missing")).length, 0);
+		assert.equal((await readSwaps(join(dir, "missing"))).length, 0);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -166,11 +166,11 @@ test("rampClass: the measured 91 ramp is cold, 130 steady is hot, a restored MoE
 	assert.equal(rampClass(91, false, 90), "hot_steady", "the steady line is an argument, not a magic number");
 });
 
-test("swap history: elapsed_ms and the ramp class survive the round trip", () => {
+test("swap history: elapsed_ms and the ramp class survive the round trip", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-hist-"));
 	try {
-		appendSwap(dir, { from: "deepseek", to: "flash-next", elapsed_s: 14.2, elapsed_ms: 14200, ramp: rampClass(480, false), first_tg: 480, steady_tg: 647, percent_path: [12, 100], at: "2030-01-01T09:12:32Z" });
-		const rows = readSwaps(dir);
+		await appendSwap(dir, { from: "deepseek", to: "flash-next", elapsed_s: 14.2, elapsed_ms: 14200, ramp: rampClass(480, false), first_tg: 480, steady_tg: 647, percent_path: [12, 100], at: "2030-01-01T09:12:32Z" });
+		const rows = await readSwaps(dir);
 		assert.equal(rows.length, 1);
 		assert.equal(rows[0].elapsed_ms, 14200, "the row keeps the transition timer's own unit (measured 14.2 s)");
 		assert.equal(rows[0].ramp, "hot_steady");
@@ -216,25 +216,25 @@ test("turnRecordOrNull: the record carries the four numbers, and only the number
 	assert.deepEqual(Object.keys(sparse).sort(), ["pp", "round", "round_outcome", "run_id", "swap_ms", "tg", "ts", "turn"], "no ttft/hit reported means no key, not a zero");
 });
 
-test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt line is skipped", () => {
+test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt line is skipped", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-turn-"));
 	const file = join(dir, "metrics.jsonl");
 	try {
 		const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 44.9 }, { ...ID, ts: "2030-01-01T09:12:32Z" });
 		assert.ok(rec);
-		appendTurn(dir, rec);
+		await appendTurn(dir, rec);
 		assert.equal(readFileSync(file, "utf8").split("\n").filter((l) => l !== "").length, 1, "EXACTLY one line");
-		assert.deepEqual(readTurns(dir, 10), [rec], "the record round-trips");
+		assert.deepEqual(await readTurns(dir, 10), [rec], "the record round-trips");
 		const next = { ...rec, turn: 4, tg: 480, swap_ms: 0 };
-		appendTurn(dir, next);
+		await appendTurn(dir, next);
 		appendFileSync(file, "{not json\n");
 		appendFileSync(file, '{"ts":"2030-01-01T09:13:00Z"}\n');
-		const all = readTurns(dir, 10);
+		const all = await readTurns(dir, 10);
 		assert.equal(all.length, 2, "a hand-corrupted line and a numberless line are skipped, not fatal");
-		assert.deepEqual(readTurns(dir, 1), [next], "readTurns returns the LAST n");
-		appendTurn(join(dir, "sub"), rec);
-		assert.equal(readTurns(join(dir, "sub"), 5).length, 1, "appendTurn creates the dir");
-		assert.equal(readTurns(join(dir, "nope"), 5).length, 0, "no ledger yet is not a crash");
+		assert.deepEqual(await readTurns(dir, 1), [next], "readTurns returns the LAST n");
+		await appendTurn(join(dir, "sub"), rec);
+		assert.equal((await readTurns(join(dir, "sub"), 5)).length, 1, "appendTurn creates the dir");
+		assert.equal((await readTurns(join(dir, "nope"), 5)).length, 0, "no ledger yet is not a crash");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
