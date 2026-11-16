@@ -1,4 +1,6 @@
 // src/index.ts
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { unlinkSync as unlinkSync2 } from "node:fs";
 import { basename, dirname, join as join6 } from "node:path";
 import { readFile as readFile2, stat as stat3 } from "node:fs/promises";
@@ -1281,7 +1283,7 @@ function startSwapWatch(to, moe, onSample) {
     cancel() {
       stopped = true;
     },
-    async finish(from, toLane, elapsed_s, dir, runId) {
+    async finish(from, toLane, elapsed_s, dir, runId, taskClass) {
       stopped = true;
       if (!sawSwap && from === toLane) return void 0;
       const m = await fetchJson(`${ROUTER}/metrics`);
@@ -1301,6 +1303,7 @@ function startSwapWatch(to, moe, onSample) {
         percent_path: percentPath.slice(0, 60),
         ...moe ? { moe } : {},
         ...runId ? { run_id: runId } : {},
+        ...taskClass ? { task_class: taskClass } : {},
         at: (/* @__PURE__ */ new Date()).toISOString()
       };
       await appendSwap(dir, row);
@@ -1555,6 +1558,34 @@ function moeBalanceRows(lanes, opts = {}) {
   });
 }
 
+// src/taskmoe.ts
+var TASK_CLASSES = ["ci", "tests", "docs", "code"];
+var PIPELINE = /\bci\b|\bworkflows?\b|pipeline|\bgh run\b|\.github\/workflows/i;
+var RUNNER = /node --test|\bnpm (?:--no-install )?(?:run )?test\b|\brig\b|node test\//i;
+var PROSE = /\bREADME\b|\bdocs?\b|documentation/i;
+function classOf(task) {
+  const files = Array.isArray(task.files) ? task.files : [];
+  const text = `${task.objective ?? ""} ${task.acceptance ?? ""} ${files.join(" ")}`;
+  if (PIPELINE.test(text)) return "ci";
+  if (RUNNER.test(task.acceptance ?? "") || files.some((f) => f.endsWith(".test.mjs"))) return "tests";
+  if (files.length > 0 && files.every((f) => f.endsWith(".md")) || PROSE.test(task.objective ?? "")) return "docs";
+  return "code";
+}
+function classWarmth(swaps) {
+  return TASK_CLASSES.map((cls) => {
+    const rows = swaps.filter((r) => r.task_class === cls);
+    const warm = rows.filter((r) => r.moe?.state === "live" && r.moe.written_by_running_engine === true && r.moe.profile_exists === true).length;
+    const newest = rows.find((r) => typeof r.moe?.profile_path === "string");
+    return { cls, swaps: rows.length, warm, ...newest?.moe?.profile_path ? { profile: newest.moe.profile_path } : {} };
+  });
+}
+function versionLine(engineVersion, pkgVersion, bundleHash) {
+  const engine = engineVersion ? `engine ${engineVersion}` : "engine version not reported";
+  const ext = pkgVersion ? `ext ${pkgVersion}` : "ext version not read";
+  const bundle = bundleHash ? `bundle ${bundleHash.slice(0, 8)}` : "bundle not built";
+  return `${engine} \xB7 ${ext} \xB7 ${bundle}`;
+}
+
 // src/screendata.ts
 var SCREEN_TURNS = 12;
 var SCREEN_SWAPS = 6;
@@ -1668,6 +1699,11 @@ async function collectScreen(src) {
       healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {}
     })
   ];
+  const classes = classWarmth(swaps).map((c) => ({
+    label: `MoE class ${c.cls}`,
+    value: c.swaps === 0 ? "no swap ran this class" : `${c.warm}/${c.swaps} warm \xB7 ${c.profile ?? "profile not named"}`,
+    ...c.swaps === 0 ? { tone: "dim" } : c.warm === 0 ? { tone: "warn" } : { tone: "ok" }
+  }));
   const tiers = [...nameResidentRow(tiersFromMetrics(metrics), metrics, src.names), claimRow(src)];
   const missing = [];
   if (!metrics) missing.push(`router ${ROUTER} unreachable \u2014 engine, decode and queue are not measured`);
@@ -1693,6 +1729,7 @@ async function collectScreen(src) {
     lanes: laneRows(src, metrics),
     tiers,
     moe,
+    classes,
     turns,
     swaps,
     context,
@@ -1806,7 +1843,7 @@ function phaseBlock(d, theme, width) {
   return lines;
 }
 function metricBlock(d, theme, width) {
-  const rows = [...d.tiers, ...d.moe];
+  const rows = [...d.tiers, ...d.moe, ...d.classes ?? []];
   if (d.context) rows.push({ label: "context", value: `${compactNumber(d.context.tokens)} / ${compactNumber(d.context.window)} (${d.context.percent.toFixed(1)}%)` });
   rows.push(...gateRows(d.gate));
   rows.push(...turnRows(d.turns));
@@ -2373,7 +2410,7 @@ function fadeOrchestrate(pi) {
     }
     if (from && runDir && from !== lane) {
       turnSwapMs += Math.round(loaded.elapsed_s * 1e3);
-      void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id).then(() => paint(ctx));
+      void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
     }
     if (run) run.lane = lane;
     await persist();
@@ -2411,6 +2448,33 @@ function fadeOrchestrate(pi) {
         ...process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}
       });
     };
+  };
+  const packageVersion = async () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    for (const p of [join6(here, "..", "package.json"), join6(here, "package.json")]) {
+      try {
+        const raw = JSON.parse(await readFile2(p, "utf8"));
+        if (raw && typeof raw === "object" && "version" in raw && typeof raw.version === "string" && raw.version !== "") return raw.version;
+      } catch {
+      }
+    }
+    return void 0;
+  };
+  const bundleHash = async () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    for (const p of [join6(here, "index.js"), join6(here, "..", "dist", "index.js")]) {
+      try {
+        return createHash("sha256").update(await readFile2(p)).digest("hex");
+      } catch {
+      }
+    }
+    return void 0;
+  };
+  const windowClass = (r) => {
+    if (!r) return void 0;
+    const w = roundWindow(r);
+    const t = w.readyNow[0] ?? w.open[0] ?? (r.tasks ?? [])[0];
+    return t ? classOf(t) : void 0;
   };
   const actOnPanel = (ctx, a) => {
     if (!run) return;
@@ -2752,7 +2816,7 @@ ${SCHEMA_HINT}` : text);
     registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
   }
   pi.registerCommand("orchestrate", {
-    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
     handler: async (args, ctx) => {
       let raw = args.trim();
       const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
@@ -2795,6 +2859,22 @@ ${SCHEMA_HINT}` : text);
           ctx.ui.notify(`run ${r.run_id}: ${r.state} \xB7 ${r.rounds} rounds \xB7 ${r.tasks_passed}/${r.tasks_total} tasks \xB7 ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
         }
         if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join6(dir, RUNS_DIRNAME)}`, "info");
+        return;
+      }
+      if (first === "moe") {
+        const dir = runDir ?? join6(ctx.cwd, "var", "omp-orchestrate");
+        for (const c of classWarmth(await readSwaps(dir))) {
+          ctx.ui.notify(`orchestrate: ${c.cls}: ${c.swaps} swaps \xB7 ${c.warm}/${c.swaps} warm \xB7 profile ${c.profile ?? "none named"}`, "info");
+        }
+        const snap = await fetchMetrics() ?? metrics;
+        if (snap) metrics = snap;
+        for (const r of moeBalanceRows([THINK_LANE, CODE_LANE], {
+          ...process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {},
+          healthByLane: snap?.loaded ? { [snap.loaded]: { spill_experts: snap.spill_experts, spill_total: snap.spill_total, spill_bytes_gb: snap.spill_bytes_gb, slots: snap.slots } } : {}
+        })) {
+          ctx.ui.notify(`orchestrate: ${r.label} \xB7 ${r.value}`, "info");
+        }
+        ctx.ui.notify(`orchestrate: ${versionLine(snap?.engine_version, await packageVersion(), await bundleHash())}`, "info");
         return;
       }
       if (first === "overlay") {
