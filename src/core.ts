@@ -5,7 +5,8 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { msg } from "./router.ts";
 
@@ -622,6 +623,107 @@ export function writeJson(path: string, value: unknown): void {
 		}
 	} catch {
 		/* the rename is already atomic; the directory flush is the durability we can add, not the record */
+	}
+}
+
+/**
+ * The router is single-tenant: one resident lane, one live-turn ledger, one flip guard. Two
+ * orchestrators driving it from two omp sessions — even two checkouts of two repos on one host —
+ * interleave their turns and each one's gate ends up judging the other's tree. So the lock is
+ * taken on the ROUTER, not the repo, and it is taken exactly once per run.
+ *
+ * `O_CREAT|O_EXCL` (`"wx"`) is the whole mutual exclusion: the filesystem picks one winner, so
+ * there is nothing to race with and no read-then-write window. What is left is decay: a machine
+ * that rebooted, a `kill -9`, a power cut. The lock's own pid answers that — `kill(pid, 0)` says
+ * `ESRCH` for a corpse and `EPERM` for a process that exists and is not ours. A pid we cannot
+ * believe (no pid, no finite pid, unparsable file) is treated as a corpse, because the file that
+ * cannot name its owner can never release it. Reclaim is a single retry: two runs racing for a
+ * freed lock produce one winner and one honest `{ok:false, stale:true}`, never a spin.
+ */
+export const LOCK_FILENAME = "orchestrator.lock";
+
+export interface InstanceLock {
+	pid: number;
+	run_id: string;
+	repo: string;
+	started: string;
+	host: string;
+}
+
+/** Reads the claim, or `undefined` for absent / empty / unparsable / non-object content. */
+export function readInstanceLock(dir: string): InstanceLock | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(join(dir, LOCK_FILENAME), "utf8"));
+		return raw && typeof raw === "object" ? (raw as InstanceLock) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Is the claimed pid alive? Our OWN pid counts as alive: a second run in the same process is
+ * refused rather than deadlocked, which is the same fact the router needs — it has one lane.
+ */
+function holderAlive(pid: unknown): boolean {
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		// ESRCH is the only "this pid is gone" answer; EPERM and friends say the pid exists.
+		return (e as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+/**
+ * Exclusive acquire. Creates `dir` when missing. The claim is fsynced before the fd closes, so a
+ * `kill -9` right after the acquire still leaves a lock naming this run.
+ */
+export function acquireInstanceLock(dir: string, info: { run_id: string; repo: string }): { ok: true } | { ok: false; holder: InstanceLock; stale: boolean } {
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, LOCK_FILENAME);
+	const claim = () => {
+		const lock: InstanceLock = { pid: process.pid, run_id: info.run_id, repo: info.repo, started: new Date().toISOString(), host: hostname() };
+		const fd = openSync(path, "wx");
+		try {
+			writeFileSync(fd, `${JSON.stringify(lock)}\n`);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+	};
+	const taken = (): boolean => {
+		try {
+			claim();
+			return true;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+			throw e;
+		}
+	};
+	if (taken()) return { ok: true };
+	const holder = readInstanceLock(dir);
+	if (holderAlive(holder?.pid)) return { ok: false, holder: holder as InstanceLock, stale: false };
+	rmSync(path, { force: true });
+	if (taken()) return { ok: true };
+	// The corpse was buried by a rival in the same instant: it owns the router, and the
+	// file we cannot read is still a claim we must not break.
+	const rival = readInstanceLock(dir) ?? holder ?? { pid: 0, run_id: "unknown", repo: info.repo, started: new Date().toISOString(), host: hostname() };
+	return { ok: false, holder: rival, stale: true };
+}
+
+/**
+ * Release, by owner only: an instance that lost the race (or resumed under a new pid) must never
+ * delete the lock the live run is holding. A missing file is not an error; neither is a file that
+ * has no readable owner, since nothing can be deleted safely from it.
+ */
+export function releaseInstanceLock(dir: string, pid: number = process.pid): void {
+	const holder = readInstanceLock(dir);
+	if (!holder || holder.pid !== pid) return;
+	try {
+		unlinkSync(join(dir, LOCK_FILENAME));
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
 	}
 }
 
