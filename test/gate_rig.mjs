@@ -25,6 +25,10 @@
 //  13. the FLIP GUARD: swaps the router reports AWAY from the resident lane are counted as a
 //      flip and named, a quiet lane reports none, and a reload of the resident lane inside the
 //      guard window issues ZERO `POST /v1/load` and says why.
+//  14. the THRASH BREAKER: at FADE_ORCHESTRATE_FLIP_BREAKER_AT swaps away from the run's lane the
+//      loop pays ZERO `POST /v1/load` and HALTS with the churn in the operator note, and
+//      `/orchestrate lanes reset` clears the ledger and lands the owed lane in exactly ONE load;
+//      two back-to-back switch requests for one lane pay ONE load (the chain is serialised).
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
@@ -128,6 +132,22 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 process.env.FADE_ORCHESTRATE_ROUTER = `http://127.0.0.1:${server.address().port}`;
 process.env.FADE_ORCHESTRATE_HEADLESS = "1";
 
+// The idle gate and the THRASH BREAKER are configuration, so the rig runs their windows in
+// milliseconds (the convention `test/pty_rig.mjs` carries for the metrics tick). They MUST be set
+// BEFORE the extension is imported: `GATE_POLL_MS`/`GATE_BUDGET_MS` (src/index.ts) and
+// `FLIP_WINDOW_MS`/`FLIP_BREAKER_AT` (src/router.ts) read the environment at module load.
+//  * the gate budget: the stub reports a slot ACTIVE while `metricsOn` is true (the decoding shape
+//    the ledger block reads), so the live idle gate holds every swap in blocks 5/9/12 for its whole
+//    budget. 15 ms is one poll: the load is paid as over-budget, the counters stay honest, and every
+//    swap-count assertion stays about exactly one `POST /v1/load`. From block 12 on `metricsOn` is
+//    false, so the router reads idle and the gate costs nothing.
+//  * the flip window, and the breaker's count at 3: block 19b drives three swaps AWAY from the run's
+//    lane and proves the loop stops paying for them.
+process.env.FADE_ORCHESTRATE_GATE_POLL_MS = "5";
+process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS = "15";
+process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS = "60000";
+process.env.FADE_ORCHESTRATE_FLIP_BREAKER_AT = "3";
+
 // ---- fake pi + ctx ----
 const tools = {};
 const commands = {};
@@ -165,10 +185,6 @@ const notes = [];
 /** Every `setWorkingMessage` call, in order: the gate names the row it is RUNNING, so the rig can
  *  prove the operator watches progress instead of a frozen terminal. `null` is the clear. */
 const working = [];
-/** The login line, captured separately: it is a ONE-SHOT at the first `session_start`, and the
- *  `notes` transcript is scoped and cleared by the later blocks, so the login line must not be
- *  asserted against a transcript that has already moved on. */
-let disclosure = "";
 const ctx = {
   hasUI: false,
   cwd: repo,
@@ -183,7 +199,6 @@ const ctx = {
     setWidget: (key, lines, opts) => void (lines === undefined ? widgets.delete(key) : widgets.set(key, { lines, opts })),
     notify: (m) => {
       notes.push(m);
-      if (disclosure === "" && /opens the screen/.test(m)) disclosure = m;
     },
     setWorkingMessage: (m) => void working.push(m ?? null),
     custom: async () => undefined,
@@ -286,6 +301,10 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const before = loads();
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }] });
   await hooks.agent_end({}, ctx);
+  // The switch is queued on the serial chain (`requestLane`), so the loader runs a few ticks after
+  // `agent_end` returns — and with `metricsOn` true the stub reports a slot ACTIVE, so the queued
+  // switch first runs the idle gate's whole (millisecond) budget and pays the load as over-budget.
+  await new Promise((r) => setTimeout(r, 150));
   const after = loads();
   const s = readState();
   ok("green gate lets agent_end issue exactly one load", after - before === 1, `${after - before}`);
@@ -347,7 +366,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("tier 1: the nudge is sent to the resident lane", sent.some((m) => m.includes("Protocol nudge 1/2")), sent.join(" | ").slice(0, 140));
 
 	await hooks.agent_end({}, ctx); // miss 2 → synthesize from git + gate
-	await new Promise((r) => setTimeout(r, 60));
+	await new Promise((r) => setTimeout(r, 150)); // the queued switch clears the gate budget, then pays the swap
 	s = readState();
 	ok("tier 2: coding_done SYNTHESIZED from git + gate", s.synthesized?.phase === "coding_done" && s.state === "verifying", `${s.synthesized?.phase}/${s.state}`);
 	ok("tier 2: the synthesized result quotes git evidence", (s.tasks.find((t) => t.id === "T1")?.result ?? "").includes("git status --porcelain"), s.tasks[0]?.result);
@@ -401,7 +420,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	writeFileSync(join(repo, "a.ts"), "pad\n".repeat(20));
 	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
 	await hooks.agent_end({}, ctx);
-	await new Promise((r) => setTimeout(r, 60));
+	await new Promise((r) => setTimeout(r, 150)); // as above: gate budget, then the swap, then the ledger line
 	const withMetrics = lines();
 	const last = JSON.parse(withMetrics[withMetrics.length - 1] ?? "{}");
 	// pp is a RATE (prompt tokens over the prefill window: 1499 tok over the 0.4 s ttft = 3748 tok/s)
@@ -594,6 +613,8 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("the refresh is announced, never silent", notes.some((n) => n.includes("re-read the checks") && n.includes("replaced")), JSON.stringify(notes.slice(-2)));
 	ok("no load is paid inside the phase call itself", loads() === l1, `loads=${loads() - l1}`);
 	await hooks.agent_end({}, ctx);
+	// Queued on the serial chain, so the loader runs a few ticks after `agent_end` returns.
+	await new Promise((r) => setTimeout(r, 60));
 	ok("the verifier swap is paid once for the refreshed green tree", loads() - l1 === 1, `loads=${loads() - l1}`);
 }
 
@@ -657,6 +678,74 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("a quiet lane carries no guard clause", quietNote === "", JSON.stringify(quietNote));
 }
 
+// 19b. The THRASH BREAKER — the operator's ask. The guard NAMES the churn and refuses to reload the
+// resident lane, and the loop kept paying 13-25 s and 52-130 GiB every time a competing client named
+// the other entry. Past `FADE_ORCHESTRATE_FLIP_BREAKER_AT` swaps away from the run's lane (3 in this
+// rig) the load IS the flip-flop, so `runSwitch` sends NOTHING — no `setModel`, no `POST /v1/load` —
+// halts the loop with the evidence in the operator note, keeps the lane owed in `pending`, and names
+// the release: `/orchestrate lanes reset` clears the ledger and lands it, ONE load. The serialised
+// chain is proved in the same block: two requests for one lane land it ONCE.
+{
+  resident = "flash-next";
+  swapLine = null;
+  writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  // The loop's own poll is what watches the router's swap line (the metrics tick; `session_start`
+  // starts it). The engine reports the swap, then the reverse, with `resident` naming the lane being
+  // unloaded, and the settle between them — `swap` clearing — is what re-arms the recorder, so each
+  // cycle is ONE flip AWAY from the run's lane.
+  const poll = async () => {
+    await hooks.session_start({}, ctx);
+    await new Promise((r) => setTimeout(r, 30));
+  };
+  for (let i = 0; i < 3; i++) {
+    resident = "flash-next";
+    swapLine = { from: "flash-next", to: "deepseek", phase: "loading", waiting: 1 };
+    await poll(); // a queued request names deepseek: the router flips AWAY from the run's lane
+    resident = "deepseek";
+    swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 1 };
+    await poll(); // and BACK
+    swapLine = null;
+    resident = "flash-next";
+    await poll();
+  }
+  const row19b = (widgets.get("fade-top")?.lines ?? []).join("\n");
+  ok("the row carries the churn the breaker acts on", hasRow(row19b, "lane flip: 3 swaps in 60s"), row19b.slice(0, 240));
+
+  notes.length = 0;
+  await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  const lTrip = loads();
+  await hooks.agent_end({}, ctx); // the green tree owes the verifier swap
+  await new Promise((r) => setTimeout(r, 150));
+  const sBreak = readState();
+  ok("the breaker pays ZERO POST /v1/load", loads() === lTrip, `extra=${loads() - lTrip}`);
+  ok("the breaker HALTS the loop: paused, with the thrash named in the operator note", sBreak.paused === true && /lane thrash: 3 swaps in 60s naming deepseek/.test(sBreak.operator_note ?? ""), JSON.stringify({ paused: sBreak.paused, operator_note: sBreak.operator_note }));
+  ok("the halt is said ONCE and names the release verb", notes.filter((n) => n.includes("LANE THRASH")).length === 1 && notes.some((n) => n.includes("LANE THRASH") && n.includes("lanes reset") && n.includes("deepseek")), JSON.stringify(notes.filter((n) => n.includes("THRASH"))));
+  ok("the refused load is recorded in the run's history", (sBreak.rejection_history ?? []).some((r) => r.reason.includes("LANE THRASH")), JSON.stringify((sBreak.rejection_history ?? []).slice(-1)));
+  ok("the verifier lane is still OWED: the note names it and the state waits on it", sBreak.state === "verifying" && (sBreak.operator_note ?? "").includes("deepseek"), `${sBreak.state} · ${JSON.stringify(sBreak.operator_note)}`);
+
+  notes.length = 0;
+  const lReset = loads();
+  await commands.orchestrate.handler("lanes reset", ctx);
+  await new Promise((r) => setTimeout(r, 200));
+  const sReset = readState();
+  ok("lanes reset clears the badge: no `lane flip:` row", !hasRow((widgets.get("fade-top")?.lines ?? []).join("\n"), "lane flip:"), (widgets.get("fade-top")?.lines ?? []).join("\n").slice(0, 240));
+  ok("lanes reset unpauses and clears the operator note", sReset.paused === false && sReset.operator_note === undefined, JSON.stringify({ paused: sReset.paused, operator_note: sReset.operator_note }));
+  ok("lanes reset pays exactly ONE POST /v1/load", loads() - lReset === 1, `extra=${loads() - lReset}`);
+  ok("the lane it lands is the owed verifier lane", resident === "deepseek" && notes.some((n) => n.includes("flip ledger cleared; landing deepseek")), `${resident} · ${JSON.stringify(notes.slice(0, 2))}`);
+
+  // The serialised chain: two switches for ONE lane, issued back to back. The chain runs the newest
+  // and skips the superseded link outright — it never touches the router — so the lane loads ONCE.
+  resident = "deepseek"; // `code` wants the coder lane back
+  const lSerial = loads();
+  void commands.orchestrate.handler("code", ctx);
+  void commands.orchestrate.handler("code", ctx);
+  await new Promise((r) => setTimeout(r, 200));
+  ok("two back-to-back requests for one lane pay AT MOST ONE POST /v1/load", loads() - lSerial === 1 && resident === "flash-next", `extra=${loads() - lSerial} · resident=${resident}`);
+  swapLine = null;
+  resident = "flash-next";
+}
+
 // 20. The Alt+F screen and the status row. The row is the one line the operator sees all day, and
 //     it says what the loop is doing in plain words: glyph, Orchestrator, state, round, tally, key.
 //     The panel is the detail view, opened on `alt+f` — claimed at the RAW-INPUT layer, because the
@@ -708,12 +797,10 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   writeState({ ...seedState("coding", [["true", "green"]]), goal: `run ${repo} on ${host} by ${user}`, schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
   await hooks.session_start({}, ctx);
   await new Promise((r) => setTimeout(r, 700)); // the login line is deferred past the TUI attach
-  // ONE line per login, and the chord fact is a ONE-SHOT for the process: this login's line names
-  // the run and the key only. The key contract (fallback, env var, raw-byte claim) is never
-  // reprinted, and never as a notify of its own.
-  const loginNotes = notes.filter((n) => /opens the screen/.test(n));
-  ok("one login line per login: the key rides ON the run line, never as its own notify", loginNotes.length > 0 && loginNotes.every((n) => n.includes("run GATE1 is")) && !notes.some((n) => /^orchestrate: the host binds/.test(n)), JSON.stringify(loginNotes.slice(0, 2)));
-  ok("the chord fact is NOT reprinted at a later login", !notes.some((n) => n.includes("the host binds")), JSON.stringify(notes.slice(0, 2)));
+  // ONE line per login, and it says NOTHING about the key: the row names the chord every round, so
+  // a working keyboard is not re-explained per session.
+  const loginNotes = notes.filter((n) => /run GATE1 is/.test(n));
+  ok("one login line per login: the adopted run, nothing else", loginNotes.length > 0 && !notes.some((n) => /opens the screen|the host binds/.test(n)), JSON.stringify(notes.slice(0, 2)));
   const row21 = widgets.get("fade-top")?.lines?.[0] ?? "";
   ok("the row names [Alt+F], the chord the raw layer claims", row21.endsWith("· [Alt+F]"), JSON.stringify(row21));
   ok("one raw-input listener is bound, for ESC f", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
@@ -725,9 +812,9 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the host-held chord is NOT registered as a shortcut (the byte is the delivery)", !shortcuts["alt+f"], JSON.stringify(Object.keys(shortcuts)));
   ok("the registered fallback chord survives", Boolean(shortcuts["alt+shift+i"]), JSON.stringify(Object.keys(shortcuts)));
   ok(
-    "the login line is ONE line: the key fact, no key-contract paragraph",
-    /the host binds Alt\+F[\s\S]*raw byte: Alt\+F opens the screen, Alt\+Shift\+I is the fallback/.test(disclosure) && !disclosure.includes("FADE_ORCHESTRATE_KEY") && !disclosure.includes("pty_rig") && disclosure.length < 260,
-    JSON.stringify({ len: disclosure.length, disclosure }),
+    "the login says no key contract: no fallback, no env var, no raw-byte claim",
+    !notes.some((n) => /opens the screen|the host binds|FADE_ORCHESTRATE_KEY|pty_rig/.test(n)),
+    JSON.stringify(notes.slice(0, 2)),
   );
   ok("the unredacted panel carries the account, host and repo path", panel21.includes(repo) && panel21.includes(host) && panel21.includes(user), panel21.slice(0, 300));
   await commands.orchestrate.handler("--demo-redact", ctx);
