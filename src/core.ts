@@ -185,12 +185,20 @@ export function roundsForTasks(tasks: Task[], budget: number): number {
 }
 
 /**
- * Emitted verbatim into the tool error after the second schema rejection (auto-repair hint).
- * The `coding_done` example shows TWO entries on purpose — the batch shape is what the lane is
- * taught, and the shape it sees in the hint is the shape it writes.
+ * Emitted verbatim into the tool error after the second schema rejection (auto-repair hint) and
+ * carried by the protocol nudge. The three phases sit one per line inside a fenced block: the lane
+ * copies the shape it can see. The `coding_done` line shows TWO entries on purpose because the
+ * batch shape is what the lane is taught.
  */
-export const SCHEMA_HINT =
-	'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}. A planning check whose ACCEPTED state is not exit-0 says so in the expected text\'s first words — "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.';
+export const SCHEMA_HINT = [
+	"Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string):",
+	"```",
+	'planning_done    {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}',
+	'coding_done      {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window',
+	'verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}',
+	"```",
+	'A planning check whose ACCEPTED state is not exit-0 says so in the expected text\'s first words — "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.',
+].join("\n");
 
 /** One pre-swap gate outcome: every check run deterministically, judged on exit code. */
 export interface GateResult {
@@ -1081,26 +1089,72 @@ export const gitCaveat = async (repo: string): Promise<string> =>
 		? ""
 		: ["The run root " + repo + " is NOT a git repo: git status/git diff evidence does not exist here, so the phase synthesizer names every task blocked and the checkpoint tags are unavailable.",
 		  "The act is `git init " + repo + "` (or start the run inside a working tree)."].join(" ");
+
+// ---- the briefing renderer ---------------------------------------------------------------
+
+// A lane reads a briefing once per turn and answers it, so the shape decides whether the contract
+// is obeyed. The old shape was a wall of single-newline lines with payload dumps mid-sentence:
+// skimmable, and the lanes skim — a payload skeleton lost inside prose is a shape the lane invents.
+// These helpers render every briefing the same way: a title line, `## ` sections, task cards as
+// bullets with sub-bullets, and the payload/check skeletons FENCED so their braces read as shape.
+// The anchors the suite pins are kept verbatim on purpose: they are the contract, not its layout.
+
+/** `## title` over its body; a section with no data renders nothing, so no header sits over emptiness. */
+function section(title: string, ...body: unknown[]): string {
+	const lines = body.filter((v) => v !== "" && v !== undefined && v !== null && v !== false) as string[];
+	return lines.length === 0 ? "" : [`## ${title}`, ...lines].join("\n");
+}
+
+/** The page: sections a blank line apart — the paragraph break a single `\n` cannot draw. */
+function page(...parts: unknown[]): string {
+	return parts.filter((v) => v !== "" && v !== undefined && v !== null && v !== false).join("\n\n");
+}
+
+/** A fenced block: the skeleton a lane must emit, set off from the prose that describes it. */
+function fence(body: string): string {
+	return "```\n" + body + "\n```";
+}
+
+/** One task as a card: id and objective on the bullet, every field a sub-bullet, UNTRUNCATED. */
+function card(t: Task, extra: string[] = []): string {
+	return [
+		`- **${t.id}**${t.status ? ` [${t.status}]` : ""} — ${t.objective}`,
+		`  - files: ${t.files.length > 0 ? t.files.join(", ") : "-"}`,
+		`  - acceptance: ${t.acceptance}`,
+		`  - dependencies: ${t.dependencies.length > 0 ? t.dependencies.join(", ") : "none"}`,
+		...extra,
+	].join("\n");
+}
+
 export const briefings = {
 	plan: async (run: RunState): Promise<string> =>
-		[
+		page(
 			`Phase 0 (planning), round ${run.round} of orchestrated run ${run.run_id}.`,
-			`Goal: ${run.goal}`,
-			`Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
-			`Checks are DATA the pre-swap gate runs through bash: ${JSON.stringify(run.checks.length ? run.checks : [["<the command that proves the goal>","<the observation that counts as green>"]])}. Each row is ONE command bash can parse. A row with a <placeholder>, an ellipsis or prose is a PLAN DEFECT: bash refuses it, it is never executed, and the gate stays red no matter what the tree does — so name commands this repo actually has, with real flags.`,
-			`Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
+			section("Goal", run.goal),
+			section(
+				"Output — a plan is ONE object",
+				`At most ${MAX_TASKS} tasks, and the checks that prove the goal:`,
+				fence('{"tasks":[{"id":"T1","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","the observation that counts as green"]]}'),
+				"Every task carries an id, an objective, repo-relative files, an acceptance that is ONE command plus what it proves, and its dependencies.",
+			),
+			section(
+				"Checks are DATA the pre-swap gate runs through bash",
+				fence(JSON.stringify(run.checks.length ? run.checks : [["<the command that proves the goal>", "<the observation that counts as green>"]])),
+				"Each row is ONE command bash can parse. A row with a <placeholder>, an ellipsis or prose is a PLAN DEFECT: bash refuses it, it is never executed, and the gate stays red no matter what the tree does — so name commands this repo actually has, with real flags.",
+			),
+			section("Rules", "- Give dependent tasks earlier ids first.", "- Files are repo-relative and disjoint.", "- Plan only: no edits, no writes."),
 			await gitCaveat(run.repo),
-			`Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`,
-		].join("\n"),
+			section("Call", 'fade_phase phase="planning_done", payload=<that JSON as a string>.'),
+		),
 	code: async (run: RunState): Promise<string> =>
-		[
+		page(
 			`Phase 1 (coding), round ${run.round} of orchestrated run ${run.run_id}.`,
-			`Goal: ${run.goal}`,
-			`Tasks: ${JSON.stringify(run.tasks)}`,
-			`Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`,
+			section("Goal", run.goal),
+			section("Tasks", ...run.tasks.map((t) => card(t))),
+			section("Contract", `Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`),
 			await gitCaveat(run.repo),
-			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
-		].join("\n"),
+			section("Call", 'fade_phase phase="coding_done", payload:', fence('{"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"}]}')),
+		),
 	/**
 	 * The coder's BATCH briefing — one window, one turn, one `coding_done`. Every task of
 	 * `roundWindow().readyNow` is spelled out UNTRUNCATED (objective, files, acceptance,
@@ -1108,7 +1162,7 @@ export const briefings = {
 	 * imagination; the blocked tasks are listed with the ids that hold them so the lane knows
 	 * what to leave alone; and the one-payload contract is stated in the turn's own words, which
 	 * is the half that kills the per-task window (the refusal in `validateDone` is the other
-	 * half).
+	 * half). The fenced payload IS the window: the ids it names are the ids that may be reported.
 	 */
 	window: async (run: RunState): Promise<string> => {
 		const { readyNow, blocked, open } = roundWindow(run);
@@ -1118,76 +1172,95 @@ export const briefings = {
 		// A re-briefed window (round > 1) carries the critique PER TASK, so the lane knows
 		// which rejection belongs to the file it is about to edit.
 		const critiques = run.round > 1 ? critiquesFor(run, readyNow.map((t) => t.id)) : [];
-		const entry = (id: string) => `{"id":"${id}","status":"passed"|"failed"|"blocked","result":"what the acceptance command observed"}`;
-		return [
+		const entry = (id: string) => `{"id":"${id}","status":"passed|failed|blocked","result":"what the acceptance command observed"}`;
+		return page(
 			`Phase 1 (coding) — ONE WINDOW, round ${run.round}/${run.max_rounds} · T${readyNow.length}/${open.length} · lane ${run.lane} · orchestrated run ${run.run_id}.`,
-			`Goal: ${run.goal}`,
-			readyNow.length > 0
-				? `Window contract: this ONE turn implements EVERY task below in ${run.repo} and reports them ALL in ONE coding_done payload: {"done":[${readyNow.map((t) => entry(t.id)).join(",")}]}. Do not report after one task and do not take a second coding turn for these tasks — one window, one coding_done, one lane swap.`
-				: `The window is EMPTY: every open task is blocked by an unpassed dependency. There is nothing to implement in this turn — do not send a coding_done naming a blocked task; report the blockers and end the turn.`,
-			readyNow.length > 0 ? `Tasks in this window (${readyNow.length} of ${open.length} open), each card in full:` : `Tasks in this window: none.`,
-			...readyNow.flatMap((t) => [
-				`  ${t.id} [${t.status ?? "pending"}] objective: ${t.objective}`,
-				`      files: ${t.files.join(", ")}`,
-				`      acceptance: ${t.acceptance}`,
-				`      dependencies: ${t.dependencies.length > 0 ? t.dependencies.join(", ") : "-"}`,
-			]),
-			blocked.length > 0
-				? `NOT in this window, unmet dependencies — do not start them and never name one in coding_done: ${blocked.map((b) => `${b.id} blocked by ${b.blockedBy.join(", ")}`).join("; ")}.`
-				: `Nothing is blocked by a dependency.`,
-			deferred.length > 0 ? `Ready but past the ${MAX_WINDOW_TASKS}-task window cap (the NEXT window's work, leave it alone now): ${deferred.join(", ")}.` : "",
-			critiques.length > 0 ? `Rejected before — the verifier's critique for the tasks of THIS window, by task id; a task rejected twice has already had this diff tried, so change the cause:` : "",
-			...critiques,
-			`Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections — nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
-			`Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
+			section("Goal", run.goal),
+			section(
+				"Window contract",
+				readyNow.length > 0
+					? `This ONE turn implements EVERY task below in ${run.repo} and reports them ALL in ONE coding_done payload:`
+					: "The window is EMPTY: every open task is blocked by an unpassed dependency. There is nothing to implement in this turn — do not send a coding_done naming a blocked task; report the blockers and end the turn.",
+				readyNow.length > 0 ? fence(`{"done":[${readyNow.map((t) => entry(t.id)).join(",")}]}`) : "",
+				readyNow.length > 0 ? "Do not report after one task and do not take a second coding turn for these tasks — one window, one coding_done, one lane swap." : "",
+			),
+			section(`Tasks in this window (${readyNow.length} of ${open.length} open)`, readyNow.length > 0 ? "each card in full:" : "none.", ...readyNow.map((t) => card(t))),
+			section(
+				"Not in this window",
+				blocked.length > 0 ? "Unmet dependencies — do not start them and never name one in coding_done:" : "",
+				...blocked.map((b) => `- ${b.id} blocked by ${b.blockedBy.join(", ")}`),
+			),
+			deferred.length > 0
+				? section("Deferred", `Ready but past the ${MAX_WINDOW_TASKS}-task window cap (the NEXT window's work, leave it alone now): ${deferred.join(", ")}.`)
+				: "",
+			critiques.length > 0
+				? section("Rejected before — the verifier's critique", "for the tasks of THIS window, by task id; a task rejected twice has already had this diff tried, so change the cause:", ...critiques)
+				: "",
+			section(
+				"Context",
+				'this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections — nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.',
+				'Run each task\'s acceptance command and put what it printed in that task\'s "result". Do not commit.',
+			),
 			await gitCaveat(run.repo),
-		].filter(Boolean).join("\n");
+		);
 	},
 	verify: (run: RunState): string =>
-		[
+		page(
 			`Phase 2 (verification), round ${run.round} of orchestrated run ${run.run_id}.`,
-			`Goal: ${run.goal}`,
-			`Task results: ${JSON.stringify(run.tasks.map((t) => ({ id: t.id, status: t.status, result: t.result, files: t.files, acceptance: t.acceptance })))}`,
-			`Read the diff (run "git diff" in ${run.repo} yourself) and re-run every check: ${JSON.stringify(run.checks)}.`,
-			`Verdict rule: "accepted" needs EVERY check re-run BY YOU in this turn, each row reported as ["cmd","observed"] with what THAT run printed. The pre-swap gate already ran them green on the coding lane and its row is in the state file; a row copied from the gate's result is not a re-run, and a check you did not run cannot be accepted.`,
-			`"needs_repair" ends the round and must name the tasks for round ${run.round + 1} as full cards: {"id":"R<n>","objective":"the CAUSE, not the same attempt","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}. A task rejected twice has had this exact diff tried: name the cause the next round can act on.`,
-		].join("\n"),
+			section("Goal", run.goal),
+			section("Task results", ...run.tasks.map((t) => card(t, [`  - result: ${t.result ?? "unreported"}`]))),
+			section(
+				"Checks to re-run",
+				`Read the diff (run "git diff" in ${run.repo} yourself) and re-run every check:`,
+				fence(JSON.stringify(run.checks)),
+				'Verdict rule: "accepted" needs EVERY check re-run BY YOU in this turn, each row reported as ["cmd","observed"] with what THAT run printed. The pre-swap gate already ran them green on the coding lane and its row is in the state file; a row copied from the gate\'s result is not a re-run, and a check you did not run cannot be accepted.',
+			),
+			section(
+				"needs_repair",
+				`"needs_repair" ends the round and must name the tasks for round ${run.round + 1} as full cards:`,
+				fence('{"id":"R1","objective":"the CAUSE, not the same attempt","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}'),
+				"A task rejected twice has had this exact diff tried: name the cause the next round can act on.",
+			),
+		),
 	repair: async (run: RunState): Promise<string> => {
-		const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
+		const prior = (run.rejection_history ?? []).slice(-5).map((r) => `- round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
 		const ids = (run.repair_tasks ?? []).map((t) => t.id);
 		const critiques = critiquesFor(run, ids);
 		const checklist = (run.repair_tasks ?? []).map((t) => `${t.id}: ${t.acceptance}`);
-		return [
+		return page(
 			`Phase 1 (repair), round ${run.round} of orchestrated run ${run.run_id}.`,
-			`Goal: ${run.goal}`,
-			`Repair tasks: ${JSON.stringify(run.repair_tasks)}`,
+			section("Goal", run.goal),
+			section("Repair tasks", ...(run.repair_tasks ?? []).map((t) => card(t))),
 			// The critique the task itself earned, with its count — the anti-oscillation line.
-			...(critiques.length > 0 ? ["Rejected before — the verifier's words, BY TASK:", ...critiques] : []),
-			...(prior.length > 0 ? ["Previously rejected — fix the cause, do not repeat the attempt:", ...prior.map((p) => `  ${p}`)] : []),
+			critiques.length > 0 ? section("Rejected before — the verifier's words, BY TASK:", ...critiques) : "",
+			prior.length > 0 ? section("Previously rejected — fix the cause, do not repeat the attempt", ...prior) : "",
 			// Compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
-			`Working tree: ${await diffStat(run.repo)}`,
-			checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
-			`Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections — no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
-			`Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
+			section("Tree", `Working tree: ${await diffStat(run.repo)}`, checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : ""),
+			section(
+				"Context",
+				"this prompt carries the task definitions, the diff stat, the checklist and the last rejections — no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.",
+				`Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
+			),
 			await gitCaveat(run.repo),
-			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
-		].filter(Boolean).join("\n");
+			section("Call", 'fade_phase phase="coding_done", payload:', fence('{"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"}]}')),
+		);
 	},
 	gate: (run: RunState): string => {
 		const results = run.gate_last?.results ?? [];
 		const invalid = results.filter((r) => r.invalid);
 		const failing = results.filter((r) => !r.ok && !r.invalid);
-		return [
+		return page(
 			`Pre-swap gate RED, round ${run.round} of orchestrated run ${run.run_id} — the verifier lane was NOT loaded; the swap is only paid for a green tree.`,
-			...invalid.map((f) => `INVALID CHECK (not a command, never executed): ${f.cmd}\n  expected: ${f.expected}\n  ${f.tail}`),
-			...failing.map((f) => `FAIL: ${f.cmd}\n  expected: ${f.expected}\n  observed tail: ${f.tail}`),
-			...(invalid.length > 0
-				? [
+			section("Plan defects (never executed)", ...invalid.map((f) => [`- INVALID CHECK (not a command, never executed): ${f.cmd}`, `  - expected: ${f.expected}`, `  - observed: ${f.tail}`].join("\n"))),
+			section("Checks that ran and failed", ...failing.map((f) => [`- FAIL: ${f.cmd}`, `  - expected: ${f.expected}`, `  - observed tail: ${f.tail}`].join("\n"))),
+			invalid.length > 0
+				? section(
+						"The exit is a plan act",
 						`${invalid.length} of the plan's checks are PLAN DEFECTS: bash refuses to parse them, so no state of ${run.repo} can make them green and no amount of coding will pay the swap. Fixing the tree is not the remedy — the exit is a plan act: call fade_phase phase="planning_done" with the rows re-declared as runnable commands (the tool's own --ref / --root / absolute-binary forms, no <placeholders>), keeping every task.`,
-					]
-				: []),
-			`Fix the causes in ${run.repo} (the checks are the plan's own), re-run them yourself until they pass, then call fade_phase phase="coding_done" again.`,
-		].join("\n");
+					)
+				: "",
+			section("Fix", `Fix the causes in ${run.repo} (the checks are the plan's own), re-run them yourself until they pass, then call fade_phase phase="coding_done" again.`),
+		);
 	},
 	final: (run: RunState): string => {
 		const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
@@ -1202,14 +1275,14 @@ export const briefings = {
 	 */
 	nudge: (run: RunState): string => {
 		const phase = PHASE_FOR_STATE[run.state] ?? "coding_done";
-		return [
+		return page(
 			`Protocol nudge ${run.stall_count ?? 1}/${STALL_SYNTHESIZE_AT} — orchestrated run ${run.run_id}, state ${run.state}, round ${run.round}/${run.max_rounds} (UNSPENT: the round budget does not move here), lane ${run.lane}.`,
-			`Your turn ended with NO fade_phase call. The loop cannot advance without it and will not swap lanes.`,
-			`Call the fade_phase tool NOW: phase="${phase}", payload=<the JSON object serialized to a string>.`,
+			section("What is missing", "Your turn ended with NO fade_phase call. The loop cannot advance without it and will not swap lanes."),
+			section("Call it now", `Call the fade_phase tool NOW: phase="${phase}", payload=<the JSON object serialized to a string>.`),
 			SCHEMA_HINT,
-			`The work is done? Say so with the acceptance command and what it printed in "result". The work is NOT done? Finish it, then report.`,
-			`The next miss auto-synthesizes this round's coding_done from git and the gate exit codes; the one after halts the run as stalled_protocol_error.`,
-		].join("\n");
+			section("Answer", 'The work is done? Say so with the acceptance command and what it printed in "result". The work is NOT done? Finish it, then report.'),
+			section("Cost of the next miss", "The next miss auto-synthesizes this round's coding_done from git and the gate exit codes; the one after halts the run as stalled_protocol_error."),
+		);
 	},
 	/**
 	 * Tier 3 of the protocol ladder: the circuit breaker tripped. The run is paused, the lane is
@@ -1219,19 +1292,18 @@ export const briefings = {
 	stalled: async (run: RunState): Promise<string> => {
 		const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
 		const phases = (run.phases ?? []).slice(-3).map((p) => `${p.phase} round ${p.round} accepted=${p.accepted}${p.notes ? ` notes=${p.notes}` : ""}`);
-		const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok).map((r) => `  RED: ${r.cmd}\n    expected: ${r.expected}\n    observed: ${r.tail}`);
-		const rejections = (run.rejection_history ?? []).slice(-5).map((r) => `  round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
-		return [
+		const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok).map((r) => [`- RED: ${r.cmd}`, `  - expected: ${r.expected}`, `  - observed: ${r.tail}`].join("\n"));
+		const rejections = (run.rejection_history ?? []).slice(-5).map((r) => `- round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
+		return page(
 			`Orchestrated run ${run.run_id} HALTED: stalled_protocol_error — ${run.protocol_retries ?? 0} turn(s) ended with no fade_phase call (state ${run.state}, round ${run.round}/${run.max_rounds}, lane ${run.lane}). The loop is paused; nothing further is sent to any lane and no lane was swapped.`,
-			phases.length > 0 ? `Last phases the machine saw: ${phases.join(" | ")}` : `No phase was ever accepted by this run.`,
-			run.synthesized ? `Synthesized coding_done at round ${run.synthesized.round} (${run.synthesized.at}): ${JSON.stringify(run.synthesized)}` : `Nothing was synthesized.`,
-			`Deterministic gate: ${gateSummary(run)}`,
-			...(failing.length > 0 ? ["Checks that are RED:", ...failing] : []),
-			...(rejections.length > 0 ? ["Recent rejections:", ...rejections] : []),
-			`Working tree: ${await diffStat(run.repo)}`,
-			run.operator_note ? `Operator note: ${run.operator_note}` : "",
-			`Act on it: read ${path}, run the plan's own checks in ${run.repo}, then /orchestrate pause to unpause in place, /orchestrate code to resume on the code lane, or /orchestrate stop to end the run.`,
-		].filter(Boolean).join("\n");
+			section("Phases the machine saw", phases.length > 0 ? phases.join("\n") : "No phase was ever accepted by this run."),
+			section("Synthesis", run.synthesized ? `Synthesized coding_done at round ${run.synthesized.round} (${run.synthesized.at}): ${JSON.stringify(run.synthesized)}` : "Nothing was synthesized."),
+			section("Deterministic gate", gateSummary(run)),
+			failing.length > 0 ? section("Checks that are RED", ...failing) : "",
+			rejections.length > 0 ? section("Recent rejections", ...rejections) : "",
+			section("Tree", `Working tree: ${await diffStat(run.repo)}`, run.operator_note ? `Operator note: ${run.operator_note}` : ""),
+			section("Act on it", `read ${path}, run the plan's own checks in ${run.repo}, then /orchestrate pause to unpause in place, /orchestrate code to resume on the code lane, or /orchestrate stop to end the run.`),
+		);
 	},
 };
 

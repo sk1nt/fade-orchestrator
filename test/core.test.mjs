@@ -51,6 +51,7 @@ import {
 	roundsForTasks,
 	runGate,
 	sameTaskPlan,
+	SCHEMA_HINT,
 	STATE_FILENAME,
 	synthesizeCodingDone,
 	tagCheckpoint,
@@ -471,7 +472,7 @@ test("the stalled briefing is the Tier-3 diagnostic: halted state, RED gate tail
 	assert.match(text, /3 turn\(s\) ended with no fade_phase call/);
 	assert.match(text, /RED: npm test/);
 	assert.match(text, /2 failed/);
-	assert.match(text, /Recent rejections:/);
+	assert.match(text, /^## Recent rejections$/m, "the section the rejections ride in");
 	assert.match(text, /\[schema\] T1: payload is not JSON/);
 	assert.match(text, /Synthesized coding_done at round 2/);
 	assert.match(text, /coding_done round 1 accepted=true/);
@@ -787,11 +788,57 @@ test("a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and 
 	assert.equal(v.error, undefined, v.error ?? "");
 	assert.match(
 		await briefings.window(run),
-		/ONE coding_done payload: \{"done":\[\{"id":"T1".*\{"id":"T2".*\{"id":"T3"/,
+		/ONE coding_done payload:\n```\n\{"done":\[\{"id":"T1"[\s\S]*\{"id":"T2"[\s\S]*\{"id":"T3"[\s\S]*\]\}\n```/,
 		"the contract the lane is briefed with names every id of the window",
 	);
 	assert.equal(applyDone(run, v.done).length, 3, "one payload marks the whole window");
 	assert.equal(ids(roundWindow(run).readyNow), "", "the round has no second window left to pay");
+});
+
+// ── the briefing renderer: a lane reads a PAGE, not a wall ────────────────────────────────────
+// The anchors above are the contract the lanes are graded on; the SHAPE is what this test owns. A
+// briefing that regresses to single-newline prose with payload dumps mid-sentence is the shape the
+// lanes skim, and a skeleton the lane cannot see is a skeleton it invents. So the page is pinned:
+// a title line, `## ` sections a blank line apart, every skeleton fenced, and tasks as cards.
+test("every briefing renders as a page — title line, ## sections, fenced skeletons, task cards", async () => {
+	const run = mkRun({
+		state: "coding",
+		round: 2,
+		tasks: [winTask("T1"), winTask("T2", ["T1"])],
+		checks: [["npm test", "exit 0"]],
+		repair_tasks: [winTask("T1")],
+		gate_last: { at: "x", passed: false, results: [{ cmd: "false", expected: "exit 0", ok: false, tail: "rc 1" }] },
+		rejection_history: [rej(1, "verification", "T1", "T1: the cache key is stale")],
+	});
+	const pages = [
+		["plan", await briefings.plan(run)],
+		["code", await briefings.code(run)],
+		["window", await briefings.window(run)],
+		["verify", briefings.verify(run)],
+		["repair", await briefings.repair(run)],
+		["gate", briefings.gate(run)],
+		["nudge", briefings.nudge(run)],
+		["stalled", await briefings.stalled(run)],
+	];
+	const skeleton = ["plan", "code", "window", "verify", "repair", "nudge"];
+	const cards = ["code", "window", "verify", "repair"];
+	for (const [name, text] of pages) {
+		assert.ok(!text.startsWith("## "), `${name}: the page leads with its title line, never a heading`);
+		assert.match(text, /^## \S/m, `${name}: its sections are ## headings`);
+		assert.match(text, /\n\n## /, `${name}: sections sit a blank line apart`);
+		if (skeleton.includes(name)) assert.match(text, /^```$/m, `${name}: the payload/check skeleton is fenced, not mid-sentence`);
+		if (cards.includes(name)) {
+			assert.match(text, /^- \*\*T1\*\* — /m, `${name}: a task is a card — id and objective on the bullet`);
+			assert.match(text, /^  - files: /m, `${name}: files are a sub-bullet`);
+			assert.match(text, /^  - acceptance: /m, `${name}: acceptance is a sub-bullet`);
+			assert.match(text, /^  - dependencies: /m, `${name}: dependencies are a sub-bullet`);
+		}
+	}
+	// The schema hint a lane reads after a refusal: one phase per line, inside one fenced block.
+	assert.match(SCHEMA_HINT, /^Payload schemas/m, "the hint keeps the title the nudge asserts");
+	assert.match(SCHEMA_HINT, /^planning_done\s+\{"tasks"/m, "planning's shape is one line");
+	assert.match(SCHEMA_HINT, /^coding_done\s+\{"done"/m, "coding's shape is the next");
+	assert.match(SCHEMA_HINT, /^verification_done \{"verdict"/m, "and verification's the third");
 });
 
 // ── declared-failure checks: a plan can name a NON-zero exit as the accepted state ──────────────

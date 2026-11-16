@@ -12,8 +12,10 @@ import { hostname, userInfo } from "node:os";
 /**
  * The account the REDACTOR masks, resolved the way `ui.ts` `account()` resolves it: `$USER` first,
  * the passwd entry as the fallback. A fixture that guessed (the old `"someone"` fallback) tested a
- * string the redactor never masks: it passed only where `$USER` was set — the public CI — and went
- * red in the fade-ci container, where `--user 1000:1000` leaves `$USER` empty (measured 2026-11-16).
+ * string the redactor never masks: it passes only where `$USER` is set — the public CI — and goes
+ * red in the fade-ci container, because that container runs with `--user 1000:1000` and no login
+ * name reaches `$USER`. The fixture resolves the account through the same fallback the redactor
+ * uses; it never names one.
  */
 const account = () => {
 	const env = process.env.USER;

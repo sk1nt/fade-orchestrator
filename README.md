@@ -51,6 +51,10 @@ carries no host-specific code.
   what that run printed — the pre-swap gate's green row is not its evidence. A `needs_repair` names
   the next round's tasks as full cards, cause first: a task rejected twice has had this exact diff
   tried (`test/core.test.mjs`).
+- **The page itself.** Each briefing is one rendered page: a title line, `## ` sections a blank line
+  apart, task cards as bullets with sub-bullets, and the payload skeleton fenced so the lane copies a
+  shape instead of inventing one. The format, the strings the suite pins as the contract, and the
+  stable-prefix rule the cache bills are in `docs/BRIEFINGS.md`.
 
 - **Protocol gate, three tiers.** A turn that ends with no `fade_phase` call is a protocol miss and
   consumes no coding round. **T1** nudge in place (`pi.sendUserMessage`, counters

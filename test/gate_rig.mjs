@@ -46,8 +46,9 @@ import { hostname, tmpdir, userInfo } from "node:os";
 /**
  * The account the REDACTOR masks, resolved the way `ui.ts` `account()` resolves it: `$USER` first,
  * then the passwd entry. Guessing (the old `"someone"` fallback) tested a string the redactor never
- * masks: green on a runner whose `$USER` is set, red in the fade-ci container where
- * `--user 1000:1000` leaves `$USER` empty (measured 2026-11-16).
+ * masks: it is green on a runner whose `$USER` is set and red in the fade-ci container, because
+ * that container runs with `--user 1000:1000` and no login name reaches `$USER`. So the fixture
+ * resolves the account through the same fallback the redactor uses; it never names one.
  */
 const account = () => {
 	const env = process.env.USER;
