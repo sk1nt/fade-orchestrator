@@ -36,6 +36,10 @@
 //      pid, run, repo and host, paying ZERO lane load and writing no state; a free router is
 //      claimed at the start, naming this pid and the new run; `stop` releases the claim. The rig
 //      isolates the claim plane in `FADE_ORCHESTRATE_LOCK_DIR`, never the operator's.
+//  17. THE ON-DISK GATE REPAIR: a `state.json` that re-declares a row and re-roots the run is
+//      judged AT THE NEW ROOT, both refreshes are announced, and the taken repair is written back
+//      as the loop's own record — the live failure it guards is a run rooted at repo A whose tasks
+//      and rows name repo B, gate red every round on rows that pass rc=0 at B.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
@@ -397,6 +401,48 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	existsSync(stateFile) && tmpSiblings.length === 0 && readState().run_id === "GATE1" && s.state === "verifying",
 	`${stateFile} round ${s.round} tmp=[${tmpSiblings.join(",")}]`,
   );
+}
+
+// 5b. The on-disk gate repair reaches the GATE (header item 17): the run resumes at repo A, an
+// operator patches `state.json` mid-run to re-root to B and re-declare a row that can only pass at
+// B, and the gate that follows must run the new row AT B and announce both refreshes. This is the
+// live failure: a run rooted at A whose tasks name B, gate red every round on rows that pass rc=0
+// at B.
+{
+  const alt = mkdtempSync(join(tmpdir(), "fade-gate-repair-"));
+  execFileSync("git", ["-C", alt, "init", "-q"], { stdio: "pipe" });
+  writeFileSync(join(alt, "marker.txt"), "the row can only pass here\n");
+  const repaired = [["test -s marker.txt", "exit 0"]];
+  // Resume at the fixture root with a row that cannot pass anywhere.
+  writeState({ ...seedState("coding", [["false", "exit 0"]]), schema_retries: 0, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  // The repair lands on disk AFTER the in-memory run exists — the only form the gate can refresh.
+  writeState({ ...readState(), repo: alt, checks: repaired });
+  notes.length = 0;
+  await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }] });
+  const s = readState();
+  const rows = s.gate_last?.results ?? [];
+  ok(
+	"the gate ran the RE-DECLARED row",
+	rows.length === 1 && rows[0].cmd === repaired[0][0] && rows[0].ok === true,
+	JSON.stringify(rows.map((r) => [r.cmd, r.ok])),
+  );
+  ok(
+	"both refreshes are announced to the operator",
+	notes.some((n) => n.includes("re-read the checks from")) && notes.some((n) => n.includes("re-rooted the run")),
+	notes.join(" | ").slice(0, 220),
+  );
+  ok(
+	"the gate is GREEN at the repaired root, so the verifier swap is paid for",
+	s.gate_last?.passed === true && s.state === "verifying",
+	`state=${s.state}`,
+  );
+  ok(
+	"the taken repair is the loop's own record on disk",
+	s.repo === alt && JSON.stringify(s.checks) === JSON.stringify(repaired),
+	`repo=${s.repo} checks=${JSON.stringify(s.checks)}`,
+  );
+  rmSync(alt, { recursive: true, force: true });
 }
 
 // 6. needs_repair records the verifier critique
