@@ -2336,7 +2336,41 @@ function fadeOrchestrate(pi) {
     }
   };
   const statePath = () => runDir ? join6(runDir, STATE_FILENAME) : "<unset>";
-  const persist = () => run && runDir ? coalesceWrite(statePath(), run) : Promise.resolve();
+  let publishedAtUs = 0;
+  const syncFromDisk = async () => {
+    if (!run || !runDir) return false;
+    let mtimeUs = 0;
+    try {
+      mtimeUs = Math.round((await stat3(statePath())).mtimeMs * 1e3);
+    } catch {
+      return false;
+    }
+    if (publishedAtUs === 0 || mtimeUs <= publishedAtUs) return false;
+    const live = await liveState();
+    if (!live || live.run_id !== run.run_id) return false;
+    const checks = refreshChecks(run, live);
+    const root = await refreshRoot(run, live);
+    if (!checks.changed && !root.changed) return false;
+    (run.phases ??= []).push({
+      phase: "disk_repair",
+      lane: run.lane,
+      accepted: true,
+      round: run.round,
+      at: (/* @__PURE__ */ new Date()).toISOString(),
+      notes: `adopted from disk: checks ${checks.to} rows${checks.added.length ? ` (+${checks.added.join(",")})` : ""}${checks.removed.length ? ` (-${checks.removed.length})` : ""}${checks.redrafted ? ` redrafted ${checks.redrafted}` : ""}${root.changed ? `; repo -> ${root.to}` : root.refused ? `; repo refused: ${root.refused}` : ""}`
+    });
+    return true;
+  };
+  const persist = async () => {
+    if (!run || !runDir) return;
+    await syncFromDisk();
+    await coalesceWrite(statePath(), run);
+    try {
+      publishedAtUs = Math.round((await stat3(statePath())).mtimeMs * 1e3);
+    } catch {
+      publishedAtUs = 0;
+    }
+  };
   let lastWriteWarn = "";
   const warnWrite = (ctx, what) => (e) => {
     const msg2 = `${what}: ${e instanceof Error ? e.message : String(e)}`;

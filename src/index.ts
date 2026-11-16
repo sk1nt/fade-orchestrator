@@ -272,8 +272,56 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 * each write is `fs.promises` (tmp → fdatasync → rename → directory sync), which is what kills
 	 * the freeze: the fsync pair used to run inside the panel's refresh tick and inside every phase
 	 * transition, on the TUI's own loop, and the host stopped painting for the length of it.
+	 *
+	 * It also carries the OPERATOR SURFACE: `checks` and `repo` are the two fields the operator is
+	 * documented to repair on disk (a run rooted at the wrong repo, a check that is not a command),
+	 * and the loop must SEE that repair at its very next write — a repair the loop never adopts is
+	 * erased by that write, which is how a re-rooted, repaired `state.json` came back red six
+	 * rounds running.
 	 */
-	const persist = (): Promise<void> => (run && runDir ? coalesceWrite(statePath(), run) : Promise.resolve());
+	/** The mtime of the last record THIS loop published, microseconds. Adoption is judged against
+	 *  it: a file NEWER than the loop's own publish was written by someone else and is adopted; a
+	 *  file older is the loop's own last publish, or a file seeded BEFORE a phase declared its own
+	 *  checks — and reverting to that erases the declaration. An unguarded sync does exactly that
+	 *  to `planning_done`'s checks and to the plan act's, measured on the rig: the gate then runs
+	 *  ZERO checks, pays no swap judgement, and the run reports green on a gate that never fired. */
+	let publishedAtUs = 0;
+	const syncFromDisk = async (): Promise<boolean> => {
+		if (!run || !runDir) return false;
+		let mtimeUs = 0;
+		try {
+			mtimeUs = Math.round((await stat(statePath())).mtimeMs * 1000);
+		} catch {
+			return false; // no file: nothing to adopt; the publish below creates it
+		}
+		if (publishedAtUs === 0 || mtimeUs <= publishedAtUs) return false;
+		const live = await liveState();
+		if (!live || live.run_id !== run.run_id) return false;
+		const checks = refreshChecks(run, live);
+		const root = await refreshRoot(run, live);
+		if (!checks.changed && !root.changed) return false;
+		// Journal it, never silent: the panel and the phase log are where the operator reads what
+		// the loop decided, and a repair that changes the gate's rows changes every later verdict.
+		(run.phases ??= []).push({
+			phase: "disk_repair",
+			lane: run.lane,
+			accepted: true,
+			round: run.round,
+			at: new Date().toISOString(),
+			notes: `adopted from disk: checks ${checks.to} rows${checks.added.length ? ` (+${checks.added.join(",")})` : ""}${checks.removed.length ? ` (-${checks.removed.length})` : ""}${checks.redrafted ? ` redrafted ${checks.redrafted}` : ""}${root.changed ? `; repo -> ${root.to}` : root.refused ? `; repo refused: ${root.refused}` : ""}`,
+		});
+		return true;
+	};
+	const persist = async (): Promise<void> => {
+		if (!run || !runDir) return;
+		await syncFromDisk();
+		await coalesceWrite(statePath(), run);
+		try {
+			publishedAtUs = Math.round((await stat(statePath())).mtimeMs * 1000);
+		} catch {
+			publishedAtUs = 0; // unmeasurable: the next write re-reads, which is the safe direction
+		}
+	};
 
 	/**
 	 * A fire-and-forget durable write must never reach the host as an unhandled rejection. The state

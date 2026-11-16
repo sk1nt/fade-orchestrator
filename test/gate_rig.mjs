@@ -110,7 +110,10 @@ writeFileSync(join(repo, "a.ts"), "seed\n");
 // fast-path block later runs `git rm -r --cached var` (the real repo gitignores `var/`, so the
 // orchestrator's own ledger must not be priced as the coder's diff), which needs `var/` to have
 // been tracked once. A seed record makes that true, as the runs' own state files did before.
-writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), "{}\n");
+// The placeholder must carry the fixture's run id: `normalizeRun` MINTS one when the file has
+// none, and disk adoption is keyed by `run_id` — a minted id refuses every seeded record, so a
+// loop that reads the file at all (the repair sync) would judge a run that never matches it.
+writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), JSON.stringify({ run_id: "GATE1" }) + "\n");
 gitAt("add", "-A");
 gitAt("commit", "-q", "-m", "rig seed");
 
@@ -295,6 +298,20 @@ const writeState = (s) => {
   writeFileSync(join(repo, "var", "omp-orchestrate", "ACTIVE.json"), JSON.stringify({ run_id: "GATE1", repo, goal: "g", started_utc: s.started_utc, max_rounds: 6 }));
 };
 const readState = () => JSON.parse(readFileSync(join(repo, "var", "omp-orchestrate", "state.json"), "utf8"));
+/** The state publish is coalesced and asynchronous (scenario 15 bounds-waits for the tmp sibling
+ *  for the same reason), so a rig that reads the file the instant a phase returns can read the
+ *  PREVIOUS record. A persist that does extra work first — the disk-repair sync — widens that race.
+ *  Settle on the field the phase OWNS, then the assertion judges that field's VALUE, never its
+ *  presence: a stale record that contradicts the expectation still fails. */
+const readStateWhen = async (pred, cap = 4000) => {
+	const t0 = Date.now();
+	let s = readState();
+	while (!pred(s) && Date.now() - t0 < cap) {
+		await new Promise((r) => setTimeout(r, 10));
+		s = readState();
+	}
+	return s;
+};
 const loads = () => reqLog.filter((r) => r === "POST /v1/load").length;
 /** The switch is queued on the serial chain, so a load lands a few ticks after the call that asked
  *  for it. A fixed sleep overran on the CI runner — the gate's polls, the stub's HTTP and the gate's
@@ -353,8 +370,10 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 
 // 4. RED gate: zero loads, rejection recorded, gate briefing names the command
 {
+  console.error("SC4-PRE", JSON.stringify({ checks: readState().checks, state: readState().state }));
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }] });
-  const s = readState();
+  // The gate's record is the field this phase owns: settle on it, then judge its value.
+  const s = await readStateWhen((x) => x.gate_last && x.run_id === "GATE1");
   ok("red gate issues ZERO verifier loads", loads() === 0, `loads=${loads()}`);
   ok("red gate keeps state coding", s.state === "coding");
   ok("red gate records a task rejection", (s.rejection_history ?? []).some((r) => r.kind === "task" && r.reason.includes("gate")));
@@ -442,6 +461,43 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	s.repo === alt && JSON.stringify(s.checks) === JSON.stringify(repaired),
 	`repo=${s.repo} checks=${JSON.stringify(s.checks)}`,
   );
+  rmSync(alt, { recursive: true, force: true });
+}
+// 5c. The WRITE PATH adopts the repair, not only the gate. The gate re-reads the file at its own
+// tick (5b), but the loop writes state for reasons that never touch the gate — a schema refusal, a
+// rejection, a lane bookkeeping write — and each of those writes rewrites the whole record. Live
+// failure, six rounds: the operator's repair landed on disk, a paint-path write rewrote the
+// pre-repair record over it, and the gate judged the OLD rows at the OLD root every round. So the
+// adoption lives in `persist`, gated on "the file is newer than the loop's own last publish", and
+// a repair must survive every later write and reach the gate that follows.
+{
+  const alt = mkdtempSync(join(tmpdir(), "fade-gate-adopt-"));
+  execFileSync("git", ["-C", alt, "init", "-q"], { stdio: "pipe" });
+  writeFileSync(join(alt, "marker.txt"), "the row can only pass here\n");
+  const repaired = [["test -s marker.txt", "exit 0"]];
+  writeState({ ...seedState("coding", [["false", "exit 0"]]), schema_retries: 0, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  writeState({ ...readState(), repo: alt, checks: repaired });
+  // A refusal: a phase call the gate NEVER sees, whose persist is the clobber that ate the repair.
+  let refused = "";
+  try {
+    await exec("coding_done", { done: [{ id: "T1", status: "ok" }] });
+  } catch (e) {
+    refused = e.message;
+  }
+  const w = readState();
+  ok("the refusal is a refusal", /passed\|failed\|blocked/.test(refused), refused.slice(0, 60));
+  ok("the refusal's write adopts the on-disk repair", w.repo === alt && JSON.stringify(w.checks) === JSON.stringify(repaired), `repo=${w.repo} checks=${JSON.stringify(w.checks)}`);
+  ok("the adoption is journaled, never silent", (w.phases ?? []).some((p) => p.phase === "disk_repair"), JSON.stringify((w.phases ?? []).slice(-1)));
+  // And it reaches the gate that follows: the repaired row, run at the repaired root, green.
+  const l0 = loads();
+  await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }, { id: "T2", status: "passed", result: "x" }] });
+  const g = await readStateWhen((x) => Boolean(x.gate_last) && x.repo === alt);
+  ok("the gate runs the repaired row at the repaired root", (g.gate_last?.results ?? []).length === 1 && g.gate_last.results[0].ok === true && g.gate_last.passed === true, JSON.stringify(g.gate_last?.results ?? []));
+  ok("the repair survives the gate's own write", g.repo === alt && JSON.stringify(g.checks) === JSON.stringify(repaired), `repo=${g.repo}`);
+  // The swap itself is 5b's subject; here the gate going GREEN at the repaired root is the point,
+  // and it is the state the loader pays from.
+  ok("a green gate at the repaired root reaches verifying, so the swap is paid for", g.state === "verifying", g.state);
   rmSync(alt, { recursive: true, force: true });
 }
 
@@ -688,7 +744,8 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	} catch (e) {
 		actErr = e.message;
 	}
-	const st1 = readState();
+	// The plan-act phase-log note is the field this act owns: settle on it, then judge the rest.
+	const st1 = await readStateWhen((x) => `${x.phases?.at(-1)?.notes ?? ""}`.includes("plan act"));
 	ok("the plan act is accepted from coding", actErr === "" && st1.checks.length === 1 && st1.checks[0][0] === "true", actErr.slice(0, 110));
 	ok("the plan act leaves the round, the state and the tasks alone", st1.round === g.round && st1.state === "coding" && st1.tasks.map((t) => t.id).join(",") === g.tasks.map((t) => t.id).join(","), `${st1.round}/${st1.state}`);
 	ok("the plan act pays NO swap", loads() === gateBase, `${loads() - gateBase}`);
