@@ -160,6 +160,25 @@ const untilText = async (needle, ms = 20_000) => {
 	return text;
 };
 
+/**
+ * Wall-clock from `send-keys` to the first `capture-pane` that SHOWS the keystroke's effect, on a
+ * 5 ms poll. The rig's `until` polls at 1 s — the right cadence for "did it land" and useless for
+ * "how long did the terminal freeze", which is the operator's complaint: a host that eats seconds
+ * per keystroke passes every polling assertion, because the text always arrives eventually. So the
+ * freeze is measured here, as a number, with a bound it can fail and a value it prints.
+ */
+const lat = async (keys, needle, ms) => {
+	const t0 = Date.now();
+	tmux("send-keys", "-t", SESSION, ...keys);
+	let text = pane();
+	while (!text.includes(needle)) {
+		if (Date.now() - t0 >= ms) return { ms: Date.now() - t0, text, hit: false };
+		await sleep(5);
+		text = pane();
+	}
+	return { ms: Date.now() - t0, text, hit: true };
+};
+
 const checks = [];
 const ok = (name, cond, detail = "") => checks.push({ name, ok: Boolean(cond), detail: String(detail).slice(0, 400) });
 
@@ -306,6 +325,33 @@ for (const state of ["DEFAULT", "HELD"]) {
 			tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
 			const opened = strip(await until("ENGINE / ROUTER", 20_000));
 			ok(`[${tag}] ESC f opens the screen`, opened.includes("ENGINE / ROUTER"), opened.slice(0, 300));
+			tmux("send-keys", "-t", SESSION, "Escape");
+			await until("Orchestrator:", 15_000).catch(() => "");
+			// ---- keystroke latency: the freeze is the complaint ----
+			// Every other assertion here POLLS until the text lands, so a host that eats seconds per
+			// keystroke — a synchronous ledger read, a spawn, an fsync inside a callback the TUI's own
+			// loop runs — reads GREEN. These two lines measure the frame instead, in the two states that
+			// matter: an idle prompt (baseline) and the extension mid-work (busy), the state the operator
+			// hits the chord in. Both print the measured number, pass or fail, so a slow box is visible
+			// and not merely red. Bound: 500 ms.
+			const BOUND = 500;
+			// Baseline: one keystroke into the idle prompt. The needle is a 4-char nonce, not a lone
+			// letter — single letters already sit on a 150x45 pane (the host's header, the row), so a
+			// one-letter needle would report the FIRST paint it saw, not the keystroke's.
+			const nonce = "zq7x";
+			const base = await lat([nonce], nonce, 5_000);
+			tmux("send-keys", "-t", SESSION, "BSpace", "BSpace", "BSpace", "BSpace");
+			console.log(`latency baseline ${base.ms}ms bound=${BOUND}ms (one keystroke into the idle prompt)`);
+			ok(`[latency] baseline: a plain editor keystroke paints under ${BOUND} ms`, base.hit && base.ms < BOUND, `baseline ${base.ms}ms bound=${BOUND}ms ${strip(base.text).slice(-200)}`);
+			// Busy: real work in flight, through the real host only — `/orchestrate status` runs the
+			// extension's command handler (it reads the state file and notifies) while the panel's tick
+			// and the 2 s metrics sampler are already running, then `ESC f` is pressed on top of it. If
+			// the handler blocks the TUI's loop the chord sits in the pty queue, and that wait IS the
+			// freeze, so it lands inside the measured window.
+			send("/orchestrate status");
+			const busy = await lat(["-H", "1b", "66"], "ENGINE / ROUTER", 5_000);
+			console.log(`latency busy ${busy.ms}ms bound=${BOUND}ms (ESC f while the extension is mid-work)`);
+			ok(`[latency] busy: ESC f opens the screen under ${BOUND} ms while the extension works`, busy.hit && busy.ms < BOUND, `busy ${busy.ms}ms bound=${BOUND}ms ${strip(busy.text).slice(0, 200)}`);
 			tmux("send-keys", "-t", SESSION, "Escape");
 			await until("Orchestrator:", 15_000).catch(() => "");
 			// The extension never takes ctrl+o. Which action the host runs there is the host's business
