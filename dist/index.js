@@ -2373,6 +2373,7 @@ function fadeOrchestrate(pi) {
     const root = await refreshRoot(run, live);
     if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run \u2014 ${root.to} (was ${root.from})`, "info");
     if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run \u2014 refused: ${root.refused}`, "warning");
+    if (r.changed || root.changed) await persist();
   };
   const runGateLogged = async (checks, repo, ctx) => {
     const t0 = Date.now();

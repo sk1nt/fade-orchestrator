@@ -334,6 +334,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const root = await refreshRoot(run, live);
 		if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run — ${root.to} (was ${root.from})`, "info");
 		if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run — refused: ${root.refused}`, "warning");
+		// A refresh that TOOK must become the loop's own record, in the same tick. Every other
+		// persist writes the whole in-memory run — the panel's refresh tick, the briefing sends —
+		// so a repaired `checks`/`repo` left unwritten here is overwritten by the next paint, and
+		// the gate then judges the pre-repair rows at the pre-repair root. Measured live: a
+		// re-root plus a re-declared row read back present 20 s before the gate, and the gate ran
+		// the old rows at the old root; the file carried the loop's write, not the repair. The
+		// write is safe in the original root because `runDir` is fixed at activation, so a
+		// re-rooted run keeps ONE durable record where the loop reads it.
+		if (r.changed || root.changed) await persist();
 	};
 
 	/**
