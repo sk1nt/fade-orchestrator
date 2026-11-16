@@ -35,6 +35,7 @@ import {
 	pushRejection,
 	readJson,
 	refreshChecks,
+	refreshRoot,
 	roundWindow,
 	roundsForTasks,
 	runGate,
@@ -100,10 +101,10 @@ test("the repair briefing carries the last rejections and omits the section when
 	assert.match(text, /round 2 \[verification\] T1: verdict needed real acceptance output/);
 });
 
-test("runGate judges on exit code and captures the observed tail", () => {
+test("runGate judges on exit code and captures the observed tail", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-gate-"));
 	try {
-		const g = runGate(
+		const g = await runGate(
 			[
 				["true", "always green"],
 				["echo boom; exit 3", "must fail"],
@@ -114,11 +115,46 @@ test("runGate judges on exit code and captures the observed tail", () => {
 		assert.equal(g.results[0].ok, true);
 		assert.equal(g.results[1].ok, false);
 		assert.match(g.results[1].tail, /boom/);
-		const green = runGate([["echo hi", "x"]], dir);
+		const green = await runGate([["echo hi", "x"]], dir);
 		assert.equal(green.passed, true);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("the gate never blocks the event loop: a slow row leaves the host ticking", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "gate-loop-"));
+	let ticks = 0;
+	const iv = setInterval(() => ticks++, 20);
+	const g = await runGate([["sleep 0.3; exit 0", "slow but green"]], dir);
+	clearInterval(iv);
+	rmSync(dir, { recursive: true, force: true });
+	assert.equal(g.passed, true, "the row is still judged on its exit code");
+	// The synchronous form (`execFileSync`) measured ticks=0 here: the TUI stops painting,
+	// keystrokes go dead and the swap watch's polls starve — the freeze, proved.
+	assert.ok(ticks >= 5, `the gate ran ON the event loop: ${ticks} timer ticks during a 300 ms row`);
+});
+
+test("the gate's TOTAL budget bounds the run: a hung row is KILLED, the rows behind it are named UNMEASURED", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "gate-budget-"));
+	const prev = process.env.FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS;
+	process.env.FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS = "1000";
+	const t0 = Date.now();
+	let g;
+	try {
+		g = await runGate([["sleep 30; exit 0", "hangs"], ["true", "would pass"]], dir);
+	} finally {
+		if (prev === undefined) delete process.env.FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS;
+		else process.env.FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS = prev;
+		rmSync(dir, { recursive: true, force: true });
+	}
+	const spent = Date.now() - t0;
+	assert.ok(spent < 5_000, `the gate ran ${spent}ms, far past its 1 s total budget`);
+	assert.equal(g.passed, false, "an unmeasured row is never a green gate");
+	assert.equal(g.results.length, 2, "every check keeps a row: the gate never silently shrinks");
+	assert.match(g.results[0].tail, /KILLED at the row's timeout/, "the hung row is named as killed, not passed silently");
+	assert.equal(g.results[1].budget, true, "the row that never ran is marked budget");
+	assert.match(g.results[1].tail, /NOT RUN/, "and its tail says UNMEASURED, so the coder fixes the hung check");
 });
 
 test("the gate briefing names each failing command and its expected text", () => {
@@ -193,6 +229,27 @@ test("refreshChecks: the gate honors an on-disk repair of the plan's checks, key
 	const ragged = refreshChecks(run, { ...run, checks: [["only-one-element"], ["good", "check"], null, [7, "x"]] });
 	assert.equal(ragged.to, 1, "a malformed pair is dropped, never grafted into the gate");
 	assert.deepEqual(run.checks, [["good", "check"]]);
+});
+
+test("refreshRoot: the gate re-roots when the state file names another working tree, keyed by run_id", () => {
+	// The livelock this pins: a run started in repo A and aimed at repo B. Every check is
+	// `bash -lc <cmd>` at run.repo, so B's src/, ci/ and benches/ do not exist, B's package is
+	// "No module named", and no change made inside B can ever pay the gate.
+	const run = mkRun({ repo: "/repo/A" });
+	const moved = refreshRoot(run, { ...run, repo: "/repo/B" }, (p) => p === "/repo/B");
+	assert.equal(moved.changed, true);
+	assert.equal(run.repo, "/repo/B", "the gate runs where the code is");
+	assert.deepEqual([moved.from, moved.to], ["/repo/A", "/repo/B"], "the move is named, never silent");
+	assert.equal(refreshRoot(run, { ...run, repo: "/repo/B" }, () => true).changed, false, "an equal root is a no-op");
+	const notGit = refreshRoot(run, { ...run, repo: "/repo/C" }, () => false);
+	assert.equal(notGit.changed, false, "a path that is not a working tree is refused");
+	assert.match(notGit.refused ?? "", /not a git working tree/, "the refusal names its reason");
+	assert.equal(run.repo, "/repo/B", "the refusal left the run where it was");
+	assert.equal(refreshRoot(run, { ...run, run_id: "OTHER-RUN", repo: "/repo/D" }, () => true).changed, false, "a state file from another run is never adopted");
+	assert.equal(refreshRoot(run, undefined, () => true).changed, false, "no state file is a no-op");
+	assert.equal(refreshRoot(run, { ...run, repo: "" }, () => true).changed, false, "an empty repo string is never adopted");
+	const here = process.cwd();
+	assert.equal(refreshRoot(mkRun({ repo: here }), { ...mkRun({ repo: here }), repo: here }).changed, false, "the default probe agrees: an equal path never moves");
 });
 
 test("a non-repo run root degrades by name: git's --no-index usage page never reaches a briefing", () => {
@@ -544,12 +601,12 @@ test("validateChecks refuses an unparseable check at the plan's authoring edge",
 	assert.equal(good.checks.length, 1);
 });
 
-test("runGate NEVER spawns an unparseable check and grades it INVALID, not FAIL", () => {
+test("runGate NEVER spawns an unparseable check and grades it INVALID, not FAIL", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "gate-parse-"));
 	const marker = join(dir, "spawned");
 	// The row keeps the plan's exact redirect shape and adds a side effect: if the gate spawned it,
 	// `marker` would exist.
-	const g = runGate([[`touch ${marker} --artifacts <pinned dir>; echo $?`, "never runs"], ["true", "runs"]], dir);
+	const g = await runGate([[`touch ${marker} --artifacts <pinned dir>; echo $?`, "never runs"], ["true", "runs"]], dir);
 	assert.equal(existsSync(marker), false, "an unparseable row is never executed");
 	assert.equal(g.results[0].invalid, true);
 	assert.match(g.results[0].tail, /not a command/);
@@ -559,8 +616,8 @@ test("runGate NEVER spawns an unparseable check and grades it INVALID, not FAIL"
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("the gate briefing names the plan defect and its exit, and keeps real failures separate", () => {
-	const g = runGate([[NOT_A_COMMAND, "PASS 0"], ["false", "must pass"]], process.cwd());
+test("the gate briefing names the plan defect and its exit, and keeps real failures separate", async () => {
+	const g = await runGate([[NOT_A_COMMAND, "PASS 0"], ["false", "must pass"]], process.cwd());
 	const text = briefings.gate({ gate_last: g, round: 1, run_id: "R", repo: "/repo" });
 	assert.match(text, /INVALID CHECK \(not a command, never executed\)/);
 	assert.match(text, /PLAN DEFECTS/);
@@ -717,8 +774,8 @@ test("expectation: the plan's head words declare the accepted exit state", () =>
 	assert.equal(expectation("empty output"), "quiet");
 });
 
-test("runGate: a declared failure that fails is GREEN and labelled; a stale premise is a REPORTED break", () => {
-	const g = runGate(
+test("runGate: a declared failure that fails is GREEN and labelled; a stale premise is a REPORTED break", async () => {
+	const g = await runGate(
 		[
 			["git -C /nonexistent-orch-dir rev-parse --git-dir", "fails: the tree is not a git repo yet"],
 			["true", "fails: this row should have failed"],
@@ -748,8 +805,8 @@ test("runGate: a declared failure that fails is GREEN and labelled; a stale prem
 	assert.equal(g.passed, false, "two real breaks keep the gate red");
 });
 
-test("gateRows: the as-expected rows are labelled and counted, and the gate reads them GREEN-side", () => {
-	const g = runGate(
+test("gateRows: the as-expected rows are labelled and counted, and the gate reads them GREEN-side", async () => {
+	const g = await runGate(
 		[
 			["git -C /nonexistent-orch-dir rev-parse --git-dir", "fails: the tree is not a git repo yet"],
 			["true", "exit 0, no failures"],

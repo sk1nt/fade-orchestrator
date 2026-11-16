@@ -3,10 +3,13 @@
  * each lane is fed. The wording of every validation error is load-bearing — the model steers by
  * the exact text — so it is part of the protocol, not decoration.
  */
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { msg } from "./router.ts";
+
+const execFileAsync = promisify(execFile);
 
 export const STATE_KEY = "fade.omp_orchestrate.v1";
 export const ACTIVE_FILENAME = "ACTIVE.json";
@@ -175,6 +178,9 @@ export interface GateResult {
 		want?: "exit0" | "nonzero" | "quiet";
 		/** A declared-failure check that failed as declared: green, and labelled, never a silent pass. */
 		as_expected?: boolean;
+		/** The row never ran: the gate's TOTAL budget was spent by the rows before it. Named, so a
+		 *  red gate says which rows are UNMEASURED, never silently fewer. */
+		budget?: boolean;
 		tail: string;
 	}[];
 }
@@ -211,54 +217,98 @@ export function expectation(expected: string): "exit0" | "nonzero" | "quiet" {
 }
 
 /**
+ * The gate's wall-clock bound ACROSS ALL the plan's checks. 120 s is ONE row's timeout; this is
+ * the loop's, so a plan of ten hung commands cannot spend twenty minutes of the session. A row
+ * that starts with the budget spent is never spawned and lands as a named red row.
+ */
+export const GATE_TOTAL_BUDGET_DEFAULT_MS = 600_000;
+/** Read at CALL time, not load time: it is configuration, and a rig must be able to prove the
+ *  bound in milliseconds. */
+export const gateTotalBudgetMs = (): number => Math.max(1_000, Number(process.env.FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS ?? GATE_TOTAL_BUDGET_DEFAULT_MS));
+
+/** One row announced BEFORE it is spawned, so the caller can paint `gate i/n: <cmd>` and the
+ *  operator watches the gate move instead of watching a frozen terminal. */
+export type GateProgress = (row: { index: number; total: number; cmd: string }) => void;
+
+/**
  * The pre-swap gate: the verifier swap costs a 13-25 s pack load; running the plan's own
  * checks on the code lane FIRST means the swap is only ever paid for a tree whose deterministic
  * checks already pass. Exit code is the verdict (deterministic); the `expected` text rides to
  * the verifier briefing for the judgement calls, and its head words can declare the accepted
  * exit state (see `expectation`).
+ *
+ * ASYNC on purpose. The synchronous form (`execFileSync`, 120 s per row, rows run back to back)
+ * held the event loop for the whole run of the gate: the TUI stopped painting, keystrokes went
+ * dead, and the swap watch's ticks were starved — the session read as a freeze, worst on the
+ * slowest plan. Each check now runs as a child process awaited off the loop, so the host keeps
+ * rendering, the panel keeps refreshing, and `onCheck` names the row that is running.
  */
-export function runGate(checks: [string, string][], cwd: string): GateResult {
-	const results = checks.map(([cmd, expected]) => {
+export async function runGate(checks: [string, string][], cwd: string, onCheck?: GateProgress): Promise<GateResult> {
+	const deadline = Date.now() + gateTotalBudgetMs();
+	const results: GateResult["results"] = [];
+	for (let i = 0; i < checks.length; i++) {
+		const [cmd, expected] = checks[i];
+		onCheck?.({ index: i + 1, total: checks.length, cmd });
 		// A row that cannot parse is never spawned: its exit code is a property of the STRING, so
 		// recording it as a code failure tells the coder to fix a tree that is already green.
 		const parse = checkParses(cmd);
 		if (!parse.ok) {
-			return {
+			results.push({
 				cmd,
 				expected,
 				ok: false,
 				invalid: true,
 				want: "exit0" as const,
 				tail: `not a command — bash -n: ${parse.detail} | plan defect: re-declare this check (planning_done); no tree state can make it pass`,
-			};
+			});
+			continue;
 		}
 		const want = expectation(expected);
-		let exit0 = false;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) {
+			results.push({
+				cmd,
+				expected,
+				ok: false,
+				want,
+				budget: true,
+				tail: `NOT RUN — the gate's ${Math.round(gateTotalBudgetMs() / 1000)} s total budget was spent by the rows before this one; this check is unmeasured (FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS)`,
+			});
+			continue;
+		}
 		let out = "";
 		try {
-			out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
-			exit0 = true;
+			const r = await execFileAsync("/bin/bash", ["-lc", cmd], { cwd, timeout: Math.min(120_000, remaining), maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
+			out = r.stdout;
 		} catch (e) {
-			const err = e as { stdout?: string; status?: number; message?: string };
+			const err = e as { stdout?: string; status?: number; code?: number | string; killed?: boolean; signal?: string; message?: string };
 			out = `${err.stdout ?? ""}`;
-			const code = typeof err.status === "number" ? err.status : undefined;
+			// The sync form reported the exit code as `status`; the async form reports it as `code`.
+			const code = typeof err.status === "number" ? err.status : typeof err.code === "number" ? err.code : undefined;
+			const timedOut = err.killed === true && (err.signal === "SIGTERM" || err.code === "ETIMEDOUT");
 			if (want === "nonzero") {
-				return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected — the plan declares this state: ${expected} | exit ${code ?? "non-zero"}: ${`${out}${err.message ?? String(e)}`.slice(-300)}`.slice(-400) };
+				results.push({ cmd, expected, ok: true, want, as_expected: true, tail: `as expected — the plan declares this state: ${expected} | exit ${code ?? "non-zero"}: ${`${out}${err.message ?? String(e)}`.slice(-300)}`.slice(-400) });
+				continue;
 			}
 			if (want === "quiet" && out.trim() === "") {
-				return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected — no output, exit ${code ?? "non-zero"}; the plan declares this state: ${expected}` };
+				results.push({ cmd, expected, ok: true, want, as_expected: true, tail: `as expected — no output, exit ${code ?? "non-zero"}; the plan declares this state: ${expected}` });
+				continue;
 			}
-			return { cmd, expected, ok: false, want, tail: `${out}${err.message ?? String(e)}`.slice(-400) };
+			const suffix = timedOut ? ` | KILLED at the row's timeout (the command did not finish)` : "";
+			results.push({ cmd, expected, ok: false, want, tail: `${out}${err.message ?? String(e)}${suffix}`.slice(-400) });
+			continue;
 		}
 		// exit 0: a declared-failure row whose premise is stale is a REPORTED break, not a pass.
 		if (want === "nonzero") {
-			return { cmd, expected, ok: false, want, tail: `expected a failure and the command exited 0 — the plan's declared state is stale, re-declare the check: ${expected} | ${out.slice(-300)}` };
+			results.push({ cmd, expected, ok: false, want, tail: `expected a failure and the command exited 0 — the plan's declared state is stale, re-declare the check: ${expected} | ${out.slice(-300)}` });
+			continue;
 		}
 		if (want === "quiet" && out.trim() !== "") {
-			return { cmd, expected, ok: false, want, tail: `expected no output and the command printed ${out.trim().split("\n").length} line(s): ${out.slice(0, 300)}` };
+			results.push({ cmd, expected, ok: false, want, tail: `expected no output and the command printed ${out.trim().split("\n").length} line(s): ${out.slice(0, 300)}` });
+			continue;
 		}
-		return { cmd, expected, ok: true, want, tail: `${out}`.slice(-400) };
-	});
+		results.push({ cmd, expected, ok: true, want, tail: `${out}`.slice(-400) });
+	}
 	return { at: new Date().toISOString(), passed: results.every((r) => r.ok), results };
 }
 
@@ -280,6 +330,24 @@ export function refreshChecks(run: RunState, live: RunState | undefined): { chan
 	if (JSON.stringify(before) === JSON.stringify(after)) return { changed: false, to: after.length, added: [], removed: [] };
 	run.checks = next;
 	return { changed: true, to: after.length, added: after.filter((c) => !before.includes(c)), removed: before.filter((c) => !after.includes(c)) };
+}
+
+/**
+ * The run's ROOT is data as well, and it is the one field the gate cannot survive being wrong
+ * about: every check is `bash -lc <cmd>` at `run.repo`, so a run started in repo A and aimed at
+ * repo B fails on files that exist only in B — `No such file or directory`, `No module named
+ * "<B's package>"`, a suite of thousands of A's tests — and no change inside B can ever pay that
+ * gate. Adopt `repo` from the on-disk state on the same rule refreshChecks uses for the checks:
+ * keyed by `run_id`, never for a path that is not a git working tree, and announced, never
+ * silent. The refusal is returned so the caller can name the reason out loud.
+ */
+export function refreshRoot(run: RunState, live: RunState | undefined, probe: (repo: string) => boolean = isGitRepo): { changed: boolean; from: string; to: string; refused?: string } {
+	if (!live || live.run_id !== run.run_id || typeof live.repo !== "string" || live.repo === "") return { changed: false, from: run.repo, to: run.repo };
+	if (live.repo === run.repo) return { changed: false, from: run.repo, to: run.repo };
+	if (!probe(live.repo)) return { changed: false, from: run.repo, to: run.repo, refused: `${live.repo} is not a git working tree` };
+	const from = run.repo;
+	run.repo = live.repo;
+	return { changed: true, from, to: live.repo };
 }
 
 /** `git diff --stat` tail: the volatile "what changed since" line a fresh lane needs. */

@@ -85,24 +85,29 @@ the rigs send `-H 1b 66`, measured to land as one 2-byte read.) The single-alt c
 table leaves free are `alt+c/e/j/q/s/t/u/v/w/x/z` — `FADE_ORCHESTRATE_KEY` accepts any of them. The
 extension moves **no** host binding, writes no config file, and leaves `ctrl+o` to the host.
 
-The chord's state is disclosed once per session, at the first hook that can answer, in the
-extension's own words:
+The login says **at most one line**, and a FREE chord says **nothing about keys at all**. The chord
+fact is a one-shot for the process, said only when the host contends the chord, and it rides on the
+SAME notify as the adopted run. The operator who has run the loop once is not handed the key
+contract at every login:
 
 ```
-orchestrate: the host's table binds Alt+F (keybinding), so the SHORTCUT for it is refused;
-the extension claims the raw byte, so Alt+F opens the orchestration screen and the host action does
-not run (proved by test/pty_rig.mjs). Alt+Shift+I is the registered fallback, /orchestrate overlay
-the command path, and FADE_ORCHESTRATE_KEY=alt+e (free in the measured table) the alternative
+orchestrate: the host binds Alt+F (its key table) and the extension claims the raw byte:
+Alt+F opens the screen, Alt+Shift+I is the fallback · run 20261116T022111Z-hbdy is coding —
+/orchestrate handover sends the condensed state · Alt+F opens the screen
 ```
 
-and when `FADE_ORCHESTRATE_KEY` is pointed at a chord the host holds, the disclosure says so, names
-the fallback and names the variable, so a colliding configuration is visible rather than a dead key:
+With `FADE_ORCHESTRATE_KEY` pointed at a chord the host holds and CANNOT deliver (a control code is
+the host's alone), the same single line names the conflict, the fallback and the variable, so a
+colliding configuration is visible rather than a dead key:
 
 ```
-orchestrate: Ctrl+O is held by the host (reserved) — the screen opens on Alt+Shift+I.
-Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host
-holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z.
-An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone
+orchestrate: the host binds Ctrl+O (reserved): the screen opens on Alt+Shift+I
+(FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE) · run … is coding …
+```
+
+What the login no longer says: the fallback chord, `FADE_ORCHESTRATE_KEY`, the raw-byte proof and
+the host's held-chord list. That is the key contract, and it lives in this file and the README;
+`/orchestrate status` answers the run, and the row above the editor names the key every round.
 
 `pi.getShortcutConflict(chord)` is **not callable from a hook that can run**: omp 18.20.2's
 loading-phase proxy throws for it (and for `setModel`/`getActiveTools`/…), `session_start` fires
@@ -110,12 +115,12 @@ inside that window, and an idle TUI session — the pty rig, a person reading th
 Measured: with the disclosure tied to the probe alone it reached the screen
 in **no** rig state. So the shipped rule is two-tier: `probeHasAnswered` separates "threw" from "free",
 the probe's answer is the authority when it answers, and when it never answers the extension's copy of
-the host's chord table (`HOST_HELD_CHORDS`, the list quoted above) decides. The chord is always
-disclosed, and the table is a fallback, never a claim of freedom the probe refused to prove.
+the host's chord table (`HOST_HELD_CHORDS`) decides. A chord NEITHER of them binds is FREE, and a
+free chord is never announced: the table decides the state of the key, it is never a reason to print.
 
-The disclosure is **deferred 500 ms**, not fired inline: the FIRST notify of a session is swallowed by
-the host's TUI attach (measured in the pty rig — the disclosure fired at `session_start` and
-never reached the scrollback, while the notify ~20 lines later in the same hook rendered every time).
+The login line is **deferred 500 ms**, not fired inline: the FIRST notify of a session is swallowed by
+the host's TUI attach (measured in the pty rig — a notify fired inline at `session_start` never
+reached the scrollback, while the notify ~20 lines later in the same hook rendered every time).
 The one-shot flags are set synchronously, so the deferral cannot double-print, and the rig reads it
 from the scrollback with a bounded wait rather than one snapshot at the row.
 
@@ -125,13 +130,15 @@ server** (`-L fade-pty-<pid>`): two rigs against `/tmp/tmux-1000/default` kill e
 — one rig's cleanup took the shared server, the other's session died mid-run at `send-keys` and its
 log opened with `no server running`. A per-rig session name does not isolate; the **server** is shared.
 
-- **DEFAULT** — nothing configured: the disclosure names the refusal, says `Alt+F` opens the screen
-  at the byte level, and names the fallback; `ESC f` opens the panel; `ctrl+o` opens **nothing** —
+- **DEFAULT** — nothing configured: the host's table BINDS `alt+f`, so the ONE login line names the
+  conflict, the raw-byte claim, `Alt+F` as the key that opens the screen and `Alt+Shift+I` as the
+  fallback, riding on the adopted run's own line — and says nothing else: no env-var advice, no
+  held-chord list, no rig reference. `ESC f` opens the panel; `ctrl+o` opens **nothing** —
   the extension never takes the host's chord. Which action the host runs there is the host's (this
   build's pane hint names `Ctrl+⇧O`), so the rig asserts only what the extension controls and keeps
   the toggle count as an observation.
-- **HELD** — `FADE_ORCHESTRATE_KEY=ctrl+o`: the disclosure names the conflict, the fallback and the
-  variable; `C-o` opens no screen; `ESC I` (alt+shift+i) opens the panel.
+- **HELD** — `FADE_ORCHESTRATE_KEY=ctrl+o`: the ONE login line names the conflict, the fallback and the
+  variable, riding on the adopted run's own line; `C-o` opens no screen; `ESC I` (alt+shift+i) opens the panel.
 
 Run 1 runs on the host's own config and asserts the `ESC f` bytes reach the extension (the host prints
 no `Tool output expansion:` for them), that the panel opens, that it is bounded by the terminal width,
@@ -280,6 +287,23 @@ strips the repo path, the OS account, `/home/<someone>`, `~` and this machine's 
 `metrics.jsonl` and `swap_history.json` keep the truth verbatim, and a fresh session starts
 unredacted. Off by default: the user's own truth stays on the screen.
 
+## The pre-swap gate runs off the event loop
+
+The gate runs the plan's own checks, and a check is an arbitrary command. The synchronous form
+(`execFileSync`, 120 s per row, rows run back to back) held the event loop for the gate's whole
+duration: the TUI stopped painting, keystrokes went dead and the swap watch's polls starved — a
+`npm test` row froze the session, which is the class the operator reported as freezing. Each row is
+now a child process awaited off the loop (`execFile`), and the gate is bounded TWICE: 120 s for one
+row, and a **total budget** across every check (`FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS`, default
+600 s). A row that starts with the budget spent is never spawned and lands as `NOT RUN … unmeasured`,
+so a red gate always says which checks were measured and which were not, and the gate's row count
+never silently shrinks. The row that is RUNNING is named as it starts
+(`fade_orchestrate: gate 2/5: npm test` on the working message) and the verdict is said with its cost
+(`fade_orchestrate: gate RED 1/5 in 41.2s — npm test`). Proved by `test/core.test.mjs` (a 300 ms row
+leaves a 20 ms timer ticking, where the synchronous form measured zero ticks; the budget kills a hung
+row in ~1 s and marks the rows behind it) and `test/gate_rig.mjs` (the working message names the row,
+and the login emits one line).
+
 ## Proof surface
 
 | file | what it proves |
@@ -288,9 +312,9 @@ unredacted. Off by default: the user's own truth stays on the screen.
 | `test/panel_data.test.mjs` (guard) | a run state written mid-plan can lack `phases`; the screen reads it as no critique and renders — measured as a throw in the rpc rig (`undefined is not an object (evaluating 'src.run.phases.length')`), which turned the panel into an error notify |
 | `test/panel_data.test.mjs` | the data contract: rows from a real-shaped `/metrics` snapshot, the named-absent states, the abbreviated model named once |
 | `test/ui_status.test.mjs` | the status line: the row's grammar, the terminal/no-run clear rule, the swap pill, the flip line, the chord bytes (`ESC f` is the delivered chord, `ESC I` the fallback, and why `ctrl+shift+<letter>` has no byte form), the key label, the row's key hint |
-| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row |
+| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row, **the gate runs off the event loop** (a 300 ms row leaves the rig's 20 ms timer ticking) and names the row on the working message, and a login emits **one** line with the chord fact riding on the run line |
 | `test/load_hostile.mjs` | the pre-unload gate against a hostile `/health`: an `error` state, a `cuda_fatal` state, zero VRAM, VRAM under the floor, a negative nested reading, a loaded context naming no model, and a swap in flight each issue **zero** `POST /v1/load` with the class named; the measured healthy line loads exactly once; a closed server is refused as `unreachable` |
-| `test/pty_rig.mjs` | the real terminal: tmux + the `omp` binary + the live extension, the row on screen, the `ESC f` bytes (`-H 1b 66`, measured as one 2-byte read) opening the panel, the keys, the legacy Escape **and** the injected Kitty CSI-u escape closing, halt clearing, and both chord states (DEFAULT: `ctrl+o` stays the host's, no panel; HELD: the disclosure names the conflict and `ESC I` opens) (`FADE_ORCHESTRATE_LIVE_SMOKE=1`) |
+| `test/pty_rig.mjs` | the real terminal: tmux + the `omp` binary + the live extension, the row on screen, the `ESC f` bytes (`-H 1b 66`, measured as one 2-byte read) opening the panel, the keys, the legacy Escape **and** the injected Kitty CSI-u escape closing, halt clearing, and both chord states (DEFAULT: the **one** login line names `Alt+F` and the fallback on the run's own line, with the key-contract paragraph ABSENT, and `ctrl+o` stays the host's, no panel; HELD: that line names the conflict and `ESC I` opens) (`FADE_ORCHESTRATE_LIVE_SMOKE=1`) |
 | `test/rpc_rig.mjs` | the headless surface through `omp --mode rpc`: the row's pill (`[Alt+F]`), the overlay's panel frames, the redaction-OFF half (the seeded file name rides unmasked), skip/halt persistence, the clear on halt |
 
 **The fake host cannot see the loading-phase guard.** omp's extension runtime answers

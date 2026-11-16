@@ -29,13 +29,14 @@ import {
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, adaptiveRounds, classifyTurnEnd, normalizeRun, pushRejection, refreshChecks, refreshRoot, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
 	TERMINAL,
 	briefings,
 	readJson,
 	validateChecks,
 	validateTasks,
 	writeJson,
+	type GateResult,
 	type PhaseLog,
 	type RunState,
 	type Task,
@@ -265,15 +266,38 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (run && runDir) writeJson(statePath(), run);
 	};
 
-	/** The gate's checks are DATA: read the file, so an on-disk repair reaches the run object.
-	 *  Without this the gate is unrepairable in a live session — `state.json` can carry fixed
-	 *  commands while the session re-judges the plan's original broken checks, every round. The
-	 *  refresh is announced, never silent. */
+	/** The gate's checks AND its root are DATA: read the file, so an on-disk repair reaches the
+	 *  run object. Without this the gate is unrepairable in a live session — `state.json` can
+	 *  carry fixed commands, or a corrected `repo`, while the session re-judges the plan's
+	 *  original rows at the original root, every round. Both refreshes are announced. */
 	const gateChecks = (ctx: ExtensionContext): void => {
 		if (!run) return;
 		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
 		const r = refreshChecks(run, live);
 		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
+		const root = refreshRoot(run, live);
+		if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run — ${root.to} (was ${root.from})`, "info");
+		if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run — refused: ${root.refused}`, "warning");
+	};
+
+	/**
+	 * The gate, awaited off the event loop, with the row named AS IT STARTS. The synchronous form
+	 * froze the whole host for the gate's duration — no paint, dead keystrokes, starved swap
+	 * watch — so the operator saw a terminal that had stopped. Here the working message carries
+	 * `gate 3/7: npm test`, the panel keeps refreshing, and the verdict's cost is said out loud.
+	 */
+	const runGateLogged = async (checks: [string, string][], repo: string, ctx: ExtensionContext): Promise<GateResult> => {
+		const t0 = Date.now();
+		const gate = await runGate(checks, repo, (row) => ctx.ui.setWorkingMessage(`fade_orchestrate: gate ${row.index}/${row.total}: ${row.cmd}`));
+		ctx.ui.setWorkingMessage();
+		const s = ((Date.now() - t0) / 1000).toFixed(1);
+		const failing = gate.results.filter((r) => !r.ok);
+		const unmeasured = gate.results.filter((r) => r.budget === true).length;
+		ctx.ui.notify(
+			`fade_orchestrate: gate ${gate.passed ? "GREEN" : `RED ${failing.length}/${gate.results.length}`} in ${s}s${failing.length > 0 ? ` — ${failing.map((f) => f.cmd).join(" | ")}` : ""}${unmeasured > 0 ? ` — ${unmeasured} row(s) NEVER RAN (gate total budget)` : ""}`,
+			gate.passed ? "info" : "warning",
+		);
+		return gate;
 	};
 
 	/** The diff the fast path prices — changed paths and changed lines in the working tree vs
@@ -597,32 +621,29 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		"alt+shift+c": true, "alt+shift+k": true, "alt+shift+l": true, "alt+shift+p": true, "alt+shift+v": true,
 	};
 
-	/** One disclosure, at `session_start`: which key opens the screen, and whether the host holds it. */
-	const resolveChord = (ctx: ExtensionContext): void => {
-		if (!CHORD || chordResolved) return;
+	/**
+	 * The chord fact, as TEXT — the caller decides whether it is said at all. The probe decides when
+	 * it answers, the chord table when it cannot (`session_start` fires inside the loading-phase
+	 * window, where the probe throws). A chord the host does not bind is NOT announced: the row
+	 * above the editor names the key every round of the run, and the operator who has run the loop
+	 * once does not need the key contract reprinted at every login. The full contract
+	 * (`FADE_ORCHESTRATE_KEY`, the registered fallback, the raw-byte claim) is in `docs/OVERLAY.md`
+	 * and is proved by `test/pty_rig.mjs`.
+	 */
+	const resolveChord = (): string | undefined => {
+		if (!CHORD || chordResolved) return undefined;
 		const conflict = hostConflict(FADE_KEY);
 		const owner = (conflict?.keybindings?.[0] ?? conflict?.owner) as string | undefined;
 		const held = conflict !== undefined || (!probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true);
 		chordResolved = true;
 		chordHeld = held;
-		if (conflictReported) return;
+		if (conflictReported) return undefined;
 		conflictReported = true;
-		// Three states, each stated as it is: the host binds the chord AND the extension can claim the
-		// byte (the `alt+<letter>` family — the SHORTCUT is refused, the raw byte delivers, and the pty
-		// rig proves the host's action does not run); the host binds the chord and the byte is NOT
-		// claimable (a control code: the chord stays the host's, and the fallback is the key); or
-		// nothing binds it and the configured chord is simply the key.
-		const text = held && RAW_DELIVERABLE
-			? `orchestrate: the host's table binds ${keyLabel(FADE_KEY)} (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "a keybinding"}), so the SHORTCUT for it is refused; the extension claims the raw byte, so ${keyLabel(FADE_KEY)} opens the orchestration screen and the host action does not run (proved by test/pty_rig.mjs). ${keyLabel(FALLBACK_KEY)} is the registered fallback, /orchestrate overlay the command path, and FADE_ORCHESTRATE_KEY=alt+e (free in the measured table) the alternative`
-			: held
-				? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) — the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z. An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone`
-				: `orchestrate: ${keyLabel(DELIVERED_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
-		// The FIRST notify of a session is swallowed by the host's TUI attach: the disclosure
-		// fired at `session_start` never reaches the scrollback, while a notify ~20 lines later
-		// in the same hook renders every time. Deferring past the attach is the remedy; the
-		// one-shot flags above are set synchronously, so the deferral can never double-print.
-		const at = setTimeout(() => ctx.ui.notify(text, "info"), 500);
-		at.unref?.();
+		if (!held) return undefined;
+		const who = conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "its key table";
+		return RAW_DELIVERABLE
+			? `the host binds ${keyLabel(FADE_KEY)} (${who}) and the extension claims the raw byte: ${keyLabel(DELIVERED_KEY)} opens the screen, ${keyLabel(FALLBACK_KEY)} is the fallback`
+			: `the host binds ${keyLabel(FADE_KEY)} (${who}): the screen opens on ${keyLabel(FALLBACK_KEY)} (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE)`;
 	};
 
 	/** Apply one validated phase; returns the lane to load and the resulting state. */
@@ -822,7 +843,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// sends the gate briefing with the observed tails — self-repair without a swap.
 			if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
 				gateChecks(ctx);
-				const gate = runGate(run.checks, run.repo);
+				const gate = await runGateLogged(run.checks, run.repo, ctx);
 				run.gate_last = gate;
 				if (!gate.passed) {
 					const failing = gate.results.filter((r) => !r.ok);
@@ -1123,28 +1144,44 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return { consume: true };
 			});
 		}
-		// One disclosure of the chord: the probe decides when it answers, the chord table when
-		// it cannot; the chord is always disclosed.
-		resolveChord(ctx);
+		// AT MOST one line per login, and NOTHING on a free chord with no run: the operator knows
+		// the commands. The chord fact rides on the SAME line as the adopted run — one notify, not a
+		// paragraph plus a status line plus a resume notice. Detail is `/orchestrate status`, the
+		// panel, and `docs/OVERLAY.md`.
+		const chordNote = resolveChord();
 		const repo = ctx.cwd;
 		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
 		const state = readJson<RunState>(join(repo, "var", "omp-orchestrate", STATE_FILENAME));
-		if (!active || !state) return;
-		runDir = join(repo, "var", "omp-orchestrate");
-		run = normalizeRun(state);
-		settledNotified = false;
-		paint(ctx);
-		startMetricsTimer();
-		if (TERMINAL[state.state] === true) {
-			ctx.ui.notify(`orchestrate: run ${state.run_id} is ${state.state} (${statePath()})`, "info");
-		} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-			setTimeout(() => {
-				const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-				if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
-			}, 250);
-			ctx.ui.notify("orchestrate: resumed with the condensed handover (FADE_ORCHESTRATE_AUTO_RESUME=1)", "info");
-		} else {
-			ctx.ui.notify("orchestrate: run mid-flight — /orchestrate handover sends the condensed state", "info");
+		let runNote: string | undefined;
+		if (active && state) {
+			runDir = join(repo, "var", "omp-orchestrate");
+			run = normalizeRun(state);
+			settledNotified = false;
+			paint(ctx);
+			startMetricsTimer();
+			const key = keyLabel(DELIVERED_KEY);
+			if (TERMINAL[state.state] === true) {
+				runNote = `run ${state.run_id} is ${state.state} (${statePath()}) — ${key} opens the screen`;
+			} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+				// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
+				// same line as everything else the login says.
+				setTimeout(() => {
+					const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+					if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
+				}, 250);
+				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1) · ${key} opens the screen`;
+			} else {
+				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state · ${key} opens the screen`;
+			}
+		}
+		const line = [chordNote, runNote].filter((n): n is string => n !== undefined).join(" · ");
+		if (line !== "") {
+			// The FIRST notify of a session is swallowed by the host's TUI attach (measured in the
+			// pty rig: the disclosure fired at `session_start` never reached the scrollback, while a
+			// notify ~20 lines later in the same hook rendered every time). Deferring past the attach
+			// is the remedy; the flags above are set synchronously, so it can never double-print.
+			const at = setTimeout(() => ctx.ui.notify(`orchestrate: ${line}`, "info"), 500);
+			at.unref?.();
 		}
 	});
 
@@ -1193,7 +1230,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// checks (exit codes) and git. A RED gate keeps the coder lane resident, exactly
 				// like the tool's pre-swap gate: the swap is paid only for a green tree.
 				gateChecks(ctx);
-				const gate = run.checks.length > 0 ? runGate(run.checks, run.repo) : undefined;
+				const gate = run.checks.length > 0 ? await runGateLogged(run.checks, run.repo, ctx) : undefined;
 				if (gate) run.gate_last = gate;
 				if (gate && !gate.passed) {
 					const failing = gate.results.filter((r) => !r.ok);

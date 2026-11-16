@@ -32,7 +32,11 @@ is host-specific.
   and refuses to reload the resident pack (52 GiB re-read for nothing).
 - **Pre-swap gate.** `coding_done` runs every planned check on the code lane *before* the
   verifier swap is paid. Red keeps the coding lane resident (0 s), records a rejection, and sends
-  the failing output back as the next briefing.
+  the failing output back as the next briefing. The checks run as child processes **off the event
+  loop** — the synchronous form froze the TUI for the gate's whole duration — each row is bounded at
+  120 s and the whole gate at a total budget, the row that is running is named on the working
+  message (`gate 2/5: npm test`), the verdict is said with its cost, and a row the budget skipped
+  is reported `NOT RUN … unmeasured`, never silently dropped.
 
 - **Protocol gate, three tiers.** A turn that ends with no `fade_phase` call is *protocol debt*,
   not a coding round: **T1** nudge in place (`pi.sendUserMessage`, counters `protocol_retries` /
@@ -132,7 +136,8 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_REDACT` | unset | `1` — or `/orchestrate --demo-redact`, `--demo-redact=off` to put it back — strips the repo path, account, `/home/…`, `~` and this hostname from every rendered **line**, so a screenshot is safe. **Display-only**: `state.json`, `metrics.jsonl` and `swap_history.json` are written verbatim, and a fresh session starts unredacted (`test/gate_rig.mjs`, `test/panel.test.mjs`, `test/rpc_rig.mjs`) |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the screen as a widget (110 columns) instead of an overlay component (RPC/print hosts) |
 | `FADE_ORCHESTRATE_BASALT_CONFIG` | unset | the basalt serve config JSON; enables the per-lane MoE placement panel (`expert-profile-save`) |
-| `FADE_ORCHESTRATE_GATE_BUDGET_MS` | `60000` | the pre-swap gate's per-command wall budget; the rigs shrink it so the timeout class is proved in milliseconds |
+| `FADE_ORCHESTRATE_GATE_POLL_MS` / `_GATE_BUDGET_MS` | `3000` / `60000` | the pre-unload **router-idle** gate: a `POST /v1/load` is deferred while `/health` reports the router busy, one poll every `_GATE_POLL_MS` for up to `_GATE_BUDGET_MS`, then paid anyway (a loop that never lands its lane is a stalled run). The rigs shrink both so a whole budget runs in milliseconds |
+| `FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS` | `600000` | the pre-swap gate's **total** wall budget across every check (each check keeps its own 120 s timeout). A row that starts with the budget spent is never spawned and lands `NOT RUN … unmeasured`; `test/core.test.mjs` proves the bound in 1 s |
 | `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | the fast path's bound — a gate-green round that touched ≤ 1 file and < 15 changed lines on the FIRST try completes with ZERO lane loads; the same round on a 20-line diff pays exactly one swap (`test/gate_rig.mjs` prices both sides) |
 | `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | the pre-unload floor. A router that reports free VRAM under it — or zero/negative, an error state, a loaded context that names no model, a swap still in flight, or no answer at all — **refuses** the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
 | `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the health line the window ENDS on is the gate's evidence. The rigs shrink it so the hung-context class is proved in milliseconds |
@@ -146,6 +151,12 @@ shape of the host's own agents panel. The surface is an env switch: `FADE_ORCHES
 opts into the host's status-bar row. The single authority for the surface — the status line's
 format, the ramp, the model-naming rule, the chord's measured history, the panel's rows and keys,
 redaction, and the proof inventory — is [`docs/OVERLAY.md`](docs/OVERLAY.md).
+
+**A login says at most one line.** With no run and a chord the host leaves free, it says nothing:
+the row above the editor names the key every round, and `/orchestrate status` answers the run. A
+contended chord is named **once per process**, riding on the same line as the adopted run — the key
+contract (fallback chord, `FADE_ORCHESTRATE_KEY`, the raw-byte claim) lives in the docs, not in
+every session's scrollback.
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run (preflights the router: think lane must load).
 - `/orchestrate status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`
@@ -233,13 +244,14 @@ Ways to load it:
 ## Tests
 
 ```bash
-npm test                 # 149 unit tests: keymap, state v2, gate, MoE, history, livedata, the
-                         # screen's renderer (every ESC encoding closes), the screen's data
-                         # contract, the status line
+npm test                 # 156 unit tests: keymap, state v2, gate (off the event loop, and its
+                        # total budget kills a hung row), MoE, history, livedata, the screen's
+                        # renderer (every ESC encoding closes), the screen's data contract, the
+                        # status line
 npm run test:gate        # the gate rig — a host-less CI gate (fake pi + stub router): the whole
-                         # phase protocol, the pre-swap gate (zero loads on red), the Alt+F raw
-                         # listener, the fast path, the --demo-redact surface, the top-widget
-                         # surface
+                         # phase protocol, the pre-swap gate (zero loads on red, the row named as
+                         # it runs), the Alt+F raw listener, the ONE login line, the fast path, the
+                         # --demo-redact surface, the top-widget surface
 node test/load_hostile.mjs # the pre-unload gate against a hostile /health (error state,
                          # zero/low VRAM, no model, swap in flight, unreachable): ZERO
                          # POST /v1/load with the class named

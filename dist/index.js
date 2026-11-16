@@ -191,9 +191,11 @@ var flipGuarded = (f) => f.flips >= FLIP_MIN_SWAPS;
 var flipNote = (f) => flipGuarded(f) ? ` \u2014 FLIP GUARD: ${f.flips} swaps in ${f.window_s}s, requests naming ${f.competing.join(", ") || "the other lane"}` : "";
 
 // src/core.ts
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+var execFileAsync = promisify(execFile);
 var STATE_KEY = "fade.omp_orchestrate.v1";
 var ACTIVE_FILENAME = "ACTIVE.json";
 var STATE_FILENAME = "state.json";
@@ -278,45 +280,70 @@ function expectation(expected) {
   if (/^(fails?|failed|non-?zero|exits? ?[1-9]\d*|exit code [1-9]\d*|[1-9]\d* ?(on exit|exit))\b/i.test(e)) return "nonzero";
   return "exit0";
 }
-function runGate(checks, cwd) {
-  const results = checks.map(([cmd, expected]) => {
+var GATE_TOTAL_BUDGET_DEFAULT_MS = 6e5;
+var gateTotalBudgetMs = () => Math.max(1e3, Number(process.env.FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS ?? GATE_TOTAL_BUDGET_DEFAULT_MS));
+async function runGate(checks, cwd, onCheck) {
+  const deadline = Date.now() + gateTotalBudgetMs();
+  const results = [];
+  for (let i = 0; i < checks.length; i++) {
+    const [cmd, expected] = checks[i];
+    onCheck?.({ index: i + 1, total: checks.length, cmd });
     const parse = checkParses(cmd);
     if (!parse.ok) {
-      return {
+      results.push({
         cmd,
         expected,
         ok: false,
         invalid: true,
         want: "exit0",
         tail: `not a command \u2014 bash -n: ${parse.detail} | plan defect: re-declare this check (planning_done); no tree state can make it pass`
-      };
+      });
+      continue;
     }
     const want = expectation(expected);
-    let exit0 = false;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      results.push({
+        cmd,
+        expected,
+        ok: false,
+        want,
+        budget: true,
+        tail: `NOT RUN \u2014 the gate's ${Math.round(gateTotalBudgetMs() / 1e3)} s total budget was spent by the rows before this one; this check is unmeasured (FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS)`
+      });
+      continue;
+    }
     let out = "";
     try {
-      out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 12e4, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
-      exit0 = true;
+      const r = await execFileAsync("/bin/bash", ["-lc", cmd], { cwd, timeout: Math.min(12e4, remaining), maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
+      out = r.stdout;
     } catch (e) {
       const err = e;
       out = `${err.stdout ?? ""}`;
-      const code = typeof err.status === "number" ? err.status : void 0;
+      const code = typeof err.status === "number" ? err.status : typeof err.code === "number" ? err.code : void 0;
+      const timedOut = err.killed === true && (err.signal === "SIGTERM" || err.code === "ETIMEDOUT");
       if (want === "nonzero") {
-        return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected \u2014 the plan declares this state: ${expected} | exit ${code ?? "non-zero"}: ${`${out}${err.message ?? String(e)}`.slice(-300)}`.slice(-400) };
+        results.push({ cmd, expected, ok: true, want, as_expected: true, tail: `as expected \u2014 the plan declares this state: ${expected} | exit ${code ?? "non-zero"}: ${`${out}${err.message ?? String(e)}`.slice(-300)}`.slice(-400) });
+        continue;
       }
       if (want === "quiet" && out.trim() === "") {
-        return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected \u2014 no output, exit ${code ?? "non-zero"}; the plan declares this state: ${expected}` };
+        results.push({ cmd, expected, ok: true, want, as_expected: true, tail: `as expected \u2014 no output, exit ${code ?? "non-zero"}; the plan declares this state: ${expected}` });
+        continue;
       }
-      return { cmd, expected, ok: false, want, tail: `${out}${err.message ?? String(e)}`.slice(-400) };
+      const suffix = timedOut ? ` | KILLED at the row's timeout (the command did not finish)` : "";
+      results.push({ cmd, expected, ok: false, want, tail: `${out}${err.message ?? String(e)}${suffix}`.slice(-400) });
+      continue;
     }
     if (want === "nonzero") {
-      return { cmd, expected, ok: false, want, tail: `expected a failure and the command exited 0 \u2014 the plan's declared state is stale, re-declare the check: ${expected} | ${out.slice(-300)}` };
+      results.push({ cmd, expected, ok: false, want, tail: `expected a failure and the command exited 0 \u2014 the plan's declared state is stale, re-declare the check: ${expected} | ${out.slice(-300)}` });
+      continue;
     }
     if (want === "quiet" && out.trim() !== "") {
-      return { cmd, expected, ok: false, want, tail: `expected no output and the command printed ${out.trim().split("\n").length} line(s): ${out.slice(0, 300)}` };
+      results.push({ cmd, expected, ok: false, want, tail: `expected no output and the command printed ${out.trim().split("\n").length} line(s): ${out.slice(0, 300)}` });
+      continue;
     }
-    return { cmd, expected, ok: true, want, tail: `${out}`.slice(-400) };
-  });
+    results.push({ cmd, expected, ok: true, want, tail: `${out}`.slice(-400) });
+  }
   return { at: (/* @__PURE__ */ new Date()).toISOString(), passed: results.every((r) => r.ok), results };
 }
 function refreshChecks(run, live) {
@@ -328,6 +355,14 @@ function refreshChecks(run, live) {
   if (JSON.stringify(before) === JSON.stringify(after)) return { changed: false, to: after.length, added: [], removed: [] };
   run.checks = next;
   return { changed: true, to: after.length, added: after.filter((c) => !before.includes(c)), removed: before.filter((c) => !after.includes(c)) };
+}
+function refreshRoot(run, live, probe = isGitRepo) {
+  if (!live || live.run_id !== run.run_id || typeof live.repo !== "string" || live.repo === "") return { changed: false, from: run.repo, to: run.repo };
+  if (live.repo === run.repo) return { changed: false, from: run.repo, to: run.repo };
+  if (!probe(live.repo)) return { changed: false, from: run.repo, to: run.repo, refused: `${live.repo} is not a git working tree` };
+  const from = run.repo;
+  run.repo = live.repo;
+  return { changed: true, from, to: live.repo };
 }
 function diffStat(repo) {
   if (!isGitRepo(repo)) return notARepo(repo);
@@ -1777,6 +1812,22 @@ function fadeOrchestrate(pi) {
     const live = runDir ? readJson(join5(runDir, STATE_FILENAME)) : void 0;
     const r = refreshChecks(run, live);
     if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} \u2014 ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
+    const root = refreshRoot(run, live);
+    if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run \u2014 ${root.to} (was ${root.from})`, "info");
+    if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run \u2014 refused: ${root.refused}`, "warning");
+  };
+  const runGateLogged = async (checks, repo, ctx) => {
+    const t0 = Date.now();
+    const gate = await runGate(checks, repo, (row) => ctx.ui.setWorkingMessage(`fade_orchestrate: gate ${row.index}/${row.total}: ${row.cmd}`));
+    ctx.ui.setWorkingMessage();
+    const s = ((Date.now() - t0) / 1e3).toFixed(1);
+    const failing = gate.results.filter((r) => !r.ok);
+    const unmeasured = gate.results.filter((r) => r.budget === true).length;
+    ctx.ui.notify(
+      `fade_orchestrate: gate ${gate.passed ? "GREEN" : `RED ${failing.length}/${gate.results.length}`} in ${s}s${failing.length > 0 ? ` \u2014 ${failing.map((f) => f.cmd).join(" | ")}` : ""}${unmeasured > 0 ? ` \u2014 ${unmeasured} row(s) NEVER RAN (gate total budget)` : ""}`,
+      gate.passed ? "info" : "warning"
+    );
+    return gate;
   };
   const fastPathDiff = (repo) => {
     try {
@@ -2001,18 +2052,18 @@ function fadeOrchestrate(pi) {
     "alt+shift+p": true,
     "alt+shift+v": true
   };
-  const resolveChord = (ctx) => {
-    if (!CHORD || chordResolved) return;
+  const resolveChord = () => {
+    if (!CHORD || chordResolved) return void 0;
     const conflict = hostConflict(FADE_KEY);
     const owner = conflict?.keybindings?.[0] ?? conflict?.owner;
     const held = conflict !== void 0 || !probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true;
     chordResolved = true;
     chordHeld = held;
-    if (conflictReported) return;
+    if (conflictReported) return void 0;
     conflictReported = true;
-    const text = held && RAW_DELIVERABLE ? `orchestrate: the host's table binds ${keyLabel(FADE_KEY)} (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "a keybinding"}), so the SHORTCUT for it is refused; the extension claims the raw byte, so ${keyLabel(FADE_KEY)} opens the orchestration screen and the host action does not run (proved by test/pty_rig.mjs). ${keyLabel(FALLBACK_KEY)} is the registered fallback, /orchestrate overlay the command path, and FADE_ORCHESTRATE_KEY=alt+e (free in the measured table) the alternative` : held ? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) \u2014 the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z. An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone` : `orchestrate: ${keyLabel(DELIVERED_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
-    const at = setTimeout(() => ctx.ui.notify(text, "info"), 500);
-    at.unref?.();
+    if (!held) return void 0;
+    const who = conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "its key table";
+    return RAW_DELIVERABLE ? `the host binds ${keyLabel(FADE_KEY)} (${who}) and the extension claims the raw byte: ${keyLabel(DELIVERED_KEY)} opens the screen, ${keyLabel(FALLBACK_KEY)} is the fallback` : `the host binds ${keyLabel(FADE_KEY)} (${who}): the screen opens on ${keyLabel(FALLBACK_KEY)} (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE)`;
   };
   const applyPhase = (phase, payload) => {
     if (!run) throw new Error("unreachable: no run");
@@ -2169,7 +2220,7 @@ ${SCHEMA_HINT}` : text);
       }
       if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
         gateChecks(ctx);
-        const gate = runGate(run.checks, run.repo);
+        const gate = await runGateLogged(run.checks, run.repo, ctx);
         run.gate_last = gate;
         if (!gate.passed) {
           const failing = gate.results.filter((r) => !r.ok);
@@ -2417,26 +2468,34 @@ ${SCHEMA_HINT}` : text);
         return { consume: true };
       });
     }
-    resolveChord(ctx);
+    const chordNote = resolveChord();
     const repo = ctx.cwd;
     const active = readJson(join5(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
     const state = readJson(join5(repo, "var", "omp-orchestrate", STATE_FILENAME));
-    if (!active || !state) return;
-    runDir = join5(repo, "var", "omp-orchestrate");
-    run = normalizeRun(state);
-    settledNotified = false;
-    paint(ctx);
-    startMetricsTimer();
-    if (TERMINAL[state.state] === true) {
-      ctx.ui.notify(`orchestrate: run ${state.run_id} is ${state.state} (${statePath()})`, "info");
-    } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-      setTimeout(() => {
-        const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-        if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
-      }, 250);
-      ctx.ui.notify("orchestrate: resumed with the condensed handover (FADE_ORCHESTRATE_AUTO_RESUME=1)", "info");
-    } else {
-      ctx.ui.notify("orchestrate: run mid-flight \u2014 /orchestrate handover sends the condensed state", "info");
+    let runNote;
+    if (active && state) {
+      runDir = join5(repo, "var", "omp-orchestrate");
+      run = normalizeRun(state);
+      settledNotified = false;
+      paint(ctx);
+      startMetricsTimer();
+      const key = keyLabel(DELIVERED_KEY);
+      if (TERMINAL[state.state] === true) {
+        runNote = `run ${state.run_id} is ${state.state} (${statePath()}) \u2014 ${key} opens the screen`;
+      } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+        setTimeout(() => {
+          const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+          if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
+        }, 250);
+        runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1) \xB7 ${key} opens the screen`;
+      } else {
+        runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state \xB7 ${key} opens the screen`;
+      }
+    }
+    const line = [chordNote, runNote].filter((n) => n !== void 0).join(" \xB7 ");
+    if (line !== "") {
+      const at = setTimeout(() => ctx.ui.notify(`orchestrate: ${line}`, "info"), 500);
+      at.unref?.();
     }
   });
   pi.on("agent_start", async (_event, ctx) => {
@@ -2476,7 +2535,7 @@ ${SCHEMA_HINT}` : text);
       }
       if (tier === "synthesize" && (run.state === "coding" || run.state === "repair")) {
         gateChecks(ctx);
-        const gate = run.checks.length > 0 ? runGate(run.checks, run.repo) : void 0;
+        const gate = run.checks.length > 0 ? await runGateLogged(run.checks, run.repo, ctx) : void 0;
         if (gate) run.gate_last = gate;
         if (gate && !gate.passed) {
           const failing = gate.results.filter((r) => !r.ok);

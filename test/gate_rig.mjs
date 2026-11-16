@@ -162,8 +162,11 @@ const pi = {
   sendUserMessage: (t) => void sent.push(t),
 };
 const notes = [];
-/** The chord disclosure, captured separately: it is a ONE-SHOT at the first `session_start`, and the
- *  `notes` transcript is scoped and cleared by the later blocks, so the disclosure must not be
+/** Every `setWorkingMessage` call, in order: the gate names the row it is RUNNING, so the rig can
+ *  prove the operator watches progress instead of a frozen terminal. `null` is the clear. */
+const working = [];
+/** The login line, captured separately: it is a ONE-SHOT at the first `session_start`, and the
+ *  `notes` transcript is scoped and cleared by the later blocks, so the login line must not be
  *  asserted against a transcript that has already moved on. */
 let disclosure = "";
 const ctx = {
@@ -180,9 +183,9 @@ const ctx = {
     setWidget: (key, lines, opts) => void (lines === undefined ? widgets.delete(key) : widgets.set(key, { lines, opts })),
     notify: (m) => {
       notes.push(m);
-      if (disclosure === "" && /orchestration screen/.test(m)) disclosure = m;
+      if (disclosure === "" && /opens the screen/.test(m)) disclosure = m;
     },
-    setWorkingMessage: () => {},
+    setWorkingMessage: (m) => void working.push(m ?? null),
     custom: async () => undefined,
     onTerminalInput: (h) => {
       inputHandlers.push(h);
@@ -704,7 +707,13 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const host = hostname();
   writeState({ ...seedState("coding", [["true", "green"]]), goal: `run ${repo} on ${host} by ${user}`, schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
   await hooks.session_start({}, ctx);
-  await new Promise((r) => setTimeout(r, 700)); // the disclosure is deferred past the TUI attach
+  await new Promise((r) => setTimeout(r, 700)); // the login line is deferred past the TUI attach
+  // ONE line per login, and the chord fact is a ONE-SHOT for the process: this login's line names
+  // the run and the key only. The key contract (fallback, env var, raw-byte claim) is never
+  // reprinted, and never as a notify of its own.
+  const loginNotes = notes.filter((n) => /opens the screen/.test(n));
+  ok("one login line per login: the key rides ON the run line, never as its own notify", loginNotes.length > 0 && loginNotes.every((n) => n.includes("run GATE1 is")) && !notes.some((n) => /^orchestrate: the host binds/.test(n)), JSON.stringify(loginNotes.slice(0, 2)));
+  ok("the chord fact is NOT reprinted at a later login", !notes.some((n) => n.includes("the host binds")), JSON.stringify(notes.slice(0, 2)));
   const row21 = widgets.get("fade-top")?.lines?.[0] ?? "";
   ok("the row names [Alt+F], the chord the raw layer claims", row21.endsWith("· [Alt+F]"), JSON.stringify(row21));
   ok("one raw-input listener is bound, for ESC f", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
@@ -715,7 +724,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the panel opened on ESC f", panel21.includes("fade-orchestrator GATE1"), panel21.slice(0, 200));
   ok("the host-held chord is NOT registered as a shortcut (the byte is the delivery)", !shortcuts["alt+f"], JSON.stringify(Object.keys(shortcuts)));
   ok("the registered fallback chord survives", Boolean(shortcuts["alt+shift+i"]), JSON.stringify(Object.keys(shortcuts)));
-  ok("the disclosure names Alt+F and the raw-byte claim", /Alt\+F[\s\S]*raw byte/.test(disclosure), JSON.stringify(disclosure));
+  ok(
+    "the login line is ONE line: the key fact, no key-contract paragraph",
+    /the host binds Alt\+F[\s\S]*raw byte: Alt\+F opens the screen, Alt\+Shift\+I is the fallback/.test(disclosure) && !disclosure.includes("FADE_ORCHESTRATE_KEY") && !disclosure.includes("pty_rig") && disclosure.length < 260,
+    JSON.stringify({ len: disclosure.length, disclosure }),
+  );
   ok("the unredacted panel carries the account, host and repo path", panel21.includes(repo) && panel21.includes(host) && panel21.includes(user), panel21.slice(0, 300));
   await commands.orchestrate.handler("--demo-redact", ctx);
   ok("--demo-redact flips the display switch", process.env.FADE_ORCHESTRATE_REDACT === "1" && notes.some((n) => n.includes("demo redaction ON")), JSON.stringify(notes.slice(-1)));
@@ -784,6 +797,29 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await hooks.agent_end({}, ctx);
   await new Promise((r) => setTimeout(r, 60));
   ok("a round with a rejection is not a FIRST TRY, so the swap is paid", loads() - base24 === 1 && readState().state === "verifying", `${loads() - base24}/${readState().state}`);
+}
+
+// 25. The gate runs OFF the event loop and NAMES the row it is running. The synchronous form
+//     (`execFileSync`, 120 s per row, rows back to back) held the loop for the gate's whole
+//     duration: no paint, dead keystrokes, starved swap watch — what the operator saw as a freeze.
+//     A 300 ms row must leave a 20 ms timer ticking, the working message must name the row, and the
+//     verdict must be said out loud with its cost.
+{
+  resident = "flash-next";
+  writeState({ ...seedState("coding", [["sleep 0.3; exit 0", "green"], ["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [], checkpoints: {} });
+  await hooks.session_start({}, ctx);
+  working.length = 0;
+  const notesBefore25 = notes.length;
+  let ticks25 = 0;
+  const iv25 = setInterval(() => ticks25++, 20);
+  const t25 = Date.now();
+  await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  const spent25 = Date.now() - t25;
+  clearInterval(iv25);
+  ok("a 300 ms gate row leaves the event loop ticking: the gate is off the loop", ticks25 >= 5, `ticks=${ticks25} in ${spent25}ms`);
+  ok("the gate names the row AS IT RUNS", working.some((m) => typeof m === "string" && /^fade_orchestrate: gate 1\/2: sleep 0\.3/.test(m)), JSON.stringify(working.slice(0, 3)));
+  ok("the gate clears the working message when it lands", working.at(-1) === null, JSON.stringify(working.slice(-2)));
+  ok("the gate verdict is said out loud with its cost", notes.slice(notesBefore25).some((n) => /gate GREEN in \d+\.\ds/.test(n)), JSON.stringify(notes.slice(notesBefore25)));
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));
