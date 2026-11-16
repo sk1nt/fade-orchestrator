@@ -102,6 +102,29 @@ export function engineProof(): EngineProof {
 	return out;
 }
 
+/** How long a `/proc` scan stays trustworthy. The scan walks every pid on the box, and the panel
+ *  asks for it on every keystroke and on each 2 s refresh tick; a lane load or a router restart
+ *  invalidates it, so 10 s is the worst-case lag for anything else. `0` disables the cache. */
+export const PROOF_TTL_MS = Number(process.env.FADE_ORCHESTRATE_PROOF_TTL_MS ?? 10_000);
+
+let proofCache: { proof: EngineProof; at: number } | undefined;
+
+/** The panel's proof: the last scan while it is younger than `PROOF_TTL_MS`, else a fresh one.
+ *  The EMPTY scan (no engine, no router) caches too — a down router is the case that walks every
+ *  pid without ever hitting the `break`, so it must not be re-walked per keystroke. The TTL is
+ *  read from the env per call so a test (or an operator) can flip it without a rebuild. */
+export function engineProofCached(): EngineProof {
+	const ttl = Number(process.env.FADE_ORCHESTRATE_PROOF_TTL_MS ?? PROOF_TTL_MS);
+	if (ttl > 0 && proofCache && Date.now() - proofCache.at < ttl) return proofCache.proof;
+	proofCache = { proof: engineProof(), at: Date.now() };
+	return proofCache.proof;
+}
+
+/** Drop the cached scan: a lane (re)load or a router restart changes what is RUNNING. */
+export function engineProofInvalidate(): void {
+	proofCache = undefined;
+}
+
 /** Process start epoch, from /proc/<pid>/stat field 22 (starttime, clock ticks) and /proc/uptime. */
 export function processStartEpoch(pid: number): number | undefined {
 	try {
@@ -176,7 +199,7 @@ export function laneMoe(lane: string, opts: { configPath?: string; modelsDir?: s
 
 /** One overlay row per lane: the "load last known MoE configuration" state. */
 export function moeRows(lanes: string[], opts: { configPath?: string; liveCmdline?: string; proof?: EngineProof } = {}): { label: string; value: string }[] {
-	const proof = opts.proof ?? engineProof();
+	const proof = opts.proof ?? engineProofCached();
 	return lanes.map((lane) => {
 		const m = laneMoe(lane, { ...opts, proof });
 		const age = m.profile_age_s !== undefined ? `${(m.profile_age_s / 3600).toFixed(1)} h old` : "no file";
@@ -189,5 +212,149 @@ export function moeRows(lanes: string[], opts: { configPath?: string; liveCmdlin
 						? `configured, NOT live · ${m.profile_exists ? age : "no profile yet"}`
 						: `${m.state} · ${m.profile_exists ? age : "no profile yet"} · ${m.written_by_running_engine === true ? "written by this engine · warm start" : m.profile_exists ? "earlier engine's file · warm on reload" : "nothing learned yet"}`;
 		return { label: `MoE ${lane}`, value };
+	});
+}
+
+/** The engine's health surface for one lane: what the expert tier spilled to, and the slots it had. */
+type MoeHealth = { spill_experts?: number; spill_total?: number; spill_bytes_gb?: number; slots?: number };
+
+export interface MoeBalance {
+	lane: string;
+	verdict: "balanced" | "spilled" | "single-gpu" | "unknown";
+	note: string;
+	/** The config's `gpu` value in its string form: `"0,1"` from `"0,1"` or `[0,1]`. */
+	gpu?: string;
+	/** How many cards that names — the card list's length, never a guess. */
+	devices?: number;
+	spill_experts?: number;
+	spill_total?: number;
+}
+
+/** The serve config spells `gpu` as `"0,1"`, `[0,1]` or a bare card; every spelling yields the card count. */
+const gpuDevices = (gpu: unknown): { verbatim: string; devices: number } | undefined => {
+	if (typeof gpu === "string") {
+		const cards = gpu.split(/[\s,]+/).filter(Boolean);
+		return cards.length ? { verbatim: gpu, devices: cards.length } : undefined;
+	}
+	if (Array.isArray(gpu)) {
+		const cards = gpu.map(String).filter((c) => c !== "" && c !== "undefined" && c !== "null");
+		return cards.length ? { verbatim: cards.join(","), devices: cards.length } : undefined;
+	}
+	if (typeof gpu === "number" && Number.isFinite(gpu)) return { verbatim: String(gpu), devices: 1 };
+	return undefined;
+};
+
+/** `vram-reserve-mib` is PER CARD: a 2048 reserve on `gpu: "0,1"` holds 2 GiB on EACH card, 4 GiB off the pair. */
+const reserveClause = (model: Record<string, unknown>, devices: number): string => {
+	const raw: unknown = model["vram-reserve-mib"];
+	const vram = typeof raw === "number" ? raw : undefined;
+	if (vram === undefined) return "";
+	const gib = (mib: number) => `${+(mib / 1024).toFixed(2)} GiB`;
+	return `; "vram-reserve-mib": ${vram} is per card — ${gib(vram)} on each of the ${devices} cards, ${gib(vram * devices)} held off the pair, not ${gib(vram)} total`;
+};
+
+/** A save-capable alias whose profile PREDATES the running engine places from the PREVIOUS run's map. */
+const stalePlacementClause = (model: Record<string, unknown>, engineStartEpoch: () => number | undefined): string => {
+	const savePath = typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : undefined;
+	if (!savePath) return "";
+	const start = engineStartEpoch();
+	if (start === undefined) return "";
+	let mtime_s: number | undefined;
+	try {
+		mtime_s = statSync(savePath).mtimeMs / 1000;
+	} catch {
+		return "";
+	}
+	if (mtime_s >= start) return "";
+	return `; its profile PREDATES this engine's start, so placement is restored from the PREVIOUS run's map (reload the lane to relearn it)`;
+};
+
+const placementBalance = (lane: string, opts: { configPath?: string; health?: MoeHealth }, engineStartEpoch: () => number | undefined): MoeBalance => {
+	const cfg = readServeConfig(opts.configPath);
+	if (!cfg) {
+		return { lane, verdict: "unknown", note: `no serve config to read${opts.configPath ? ` at ${opts.configPath}` : " (no config path configured)"} — placement is unjudged` };
+	}
+	const model = cfg.models[lane];
+	if (!model) {
+		return { lane, verdict: "unknown", note: `lane "${lane}" is not in ${opts.configPath} — no "gpu" / "*-reserve-mib" keys to judge` };
+	}
+	const gpu = gpuDevices(model.gpu);
+	if (!gpu) {
+		return { lane, verdict: "unknown", note: `the alias carries no "gpu" key (or an empty one): add "gpu": "0,1" to split the expert tier across the cards` };
+	}
+	const { verbatim, devices } = gpu;
+	const health = opts.health;
+	if (!health) {
+		return { lane, verdict: "unknown", gpu: verbatim, devices, note: `no health reading supplied for ${lane}: spill is unmeasured, so the placement is unjudged` };
+	}
+	const spill = typeof health.spill_experts === "number" ? health.spill_experts : undefined;
+	const reserve = reserveClause(model, devices);
+	const spillTotal = health.spill_total;
+	if (spill !== undefined && spill > 0) {
+		return {
+			lane,
+			verdict: "spilled",
+			gpu: verbatim,
+			devices,
+			spill_experts: spill,
+			...(spillTotal !== undefined ? { spill_total: spillTotal } : {}),
+			note: `${spill}/${spillTotal ?? "?"} experts are on the file tier${health.spill_bytes_gb !== undefined ? ` (${health.spill_bytes_gb} GB)` : ""} — experts outside VRAM are PCIe/NVMe reads per generated token, on the generation path; fit the tier to the ${devices} card(s) with "ram-reserve-mib" / "vram-reserve-mib" at the alias and the pack quant, then re-save the profile — never a bigger pack${reserve}`,
+		};
+	}
+	const measured = { ...(spill !== undefined ? { spill_experts: spill } : {}), ...(spillTotal !== undefined ? { spill_total: spillTotal } : {}) };
+	if (devices === 1) {
+		return {
+			lane,
+			verdict: "single-gpu",
+			gpu: verbatim,
+			devices,
+			...measured,
+			note: `one card carries the whole expert tier and the second is idle for this lane: the alias sets "gpu": "${verbatim}" — widen it to "gpu": "0,1" so both cards split the tier${reserve}`,
+		};
+	}
+	return {
+		lane,
+		verdict: "balanced",
+		gpu: verbatim,
+		devices,
+		...measured,
+		note: `${devices} cards carry the expert tier ("gpu": "${verbatim}") and the health reading shows no file-tier experts${reserve}${stalePlacementClause(model, engineStartEpoch)}`,
+	};
+};
+
+/**
+ * GPU placement for one lane: the host runs 2 cards (`--gpu 0,1`), so the expert tier belongs on
+ * both, sized by the reserve knobs. Absent data is NAMED, never rendered as a zero — a missing
+ * health reading is not "no spill", and a missing `gpu` key is not "one card". The stale-profile
+ * clause is the one live reading: `/proc` is scanned only for an alias that carries
+ * `expert-profile-save`, and only to compare its profile's mtime against the engine's start.
+ */
+export function moeBalance(lane: string, opts: { configPath?: string; health?: MoeHealth } = {}): MoeBalance {
+	let read = false;
+	let start: number | undefined;
+	return placementBalance(lane, opts, () => {
+		if (!read) {
+			read = true;
+			start = engineProof().engineStartEpoch;
+		}
+		return start;
+	});
+}
+
+/** One overlay row per lane: which cards carry the expert tier, and what sits on the file tier. */
+export function moeBalanceRows(lanes: string[], opts: { configPath?: string; healthByLane?: Record<string, MoeHealth> } = {}): { label: string; value: string }[] {
+	const proof = engineProofCached();
+	return lanes.map((lane) => {
+		const b = placementBalance(lane, { configPath: opts.configPath, health: opts.healthByLane?.[lane] }, () => proof.engineStartEpoch);
+		const tail =
+			b.verdict === "spilled"
+				? `${b.spill_experts ?? "?"}/${b.spill_total ?? "?"} experts on the file tier`
+				: b.verdict === "single-gpu"
+					? "second card idle"
+					: b.verdict === "balanced"
+						? "no file-tier experts"
+						: b.note;
+		const value = b.verdict === "unknown" ? `${b.verdict} · ${b.note}` : `${b.verdict} · gpu ${b.gpu ?? "?"} · ${b.devices ?? "?"} devices · ${tail}`;
+		return { label: `MoE balance ${lane}`, value };
 	});
 }
