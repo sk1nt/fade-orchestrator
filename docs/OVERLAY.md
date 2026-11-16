@@ -1,8 +1,8 @@
 # The status line and the Alt+F screen
 
-What you see, where it is placed, and why it is placed there. Every statement below is
-implemented in `src/ui.ts` (the line), `src/panel.ts` (the screen), `src/screendata.ts` (its data
-contract) and `src/index.ts` (the wiring), and each section names the file that proves it.
+Placement, content, and the measurements behind each choice. Every statement below is implemented
+in `src/ui.ts` (the line), `src/panel.ts` (the screen), `src/screendata.ts` (its data contract) and
+`src/index.ts` (the wiring); each section names the file that proves it.
 
 ## The one status line
 
@@ -49,15 +49,15 @@ the top widget. The default ships the widget: the footer row is the host's own s
 
 **The row names the chord it honors.** The key hint is `keyLabel(chordHeld ? FALLBACK_KEY :
 FADE_KEY)` (`src/index.ts`): the configured chord when the host's probe reports it FREE, the
-fallback chord when the host holds the configured one. The first cut of this feature painted
-`[Ctrl+O]` in the held state, advertising a key that opened nothing while the pty rig's own
-assertion in that state read "ctrl+o opens nothing" — the row and the key disagreeing on the same
-screen. The pty rig now asserts the label in BOTH states (`[Alt+F]` delivered, `[Alt+Shift+I]`
-held), and `statusLines()` defaults to the delivered chord, never to `Ctrl+O`.
+fallback chord when the host holds the configured one. An earlier build printed `[Ctrl+O]` in the
+held state: the row named a chord that opened nothing while the pty rig's assertion in that same
+state read "ctrl+o opens nothing" — the row and the key disagreeing on one screen. The pty rig now
+asserts the label in BOTH states (`[Alt+F]` delivered, `[Alt+Shift+I]` held), and `statusLines()`
+defaults to the delivered chord, never to `Ctrl+O`.
 
 ## The panel's key: `alt+f` at the raw-input layer, the fallback, the escape encodings
 
-The key was chosen by measurement, twice, because the first measurement was not enough.
+The key was chosen by two measurements; the first was insufficient.
 
 **`ctrl+o` is out.** The host owns it as the built-in action **`app.tools.expand`**, and a built-in
 binding is not merely skipped at registration — the host **acts on it**. Measured in a real 150×45
@@ -65,16 +65,15 @@ terminal: sending `C-o` printed `Tool output expansion: enabled` and the extensi
 `onTerminalInput` listener never received `0x0f`; registering the chord is refused with
 `Extension shortcut conflicts with built-in shortcut`.
 
-**`alt+f` is DELIVERED, at the raw-input layer, and that is the instructive one.** A
-strings-extracted copy of the host's default-key table (38 actions) does not list `alt+f`, and it
-looked free. The host's own runtime answers differently: `getShortcutConflict("alt+f")` →
-`keybinding tui.editor.cursorWordRight` — the host **binds** it, so `registerShortcut("alt+f")` is
-**refused**. The chord is therefore claimed at the byte level: `ctx.ui.onTerminalInput` consumes
-`ESC f` (`1b 66`) before the host's binding acts, and the pty rig proves BOTH halves — the panel
-opens, and the host's word-move does not run. (The measurement that settled it: the same rig first
-watched `ESC f` move the cursor word and open nothing.) The strings table is a copy; the host's
-probe is the authority — and when the host holds a chord the answer is to take the byte, never to
-move the host's binding.
+**`alt+f` is DELIVERED, at the raw-input layer.** A strings-extracted copy of the host's
+default-key table (38 actions) does not list `alt+f`. The host's runtime answers differently:
+`getShortcutConflict("alt+f")` → `keybinding tui.editor.cursorWordRight` — the host **binds** it, so
+`registerShortcut("alt+f")` is **refused**. The chord is therefore claimed at the byte level:
+`ctx.ui.onTerminalInput` consumes `ESC f` (`1b 66`) before the host's binding acts, and the pty rig
+proves BOTH halves — the panel opens, and the host's word-move does not run. (The rig's first
+measurement: `ESC f` moved the cursor word and opened nothing.) The strings table is a copy; the
+host's probe is the authority. When the host holds a chord, the extension takes the byte and never
+moves the host's binding.
 
 **The key is `alt+f`** (ESC + `f`) and `alt+shift+i` (ESC + `I`) is the registered fallback,
 probe-reported FREE. `alt+<letter>` is **byte-distinct** from every control code;
@@ -85,38 +84,30 @@ the rigs send `-H 1b 66`, measured to land as one 2-byte read.) The single-alt c
 table leaves free are `alt+c/e/j/q/s/t/u/v/w/x/z` — `FADE_ORCHESTRATE_KEY` accepts any of them. The
 extension moves **no** host binding, writes no config file, and leaves `ctrl+o` to the host.
 
-The login says **at most one line**, and a FREE chord says **nothing about keys at all**. The chord
-fact is a one-shot for the process, said only when the host contends the chord, and it rides on the
-SAME notify as the adopted run. The operator who has run the loop once is not handed the key
-contract at every login:
+The login says **at most one line, and it is about the run**. A delivered chord is never explained:
+the row above the editor names the key every round, `/orchestrate status` answers the run, and this
+file carries the contract. With no run the login says nothing at all:
 
 ```
-orchestrate: the host binds Alt+F (its key table) and the extension claims the raw byte:
-Alt+F opens the screen, Alt+Shift+I is the fallback · run 20261116T022111Z-hbdy is coding —
-/orchestrate handover sends the condensed state · Alt+F opens the screen
+orchestrate: run 20261116T022111Z-hbdy is coding — /orchestrate handover sends the condensed state
 ```
 
-With `FADE_ORCHESTRATE_KEY` pointed at a chord the host holds and CANNOT deliver (a control code is
-the host's alone), the same single line names the conflict, the fallback and the variable, so a
-colliding configuration is visible rather than a dead key:
+Only a chord that cannot work adds a clause. With `FADE_ORCHESTRATE_KEY` pointed at a chord the host
+holds and cannot deliver (a control code is the host's alone), the same single line names the
+conflict, the fallback and the variable, so a colliding configuration is visible and not a dead key:
 
 ```
 orchestrate: the host binds Ctrl+O (reserved): the screen opens on Alt+Shift+I
 (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE) · run … is coding …
 ```
 
-What the login no longer says: the fallback chord, `FADE_ORCHESTRATE_KEY`, the raw-byte proof and
-the host's held-chord list. That is the key contract, and it lives in this file and the README;
-`/orchestrate status` answers the run, and the row above the editor names the key every round.
-
 `pi.getShortcutConflict(chord)` is **not callable from a hook that can run**: omp 18.20.2's
 loading-phase proxy throws for it (and for `setModel`/`getActiveTools`/…), `session_start` fires
-inside that window, and an idle TUI session — the pty rig, a person reading the wall — never fires
-Measured: with the disclosure tied to the probe alone it reached the screen
-in **no** rig state. So the shipped rule is two-tier: `probeHasAnswered` separates "threw" from "free",
-the probe's answer is the authority when it answers, and when it never answers the extension's copy of
-the host's chord table (`HOST_HELD_CHORDS`) decides. A chord NEITHER of them binds is FREE, and a
-free chord is never announced: the table decides the state of the key, it is never a reason to print.
+inside that window, and an idle TUI session (the pty rig) never fires `agent_start` to retry on. So
+that one verdict is reached in two tiers: `probeHasAnswered` separates "threw" from "free"; the
+probe's answer is the authority when it answers, and when it never answers the extension's copy of
+the host's chord table (`HOST_HELD_CHORDS`) decides. A control chord neither source names stays
+unannounced — the extension never reports a conflict that no source reported.
 
 The login line is **deferred 500 ms**, not fired inline: the FIRST notify of a session is swallowed by
 the host's TUI attach (measured in the pty rig — a notify fired inline at `session_start` never
@@ -130,10 +121,9 @@ server** (`-L fade-pty-<pid>`): two rigs against `/tmp/tmux-1000/default` kill e
 — one rig's cleanup took the shared server, the other's session died mid-run at `send-keys` and its
 log opened with `no server running`. A per-rig session name does not isolate; the **server** is shared.
 
-- **DEFAULT** — nothing configured: the host's table BINDS `alt+f`, so the ONE login line names the
-  conflict, the raw-byte claim, `Alt+F` as the key that opens the screen and `Alt+Shift+I` as the
-  fallback, riding on the adopted run's own line — and says nothing else: no env-var advice, no
-  held-chord list, no rig reference. `ESC f` opens the panel; `ctrl+o` opens **nothing** —
+- **DEFAULT** — nothing configured: the host's table BINDS `alt+f`, so the login says the adopted
+  run and nothing about the key; the row names `Alt+F` and the docs carry the contract.
+  `ESC f` opens the panel; `ctrl+o` opens **nothing** —
   the extension never takes the host's chord. Which action the host runs there is the host's (this
   build's pane hint names `Ctrl+⇧O`), so the rig asserts only what the extension controls and keeps
   the toggle count as an observation.
@@ -148,9 +138,9 @@ that its clock moves on the refresh tick while open, that **both** escape encodi
 The wiring is:
 
 - `pi.registerShortcut(FADE_KEY)` is attempted first, so the HOST parses the chord wherever it can;
-  for `alt+f` the host's table holds it and the registration is **refused** — that refusal is the
-  disclosure's trigger, and the fake-host rig models it, so a "not registered" assertion in
-  `test/gate_rig.mjs` is honest and not a tautology;
+  for `alt+f` the host's table holds it and the registration is **refused** — that refusal is why
+  the fallback chord is the one registered, and the fake-host rig models it, so a "not registered"
+  assertion in `test/gate_rig.mjs` checks a real refusal and not a tautology;
 - `ctx.ui.onTerminalInput(handler)` receives `ESC f`, returns `{ consume: true }` and opens the
   screen; every other keystroke returns `undefined`, so an unrelated key is never swallowed. Both
   routes go through the same guarded open, so one keystroke yields one panel;
@@ -210,7 +200,7 @@ Layout rules, all proved in `test/panel.test.mjs`:
 - **Every row is flush with the frame** at 60, 100, 110 and 120 columns: content is padded to the
   inner width, so the right border is a line and not a ragged edge.
 - **Two columns from 100 columns** (list + phase rail left, engine numbers right); below that the
-  metrics stack under the list, because a 40-column metrics column is unreadable.
+  metrics stack under the list; a 40-column metrics column is not usable at that width.
 - **The key bar never loses a key.** It is packed as items, so a narrow panel wraps between keys;
   a word wrap of the bar as prose split `[esc] close` across rows, which is how the close key
   disappeared from the 110-column surface.
@@ -222,8 +212,8 @@ Layout rules, all proved in `test/panel.test.mjs`:
 
 ## The metrics, and the rule about numbers
 
-The engine column reads the router, the run's durable records and the host's context meter. The
-rule is the ledger's: **a number nobody measured is NAMED, never printed as a zero.**
+The engine column reads the router, the run's durable records and the host's context meter. The rule
+is the ledger's, and it holds repo-wide: **an absent reading is named, never rendered as a zero.**
 
 | row | source | named state when absent |
 | --- | --- | --- |
@@ -247,13 +237,13 @@ a crash on the real payload passed the rig: the reader took `true` for a lane na
 threw on `name.indexOf`, and the panel opened nothing on the real host. The stub now mirrors the capture
 field for field, and the panel asserts the numbers that capture contains.
 
-The panel never dies on a shape it did not predict: every router field is type-guarded on the way in
-(`laneKey`, `typeof … === "number"`), and `nameResidentRow` returns the rows unchanged when the
+An unpredicted router shape does not close the panel: every router field is type-guarded on the way
+in (`laneKey`, `typeof … === "number"`), and `nameResidentRow` returns the rows unchanged when the
 resident fact is not a lane key.
 
-The router's own unreachability is a row of its own: `router http://127.0.0.1:18014 unreachable —
-engine, decode and queue are not measured`. A dead wire reading as a quiet market is the defect
-class this screen exists to prevent.
+Router unreachability has a row of its own: `router http://127.0.0.1:18014 unreachable — engine,
+decode and queue are not measured`. A dead wire renders the named absent state and never a zero: the
+absent-reading rule covers the wire itself.
 
 ## Keys
 
@@ -270,12 +260,12 @@ class this screen exists to prevent.
 | `esc` `q` `ctrl+c` | close, touching no loop control — `esc` in every encoding the host delivers (see above) |
 
 The bar **wraps**; it never clips. It is 120 visible columns, so on the 110-column default surface a
-single-line bar lost its tail — the key a user needs most, `[esc] close`, was not on screen.
+single-line bar lost its tail: `[esc] close` was not on screen.
 `wrapText()` in `src/panel.ts` folds it onto as many rows as the width needs, at every width the
 panel supports.
 
 The panel is **live**: it re-reads on a 2 s tick (`FADE_ORCHESTRATE_PANEL_REFRESH_MS`, floor 500 ms)
-and calls `tui.requestRender()`, so the numbers move while you watch. The tick is `unref`'d and
+and calls `tui.requestRender()`, so the numbers move between repaints. The tick is `unref`'d and
 `dispose()` clears it — a closed panel never polls the router again, and an open one never holds
 the process open.
 
@@ -284,21 +274,21 @@ the process open.
 `FADE_ORCHESTRATE_REDACT=1` — or `/orchestrate --demo-redact`, put back with `--demo-redact=off` —
 strips the repo path, the OS account, `/home/<someone>`, `~` and this machine's hostname from
 **every** rendered line, so a screenshot is safe to paste. **Display-only**: `state.json`,
-`metrics.jsonl` and `swap_history.json` keep the truth verbatim, and a fresh session starts
-unredacted. Off by default: the user's own truth stays on the screen.
+`metrics.jsonl` and `swap_history.json` keep the values verbatim, and a fresh session starts
+unredacted. Off by default: the screen shows the unmodified record.
 
 ## The pre-swap gate runs off the event loop
 
 The gate runs the plan's own checks, and a check is an arbitrary command. The synchronous form
 (`execFileSync`, 120 s per row, rows run back to back) held the event loop for the gate's whole
 duration: the TUI stopped painting, keystrokes went dead and the swap watch's polls starved — a
-`npm test` row froze the session, which is the class the operator reported as freezing. Each row is
+`npm test` row froze the session, the class reported as freezing. Each row is
 now a child process awaited off the loop (`execFile`), and the gate is bounded TWICE: 120 s for one
 row, and a **total budget** across every check (`FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS`, default
 600 s). A row that starts with the budget spent is never spawned and lands as `NOT RUN … unmeasured`,
-so a red gate always says which checks were measured and which were not, and the gate's row count
-never silently shrinks. The row that is RUNNING is named as it starts
-(`fade_orchestrate: gate 2/5: npm test` on the working message) and the verdict is said with its cost
+so a red gate names which checks were measured and which were not — the absent-reading rule, applied
+to the gate. The gate's row count never shrinks silently. The row that is RUNNING is named as it
+starts (`fade_orchestrate: gate 2/5: npm test` on the working message) and the verdict prints with its cost
 (`fade_orchestrate: gate RED 1/5 in 41.2s — npm test`). Proved by `test/core.test.mjs` (a 300 ms row
 leaves a 20 ms timer ticking, where the synchronous form measured zero ticks; the budget kills a hung
 row in ~1 s and marks the rows behind it) and `test/gate_rig.mjs` (the working message names the row,
@@ -324,6 +314,6 @@ while the extension is loading, and the host dispatches `session_start` inside t
 uncaught throw there does not print a stack — it **disables the extension**, so every downstream
 assertion fails behind `Failed to load extension`. The gate rig's host defines those methods, so it
 passes while the real host rejects the same code. That class is proved only by the live rigs
-(`pty_rig`, `rpc_rig`) and, in the field, by the extension actually loading; the wiring swallows the
+(`pty_rig`, `rpc_rig`) and, in the field, by the extension loading; the wiring swallows the
 probe (`shortcutConflict`) and defers the phase-tool activation to `agent_start`, where the runtime
 is live.
