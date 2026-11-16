@@ -41,7 +41,24 @@
 import http from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { hostname, tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
+
+/**
+ * The account the REDACTOR masks, resolved the way `ui.ts` `account()` resolves it: `$USER` first,
+ * then the passwd entry. Guessing (the old `"someone"` fallback) tested a string the redactor never
+ * masks: green on a runner whose `$USER` is set, red in the fade-ci container where
+ * `--user 1000:1000` leaves `$USER` empty (measured 2026-11-16).
+ */
+const account = () => {
+	const env = process.env.USER;
+	if (env && env.length > 1) return env;
+	try {
+		return userInfo().username || "";
+	} catch {
+		return "";
+	}
+};
+
 import { dirname, join } from "node:path";
 import { buildTestBundle } from "./build.mjs";
 
@@ -861,7 +878,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 //     `test/pty_rig.mjs`.
 {
   resident = "flash-next";
-  const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
+  const user = account() || "someone";
   const host = hostname();
   writeState({ ...seedState("coding", [["true", "green"]]), goal: `run ${repo} on ${host} by ${user}`, schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
   await hooks.session_start({}, ctx);
