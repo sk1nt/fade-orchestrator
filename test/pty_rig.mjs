@@ -316,11 +316,15 @@ for (const state of ["DEFAULT", "HELD"]) {
 			// The host's table BINDS `alt+f`, so the login's line says the adopted run and NOTHING about
 			// the key: the row and docs/OVERLAY.md carry the contract. Assertions stay short: a
 			// 150-column pane wraps a long row mid-phrase.
-			// The pane at this moment carries the ROW too, and the row's contract is to advertise the
-			// chord (`· [Alt+F]`), so the key test runs on the login's OWN line: a pane-wide grep would
-			// read the row's hint as login text and report a key paragraph that is not there.
-			const pane = strip(await untilText("run PTYRIG1 is", 20_000));
-			const loginLine = pane.split("\n").filter((l) => /run PTYRIG1 is/.test(l)).join("\n");
+			// The pane is a GRID: the host's top widget and the login notify sit on the SAME captured
+			// line, side by side, and the widget's contract is to advertise `· [Alt+F]`. So the login
+			// text is sliced between its own start and the widget's `Orchestrator:` marker — the key
+			// test runs on the notify, never on the row's hint.
+			const paneText = strip(await untilText("run PTYRIG1 is", 20_000));
+			const at = paneText.indexOf("run PTYRIG1 is");
+			const from = paneText.lastIndexOf("orchestrate:", at);
+			const stop = paneText.indexOf("Orchestrator:", at);
+			const loginLine = at < 0 ? "" : paneText.slice(from >= 0 && from < at ? from : at, stop > at ? stop : at + 220).replace(/\s+/g, " ").trim();
 			ok(`[${tag}] the login line carries the adopted run`, loginLine.includes("run PTYRIG1 is"), loginLine.slice(-380));
 			ok(`[${tag}] the login says NOTHING about the key: no chord, no fallback, no env var`, !/Alt\+F|Alt\+Shift\+I|FADE_ORCHESTRATE_KEY|opens the screen/.test(loginLine), loginLine.slice(-380));
 			// The row and the key must agree: the row advertises the chord that DELIVERS.
