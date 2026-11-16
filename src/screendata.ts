@@ -290,7 +290,12 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 export function claimRow(src: ScreenSource): TierRow {
 	if (src.claim === undefined) return { label: "router claim", value: "not measured" };
 	if (src.claim === null) return { label: "router claim", value: "free — no run holds this router" };
+	// The age is the operator's "is this abandoned?" reading: a claim taken seconds ago is a run in
+	// flight, one from six hours ago is a session that never ended. An unparseable `started` (a hand
+	// written claim file) prints no age rather than a guessed one.
+	const started = Number.isFinite(Date.parse(src.claim.started)) ? Date.parse(src.claim.started) : NaN;
+	const held = Number.isFinite(started) ? ` · held ${formatElapsed(Math.max(0, ((src.now?.() ?? new Date()).getTime() - started) / 1000))}` : "";
 	return src.claim.run_id === src.run.run_id
-		? { label: "router claim", value: `this run (pid ${src.claim.pid})` }
-		: { label: "router claim", value: `HELD BY pid ${src.claim.pid}: run ${src.claim.run_id} in ${src.claim.repo} on ${src.claim.host}` };
+		? { label: "router claim", value: `this run (pid ${src.claim.pid})${held}` }
+		: { label: "router claim", value: `HELD BY pid ${src.claim.pid}: run ${src.claim.run_id} in ${src.claim.repo} on ${src.claim.host}${held}` };
 }

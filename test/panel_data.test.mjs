@@ -361,17 +361,20 @@ test("live config, stale profile: the reload act renders instead of a green", ()
 // A refused start names the holder in its notify, and the panel is where the operator looks next, so
 // the same fields ride the screen. "free" is a MEASURED answer; a caller that never read the claim is
 // reported as not measured, never guessed free.
-test("the claim row names this run, a foreign holder, free, and not measured", async () => {
+test("the claim row names this run, a foreign holder, free, and not measured, with the age", async () => {
 	const foreign = { pid: 4242, run_id: "OTHER9", repo: "/home/elsewhere/checkout", started: "2030-01-01T00:00:00.000Z", host: "other-box" };
-	const src = (over) => ({ run: { run_id: "MINE1" }, runDir: "/none", lanes: { think: "deepseek", code: "flash-next" }, ...over });
-	assert.equal(claimRow(src({ claim: foreign })).value, "HELD BY pid 4242: run OTHER9 in /home/elsewhere/checkout on other-box", "the fields a refused start names");
-	assert.equal(claimRow(src({ claim: { ...foreign, run_id: "MINE1" } })).value, "this run (pid 4242)", "the run reading its own claim says so, with the pid");
+	// A fixed clock: the age is the row's "is this abandoned?" reading, so it is asserted, not left
+	// to the wall.
+	const src = (over) => ({ run: { run_id: "MINE1" }, runDir: "/none", lanes: { think: "deepseek", code: "flash-next" }, now: () => new Date("2030-01-01T12:00:00.000Z"), ...over });
+	assert.equal(claimRow(src({ claim: foreign })).value, "HELD BY pid 4242: run OTHER9 in /home/elsewhere/checkout on other-box · held 12h00m", "the fields a refused start names, and the age");
+	assert.equal(claimRow(src({ claim: { ...foreign, run_id: "MINE1" } })).value, "this run (pid 4242) · held 12h00m", "the run reading its own claim says so, with the pid");
+	assert.equal(claimRow(src({ claim: { ...foreign, started: "hand written" } })).value, "HELD BY pid 4242: run OTHER9 in /home/elsewhere/checkout on other-box", "an unparseable start prints no age, never a guessed one");
 	assert.equal(claimRow(src({ claim: null })).value, "free — no run holds this router", "free is a real reading");
 	assert.equal(claimRow(src({})).value, "not measured", "a caller that never read the claim does not report a free router");
 	const dir = mkdtempSync(join(tmpdir(), "fade-panel-claim-"));
 	try {
-		const d = await withMoe(undefined, () => collectScreen({ run: { ...run(), run_id: "MINE1" }, runDir: dir, lanes: { think: "deepseek", code: "flash-next" }, metrics, claim: foreign }));
-		assert.ok(d.tiers.some((t) => t.label === "router claim" && t.value.includes("HELD BY pid 4242")), JSON.stringify(d.tiers.map((t) => t.label)));
+		const d = await withMoe(undefined, () => collectScreen({ run: { ...run(), run_id: "MINE1" }, runDir: dir, lanes: { think: "deepseek", code: "flash-next" }, metrics, claim: foreign, now: () => new Date("2030-01-01T12:00:00.000Z") }));
+		assert.ok(d.tiers.some((t) => t.label === "router claim" && t.value.includes("HELD BY pid 4242") && t.value.includes("· held 12h00m")), JSON.stringify(d.tiers.filter((t) => t.label === "router claim")));
 		assert.equal(d.claim.run_id, "OTHER9", "the structured claim rides the screen data, not only its rendering");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

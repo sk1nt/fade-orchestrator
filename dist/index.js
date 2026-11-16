@@ -1672,7 +1672,9 @@ async function collectScreen(src) {
 function claimRow(src) {
   if (src.claim === void 0) return { label: "router claim", value: "not measured" };
   if (src.claim === null) return { label: "router claim", value: "free \u2014 no run holds this router" };
-  return src.claim.run_id === src.run.run_id ? { label: "router claim", value: `this run (pid ${src.claim.pid})` } : { label: "router claim", value: `HELD BY pid ${src.claim.pid}: run ${src.claim.run_id} in ${src.claim.repo} on ${src.claim.host}` };
+  const started = Number.isFinite(Date.parse(src.claim.started)) ? Date.parse(src.claim.started) : NaN;
+  const held = Number.isFinite(started) ? ` \xB7 held ${formatElapsed(Math.max(0, ((src.now?.() ?? /* @__PURE__ */ new Date()).getTime() - started) / 1e3))}` : "";
+  return src.claim.run_id === src.run.run_id ? { label: "router claim", value: `this run (pid ${src.claim.pid})${held}` } : { label: "router claim", value: `HELD BY pid ${src.claim.pid}: run ${src.claim.run_id} in ${src.claim.repo} on ${src.claim.host}${held}` };
 }
 
 // src/panel.ts
@@ -2686,8 +2688,10 @@ ${SCHEMA_HINT}` : text);
         }
         const done = run.tasks.filter((t) => t.status === "passed").length;
         const claim2 = readInstanceLock(instanceLockDir(ROUTER));
+        const started = claim2 && Number.isFinite(Date.parse(claim2.started)) ? Date.parse(claim2.started) : NaN;
+        const held = Number.isFinite(started) ? ` \xB7 held ${formatElapsed(Math.max(0, (Date.now() - started) / 1e3))}` : "";
         ctx.ui.notify(
-          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"} \xB7 ${statePath()}`,
+          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${statePath()}`,
           "info"
         );
         paint(ctx);

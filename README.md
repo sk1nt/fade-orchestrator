@@ -139,7 +139,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | Variable | Default | Meaning |
 |---|---|---|
 | `FADE_ORCHESTRATE_ROUTER` | `http://127.0.0.1:18014` | basalt router base URL |
-| `FADE_ORCHESTRATE_LOCK_DIR` | `~/.local/state/fade-orchestrator` | the base of the **router claim**: one file per router (`<router-slug>/orchestrator.lock`), holding the owning pid, run id, repo and host. A run claims its router at the keystroke and releases it at `halt`/`stop`/completion/preflight failure; a second session on the same router is refused before any lane load or state write. Set it to move the whole plane (rigs, containers, a read-only home) |
+| `FADE_ORCHESTRATE_LOCK_DIR` | `~/.local/state/fade-orchestrator` | the base of the **router claim**: one file per router (`<router-slug>/orchestrator.lock`), holding the owning pid, run id, repo, host and start time. A run claims its router at the keystroke and releases it at `halt`/`stop`/completion/preflight failure; a second session on the same router is refused before any lane load or state write, and the refusal, `/orchestrate status` and the screen all name the holder **with the age of the claim** (`· held 12h00m`), which is the "is this a session that never ended?" reading. Set it to move the whole plane (rigs, containers, a read-only home) |
 | `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
 | `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane) |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements |
@@ -158,7 +158,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the gate reports the health line seen when the window ends |
 | `FADE_ORCHESTRATE_FLIP_WINDOW_MS` / `_FLIP_MIN_SWAPS` / `_FLIP_BREAKER_AT` | `120000` / `2` / `4` | the flip window, the count that badges it, and the count that halts the loop. At the breaker a switch issues no `setModel` and no `POST /v1/load`, the run pauses with the flips named, and `/orchestrate lanes reset` clears the ledger and lands the owed lane |
 | `FADE_ORCHESTRATE_SWITCH_GLYPH` | U+F051F | the icon on the model-switch row, in the same Nerd Font private-use family as the status glyph; an empty value removes it and its space (`test/ui_status.test.mjs`) |
-| `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so the keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call, and a lane load drops the cache |
+| `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so the keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call, and a lane load drops the cache. Measured on this box (1103 processes): one walk 2-4 ms, so the TTL is what keeps that out of the panel's refresh path |
 
 ## Surface and commands
 

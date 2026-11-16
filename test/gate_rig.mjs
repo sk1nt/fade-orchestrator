@@ -981,8 +981,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await new Promise((r) => setTimeout(r, 300));
   const panel26 = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
   ok("the screen names the claim THIS process holds, with its pid", hasRow(panel26, `router claim this run (pid ${process.pid})`), panel26.split("\n").filter((l) => /claim|engine|resident/.test(l)).join("\n").slice(0, 400));
+  notes.length = 0;
   await commands.orchestrate.handler("status", ctx);
-  ok("status names the claim as this process's", notes.join("\n").includes(`router claim this run (pid ${process.pid})`), notes.join("\n").slice(0, 240));
+  const statusNote = notes.join("\n");
+  ok("status names the claim as this process's", statusNote.includes(`router claim this run (pid ${process.pid})`), statusNote.slice(0, 240));
+  ok("status names how long the router has been claimed", /router claim this run \(pid \d+\) · held \d+m\d{2}s/.test(statusNote), statusNote.slice(0, 240));
   await commands.orchestrate.handler("stop --clear", ctx);
   ok("`stop` releases the claim, so the next session is not refused", !existsSync(claimFile), claimFile);
 }

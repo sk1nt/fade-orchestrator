@@ -51,7 +51,7 @@ import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, 
 import { handoverText } from "./core.ts";
 import { engineProofInvalidate, laneMoe } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
-import { collectScreen, type ScreenData } from "./screendata.ts";
+import { collectScreen, formatElapsed, type ScreenData } from "./screendata.ts";
 
 // The panel key. The default is `alt+f`, not `ctrl+o`: the host binds `ctrl+o` to
 // `app.tools.expand` and ACTS on its own bindings, so the screen cannot live there. The host's
@@ -1101,8 +1101,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				}
 				const done = run.tasks.filter((t) => t.status === "passed").length;
 				const claim = readInstanceLock(instanceLockDir(ROUTER));
+				// The claim's age answers the operator's next question: a claim taken seconds ago is a
+				// run in flight; one from six hours ago is a session that never ended. An unparseable
+				// `started` prints no age rather than a guessed one.
+				const started = claim && Number.isFinite(Date.parse(claim.started)) ? Date.parse(claim.started) : NaN;
+				const held = Number.isFinite(started) ? ` · held ${formatElapsed(Math.max(0, (Date.now() - started) / 1000))}` : "";
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
