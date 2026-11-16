@@ -256,16 +256,15 @@ try {
 // to `tui.editor.cursorWordRight` (ESC f moves the word there), so `registerShortcut` is refused
 // and the extension's `onTerminalInput` listener consumes the two bytes before the host's binding
 // acts. Two states, each in an isolated agent dir so the host's own config cannot leak into either:
-//   DEFAULT — nothing configured: the host's table BINDS `alt+f`, so the login's ONE line names the
-//             conflict, says the extension claims the raw byte so Alt+F opens the screen, and names
-//             the fallback — riding on the adopted run's own line. It prints no env-var advice, no
-//             held-chord list, no rig self-reference. `ESC f` opens the panel; `ctrl+o` opens
-//             NOTHING (the extension never takes the host's chord — which action the host runs there
-//             is the host's, not the rig's claim). A chord the host leaves FREE says nothing at all.
+//   DEFAULT — nothing configured: the host's table BINDS `alt+f`, so the login says the adopted run
+//             and NOTHING about the key: the row names the chord every round and docs/OVERLAY.md
+//             carries the contract. `ESC f` opens the panel; `ctrl+o` opens NOTHING (the extension
+//             never takes the host's chord — which action the host runs there is the host's, not
+//             the rig's claim). A chord the host leaves FREE says nothing at all.
 //   HELD    — FADE_ORCHESTRATE_KEY=ctrl+o, a chord the host binds: ONE line names the conflict, the
 //             fallback chord and the env var that moves the key, riding on the SAME notify as the
-//             adopted run; ctrl+o opens no screen, and ESC I (alt+shift+i) opens the panel. This is
-//             the state the extension has to degrade honestly in.
+//             adopted run; ctrl+o opens no screen, and ESC I (alt+shift+i) opens the panel. A
+//             configured control chord is the one that cannot work, so it is the one worth saying.
 // The line is read from the SCROLLBACK with a bounded wait: the extension defers it 500 ms, because
 // the FIRST notify of a session is swallowed by the host's TUI attach — a notify fired at
 // `session_start` never renders, while the next one in the same hook always does.
@@ -295,14 +294,12 @@ for (const state of ["DEFAULT", "HELD"]) {
 		await launch({ PI_CODING_AGENT_DIR: agentDir, FADE_ORCHESTRATE_METRICS_INTERVAL_MS: "2000", FADE_ORCHESTRATE_PANEL_REFRESH_MS: "1000", ...(state === "HELD" ? { FADE_ORCHESTRATE_KEY: "ctrl+o" } : {}) });
 		await until("Orchestrator:", 60_000);
 		if (state === "DEFAULT") {
-			// The host's table BINDS `alt+f`, so the login's ONE line names the conflict, the delivered
-			// byte and the fallback — and NOTHING ELSE: no env-var advice, no held-chord list, no rig
-			// self-reference. Assertions stay short: a 150-column pane wraps a long row mid-phrase.
+			// The host's table BINDS `alt+f`, so the login's line says the adopted run and NOTHING about
+			// the key: the row and docs/OVERLAY.md carry the contract. Assertions stay short: a
+			// 150-column pane wraps a long row mid-phrase.
 			const loginLine = strip(await untilText("run PTYRIG1 is", 20_000));
-			ok(`[${tag}] the one login line names the key that opens the screen`, /Alt\+F opens the screen/.test(loginLine), loginLine.slice(-380));
-			ok(`[${tag}] the SAME line carries the adopted run — one notify, not a paragraph plus a status line`, loginLine.includes("run PTYRIG1 is"), loginLine.slice(-380));
-			ok(`[${tag}] the line names the fallback chord`, loginLine.includes("Alt+Shift+I"), loginLine.slice(-380));
-			ok(`[${tag}] the key-contract paragraph is GONE: no env-var advice, no held-chord list, no rig reference`, !loginLine.includes("FADE_ORCHESTRATE_KEY") && !loginLine.includes("pty_rig") && !loginLine.includes("alt+a/b/d/f") && !loginLine.includes("the host holds"), loginLine.slice(-380));
+			ok(`[${tag}] the login line carries the adopted run`, loginLine.includes("run PTYRIG1 is"), loginLine.slice(-380));
+			ok(`[${tag}] the login says NOTHING about the key: no chord, no fallback, no env var`, !/Alt\+F|Alt\+Shift\+I|FADE_ORCHESTRATE_KEY|opens the screen/.test(loginLine), loginLine.slice(-380));
 			// The row and the key must agree: the row advertises the chord that DELIVERS.
 			const shown = strip(scrollback());
 			ok(`[${tag}] the row advertises the chord that opens the screen`, /T\d+\/\d+ · \[Alt\+F\]/.test(shown), shown.slice(-300));
