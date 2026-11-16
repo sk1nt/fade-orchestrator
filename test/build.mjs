@@ -34,6 +34,7 @@ export function buildTestBundle() {
     "src/history.ts",
     "src/core.ts",
     "src/moe.ts",
+    "src/taskmoe.ts",
     "src/ui.ts",
     "src/screendata.ts",
     "src/panel.ts",
