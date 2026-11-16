@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { engineProofCached, engineProofInvalidate, laneMoe, moeBalance, moeBalanceRows, moeRows } from "../.test-build/moe.mjs";
+import { drafterRow, engineProofCached, engineProofInvalidate, laneMoe, moeBalance, moeBalanceRows, moeRows, packDrafter } from "../.test-build/moe.mjs";
 
 const mkConfig = (dir, models) => {
 	const p = join(dir, "config.json");
@@ -362,6 +362,75 @@ test("moeRows reads the cached scan by default; an explicit proof wins and never
 		if (prev === undefined) delete process.env[PROOF_TTL_ENV];
 		else process.env[PROOF_TTL_ENV] = prev;
 		engineProofInvalidate();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/** A v2 pack header, exactly as `include/basalt/core/model_format.hpp` lays it out. */
+const mkPack = (dir, name, sections) => {
+	const head = Buffer.alloc(64 + sections.length * 128);
+	head.write("BASALTMF", 0, "latin1");
+	head.writeUInt32LE(2, 8);
+	head.writeUInt32LE(sections.length, 12);
+	head.writeBigUInt64LE(BigInt(head.length), 16);
+	sections.forEach((s, i) => {
+		const base = 64 + i * 128;
+		head.write(s.name, base, "latin1");
+		head.writeBigUInt64LE(BigInt(0), base + 64);
+		head.writeBigUInt64LE(BigInt(s.bytes), base + 72);
+	});
+	const p = join(dir, name);
+	writeFileSync(p, head);
+	return p;
+};
+
+test("the drafter row names DSpark from the pack header and the config's own knobs", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-moe-"));
+	try {
+		const pack = mkPack(dir, "ds4.basalt", [
+			{ name: "experts", bytes: 8e9 },
+			{ name: "dspark/gguf", bytes: 7976914240 },
+		]);
+		const cfg = mkConfig(dir, [{ alias: "deepseek", model: pack, spec: 3, "draft-experts": 32 }]);
+		const row = drafterRow(["deepseek"], { configPath: cfg, proof: { routerConfigPath: cfg } });
+		assert.equal(row.label, "MoE drafter");
+		assert.match(row.value, /^deepseek DSpark 7\.43 GiB pack · win ≤3 · 32\/stage$/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("Flash-Next's MTP sections are named from the pack, and an unset spec is the engine default", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-moe-"));
+	try {
+		const pack = mkPack(dir, "qfn.basalt", [
+			{ name: "mtp/dense", bytes: 118111600 },
+			{ name: "mtp/experts", bytes: 708837376 },
+		]);
+		const cfg = mkConfig(dir, [{ alias: "flash-next", model: pack }]);
+		const row = drafterRow(["flash-next"], { configPath: cfg, proof: { routerConfigPath: cfg } });
+		assert.match(row.value, /^flash-next MTP 0.77 GiB pack · spec engine-default · draft-experts default$/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("one row names every lane; a pack with neither drafter and an unreadable pack are named states", () => {
+	const dir = mkdtempSync(join(tmpdir(), "orch-moe-"));
+	try {
+		const bare = mkPack(dir, "bare.basalt", [{ name: "dense", bytes: 1e9 }]);
+		const cfg = mkConfig(dir, [
+			{ alias: "flash-next", model: bare },
+			{ alias: "deepseek", model: join(dir, "missing.basalt") },
+		]);
+		const row = drafterRow(["flash-next", "deepseek"], { configPath: cfg, proof: { routerConfigPath: cfg } });
+		assert.match(row.value, /flash-next no drafter in pack/);
+		assert.match(row.value, /deepseek pack not read/);
+		assert.match(row.value, /; /);
+		// No config path = nothing to read, and that is said rather than green.
+		const none = drafterRow(["deepseek"], { proof: {} });
+		assert.match(none.value, /deepseek pack not read/);
+	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

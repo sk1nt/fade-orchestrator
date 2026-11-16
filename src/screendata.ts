@@ -15,7 +15,7 @@ import type { GateResult, RunState } from "./core.ts";
 import type { InstanceLock } from "./core.ts";
 import { readTurns, readSwaps, summarizeSwaps, type SwapRow, type TurnRecord } from "./history.ts";
 import { fetchMetrics, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
-import { moeBalanceRows, moeRows } from "./moe.ts";
+import { drafterRow, moeBalanceRows, moeRows } from "./moe.ts";
 import { classWarmth } from "./taskmoe.ts";
 import { ROUTER } from "./router.ts";
 import { modelLabel, type FlipBadge, type TierRow } from "./ui.ts";
@@ -256,6 +256,9 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 			configPath: src.moeConfigPath,
 			healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {},
 		}),
+		// What drafts each lane: the pack's own drafter section (DSpark / MTP) and the config's
+		// knobs. One row for both lanes — the drafter is a load-time fact, not a tuning lever.
+		drafterRow([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath }),
 	];
 	// The per-class record: the swaps stamped with a class, and how many of them landed on a lane
 	// whose saved placement was live AND written by the RUNNING engine. A class the ledger never

@@ -12,6 +12,11 @@
  *   `write_expert_profile` is wired only by the qwen4exp `--expert-profile-save` path
  *   (src/models/qwen4exp/serve/tier_profile.cpp). So DeepSeek rehearses placement every swap;
  *   it cannot be made warm by configuration until the engine grows the counterpart.
+ * - The DRAFTERS differ per pack and ship inside the pack, so the panel reads the pack's own
+ *   header (`drafterRow`): DeepSeek-V4.1 carries `dspark/gguf` (DSpark, 7.43 GiB; `--spec 3` =
+ *   windows ≤3, `--draft-experts 32`) and Flash-Next carries `mtp/*` (its MTP drafter). A pack
+ *   with neither drafts nothing and `--spec` has no drafter to cap — that is a named state, not
+ *   a zero.
  *
  * Three states must stay states, never greens:
  *   configured_not_live — the serve config names the save file, but the RUNNING router does not
@@ -25,7 +30,7 @@
  * router's own `--config` path is therefore the liveness test, and the profile's mtime against
  * the engine process start is the write-side proof.
  */
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export interface LaneMoe {
@@ -372,4 +377,104 @@ export function moeBalanceRows(lanes: string[], opts: { configPath?: string; hea
 		const value = b.verdict === "unknown" ? `${b.verdict} · ${b.note}` : `${b.verdict} · gpu ${b.gpu ?? "?"} · ${b.devices ?? "?"} devices · ${tail}`;
 		return { label: `MoE balance ${lane}`, value };
 	});
+}
+
+/**
+ * The drafter a pack ships, read from its own 64 KiB header (`include/basalt/core/model_format.hpp`:
+ * magic `BASALTMF`, version 2, then SectionEntry records of name / offset / bytes). This is the
+ * same table the engine reads at load, so the panel answers from the pack, not from a guess:
+ * `dspark/gguf` is DeepSeek's block drafter, `mtp/*` is Flash-Next's MTP drafter, and a pack with
+ * neither drafts nothing (`--spec` then has no drafter to cap).
+ *
+ * Cached per (path, mtime, size): the header read is 64 KiB against an 80-250 GB pack, and the
+ * panel asks on every refresh tick.
+ */
+export interface PackDrafter {
+	kind: "dspark" | "mtp" | "none" | "unknown";
+	/** Sum of the drafter sections' bytes, when the pack was read. */
+	bytes?: number;
+}
+
+const PACK_MAGIC = "BASALTMF";
+const PACK_HEADER_BYTES = 64;
+const PACK_SECTION_BYTES = 128;
+const packDrafterCache = new Map<string, { key: string; drafter: PackDrafter }>();
+
+export function packDrafter(packPath: string | undefined): PackDrafter {
+	if (!packPath) return { kind: "unknown" };
+	let key: string;
+	try {
+		const st = statSync(packPath);
+		key = `${st.mtimeMs}:${st.size}`;
+	} catch {
+		return { kind: "unknown" };
+	}
+	const hit = packDrafterCache.get(packPath);
+	if (hit && hit.key === key) return hit.drafter;
+	let drafter: PackDrafter = { kind: "unknown" };
+	try {
+		const fd = openSync(packPath, "r");
+		try {
+			const head = Buffer.alloc(PACK_HEADER_BYTES + 512 * PACK_SECTION_BYTES);
+			const nread = readSync(fd, head, 0, head.length, 0);
+			if (nread >= PACK_HEADER_BYTES && head.toString("latin1", 0, 8) === PACK_MAGIC) {
+				const n = Math.min(head.readUInt32LE(12), 511);
+				let dspark: number | undefined;
+				let mtpBytes = 0;
+				for (let i = 0; i < n; i++) {
+					const base = PACK_HEADER_BYTES + i * PACK_SECTION_BYTES;
+					if (base + 80 > nread) break;
+					const name = head.toString("latin1", base, base + 64).replace(/\0.*$/, "");
+					const bytes = Number(head.readBigUInt64LE(base + 72));
+					if (name === "dspark/gguf" && bytes > 0) dspark = bytes;
+					else if (name.startsWith("mtp/") && bytes > 0) mtpBytes += bytes;
+				}
+				drafter =
+					dspark !== undefined
+						? { kind: "dspark", bytes: dspark }
+						: mtpBytes > 0
+							? { kind: "mtp", bytes: mtpBytes }
+							: { kind: "none" };
+			}
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		drafter = { kind: "unknown" };
+	}
+	packDrafterCache.set(packPath, { key, drafter });
+	return drafter;
+}
+
+const gib = (bytes: number | undefined): string => (bytes === undefined ? "?" : `${+(bytes / 2 ** 30).toFixed(2)} GiB`);
+
+/**
+ * One overlay row: what drafts each lane, from the pack header and the config's own knobs.
+ * `spec` and `draft-experts` are read from the serve config only — an absent key is named
+ * "engine default", never filled with a number this module did not measure.
+ */
+export function drafterRow(lanes: string[], opts: { configPath?: string; proof?: EngineProof } = {}): { label: string; value: string } {
+	const proof = opts.proof ?? engineProofCached();
+	const cfg = readServeConfig(opts.configPath ?? proof.routerConfigPath);
+	const segments = lanes.map((lane) => {
+		const model = cfg?.models?.[lane];
+		const packPath = typeof model?.model === "string" ? String(model.model) : undefined;
+		const pack = packDrafter(packPath);
+		const spec = model?.spec;
+		const experts = model?.["draft-experts"];
+		const what =
+			pack.kind === "dspark"
+				? `DSpark ${gib(pack.bytes)} pack`
+				: pack.kind === "mtp"
+					? `MTP ${gib(pack.bytes)} pack`
+					: pack.kind === "none"
+						? "no drafter in pack"
+						: "pack not read";
+		const knobs = [
+			typeof spec === "number" ? `win ≤${spec}` : "spec engine-default",
+			typeof experts === "number" ? `${experts}/stage` : "draft-experts default",
+		].join(" · ");
+		return `${lane} ${what} · ${knobs}`;
+	});
+	return { label: "MoE drafter", value: segments.length > 0 ? segments.join("; ") : "no lanes" };
 }

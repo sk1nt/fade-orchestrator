@@ -1337,7 +1337,7 @@ async function persistMetrics(dir, snap) {
 }
 
 // src/moe.ts
-import { readdirSync, readFileSync as readFileSync2, statSync } from "node:fs";
+import { closeSync as closeSync2, openSync as openSync2, readdirSync, readFileSync as readFileSync2, readSync, statSync } from "node:fs";
 import { join as join4, resolve } from "node:path";
 var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
 function readServeConfig(path) {
@@ -1479,8 +1479,8 @@ var reserveClause = (model, devices) => {
   const raw = model["vram-reserve-mib"];
   const vram = typeof raw === "number" ? raw : void 0;
   if (vram === void 0) return "";
-  const gib = (mib) => `${+(mib / 1024).toFixed(2)} GiB`;
-  return `; "vram-reserve-mib": ${vram} is per card \u2014 ${gib(vram)} on each of the ${devices} cards, ${gib(vram * devices)} held off the pair, not ${gib(vram)} total`;
+  const gib2 = (mib) => `${+(mib / 1024).toFixed(2)} GiB`;
+  return `; "vram-reserve-mib": ${vram} is per card \u2014 ${gib2(vram)} on each of the ${devices} cards, ${gib2(vram * devices)} held off the pair, not ${gib2(vram)} total`;
 };
 var stalePlacementClause = (model, engineStartEpoch) => {
   const savePath = typeof model["expert-profile-save"] === "string" ? String(model["expert-profile-save"]) : void 0;
@@ -1556,6 +1556,69 @@ function moeBalanceRows(lanes, opts = {}) {
     const value = b.verdict === "unknown" ? `${b.verdict} \xB7 ${b.note}` : `${b.verdict} \xB7 gpu ${b.gpu ?? "?"} \xB7 ${b.devices ?? "?"} devices \xB7 ${tail}`;
     return { label: `MoE balance ${lane}`, value };
   });
+}
+var PACK_MAGIC = "BASALTMF";
+var PACK_HEADER_BYTES = 64;
+var PACK_SECTION_BYTES = 128;
+var packDrafterCache = /* @__PURE__ */ new Map();
+function packDrafter(packPath) {
+  if (!packPath) return { kind: "unknown" };
+  let key;
+  try {
+    const st = statSync(packPath);
+    key = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return { kind: "unknown" };
+  }
+  const hit = packDrafterCache.get(packPath);
+  if (hit && hit.key === key) return hit.drafter;
+  let drafter = { kind: "unknown" };
+  try {
+    const fd = openSync2(packPath, "r");
+    try {
+      const head = Buffer.alloc(PACK_HEADER_BYTES + 512 * PACK_SECTION_BYTES);
+      const nread = readSync(fd, head, 0, head.length, 0);
+      if (nread >= PACK_HEADER_BYTES && head.toString("latin1", 0, 8) === PACK_MAGIC) {
+        const n = Math.min(head.readUInt32LE(12), 511);
+        let dspark;
+        let mtpBytes = 0;
+        for (let i = 0; i < n; i++) {
+          const base = PACK_HEADER_BYTES + i * PACK_SECTION_BYTES;
+          if (base + 80 > nread) break;
+          const name = head.toString("latin1", base, base + 64).replace(/\0.*$/, "");
+          const bytes = Number(head.readBigUInt64LE(base + 72));
+          if (name === "dspark/gguf" && bytes > 0) dspark = bytes;
+          else if (name.startsWith("mtp/") && bytes > 0) mtpBytes += bytes;
+        }
+        drafter = dspark !== void 0 ? { kind: "dspark", bytes: dspark } : mtpBytes > 0 ? { kind: "mtp", bytes: mtpBytes } : { kind: "none" };
+      }
+    } finally {
+      closeSync2(fd);
+    }
+  } catch {
+    drafter = { kind: "unknown" };
+  }
+  packDrafterCache.set(packPath, { key, drafter });
+  return drafter;
+}
+var gib = (bytes) => bytes === void 0 ? "?" : `${+(bytes / 2 ** 30).toFixed(2)} GiB`;
+function drafterRow(lanes, opts = {}) {
+  const proof = opts.proof ?? engineProofCached();
+  const cfg = readServeConfig(opts.configPath ?? proof.routerConfigPath);
+  const segments = lanes.map((lane) => {
+    const model = cfg?.models?.[lane];
+    const packPath = typeof model?.model === "string" ? String(model.model) : void 0;
+    const pack = packDrafter(packPath);
+    const spec = model?.spec;
+    const experts = model?.["draft-experts"];
+    const what = pack.kind === "dspark" ? `DSpark ${gib(pack.bytes)} pack` : pack.kind === "mtp" ? `MTP ${gib(pack.bytes)} pack` : pack.kind === "none" ? "no drafter in pack" : "pack not read";
+    const knobs = [
+      typeof spec === "number" ? `win \u2264${spec}` : "spec engine-default",
+      typeof experts === "number" ? `${experts}/stage` : "draft-experts default"
+    ].join(" \xB7 ");
+    return `${lane} ${what} \xB7 ${knobs}`;
+  });
+  return { label: "MoE drafter", value: segments.length > 0 ? segments.join("; ") : "no lanes" };
 }
 
 // src/taskmoe.ts
@@ -1697,7 +1760,10 @@ async function collectScreen(src) {
     ...moeBalanceRows([src.lanes.think, src.lanes.code], {
       configPath: src.moeConfigPath,
       healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {}
-    })
+    }),
+    // What drafts each lane: the pack's own drafter section (DSpark / MTP) and the config's
+    // knobs. One row for both lanes — the drafter is a load-time fact, not a tuning lever.
+    drafterRow([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath })
   ];
   const classes = classWarmth(swaps).map((c) => ({
     label: `MoE class ${c.cls}`,
