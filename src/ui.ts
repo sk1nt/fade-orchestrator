@@ -109,6 +109,11 @@ export function orchGlyph(): string {
 	return process.env.FADE_ORCHESTRATE_GLYPH ?? "󰚩";
 }
 
+/** The switch icon, the same private-use family as the row glyph; an empty value drops it. */
+export function switchGlyph(): string {
+	return process.env.FADE_ORCHESTRATE_SWITCH_GLYPH ?? "\u{F051F}";
+}
+
 /**
  * The byte form a chord produces, which is what a raw-input listener compares against.
  *
@@ -232,7 +237,8 @@ export function statusLines(
 	const hint = `[${opts.key ?? "Alt+F"}]`;
 	if (opts.swap) {
 		const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
-		const line = `${head}Orchestrator: switching ${opts.swap.from}→${opts.swap.to}${pct} · ${hint}${stall}${paused}`;
+		const sg = switchGlyph() === "" ? "" : `${switchGlyph()} `;
+		const line = `${head}Orchestrator: ${sg}switching ${opts.swap.from}→${opts.swap.to}${pct} · ${hint}${stall}${paused}`;
 		return [shown(ramp(line, opts.swap.percent ?? 0), run)];
 	}
 	const line = `${head}Orchestrator: ${shortState(run.state)} R${run.round}/${run.max_rounds} · T${passed}/${total} · ${hint}${stall}${paused}${opts.suffix ? ` · ${opts.suffix}` : ""}`;
