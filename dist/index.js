@@ -1,5 +1,5 @@
 // src/index.ts
-import { unlinkSync } from "node:fs";
+import { unlinkSync as unlinkSync2 } from "node:fs";
 import { basename, dirname, join as join5 } from "node:path";
 import { execFileSync as execFileSync2 } from "node:child_process";
 import { Type } from "typebox";
@@ -157,8 +157,13 @@ async function routerBusy() {
 }
 var FLIP_WINDOW_MS = Number(process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS ?? 12e4);
 var FLIP_MIN_SWAPS = Number(process.env.FADE_ORCHESTRATE_FLIP_MIN_SWAPS ?? 2);
+var FLIP_BREAKER_AT = Number(process.env.FADE_ORCHESTRATE_FLIP_BREAKER_AT ?? 4);
 var swapLog = [];
 var lastSwapSig = "";
+function resetFlipLedger() {
+  swapLog.length = 0;
+  lastSwapSig = "";
+}
 async function residentLane() {
   return (await listLanes()).models.find((m) => m.status === "loaded")?.id;
 }
@@ -188,12 +193,13 @@ function flipState(resident, windowMs = FLIP_WINDOW_MS) {
   };
 }
 var flipGuarded = (f) => f.flips >= FLIP_MIN_SWAPS;
+var flipBreaker = (f) => f.flips >= FLIP_BREAKER_AT;
 var flipNote = (f) => flipGuarded(f) ? ` \u2014 FLIP GUARD: ${f.flips} swaps in ${f.window_s}s, requests naming ${f.competing.join(", ") || "the other lane"}` : "";
 
 // src/core.ts
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 var execFileAsync = promisify(execFile);
 var STATE_KEY = "fade.omp_orchestrate.v1";
@@ -347,14 +353,21 @@ async function runGate(checks, cwd, onCheck) {
   return { at: (/* @__PURE__ */ new Date()).toISOString(), passed: results.every((r) => r.ok), results };
 }
 function refreshChecks(run, live) {
-  const before = run.checks.map((c) => c[0]);
-  if (!live || live.run_id !== run.run_id || !Array.isArray(live.checks)) return { changed: false, to: before.length, added: [], removed: [] };
+  const before = run.checks;
+  const none = { changed: false, to: before.length, added: [], removed: [], redrafted: 0 };
+  if (!live || live.run_id !== run.run_id || !Array.isArray(live.checks)) return none;
   const isPair = (c) => Array.isArray(c) && c.length === 2 && typeof c[0] === "string" && typeof c[1] === "string";
   const next = live.checks.filter(isPair);
-  const after = next.map((c) => c[0]);
-  if (JSON.stringify(before) === JSON.stringify(after)) return { changed: false, to: after.length, added: [], removed: [] };
+  if (JSON.stringify(before) === JSON.stringify(next)) return { ...none, to: next.length };
+  const redrafted = before.filter((b) => next.some((a) => a[0] === b[0] && a[1] !== b[1])).length;
   run.checks = next;
-  return { changed: true, to: after.length, added: after.filter((c) => !before.includes(c)), removed: before.filter((c) => !after.includes(c)) };
+  return {
+    changed: true,
+    to: next.length,
+    added: next.filter((a) => !before.some((b) => b[0] === a[0])).map((a) => a[0]),
+    removed: before.filter((b) => !next.some((a) => a[0] === b[0])).map((b) => b[0]),
+    redrafted
+  };
 }
 function refreshRoot(run, live, probe = isGitRepo) {
   if (!live || live.run_id !== run.run_id || typeof live.repo !== "string" || live.repo === "") return { changed: false, from: run.repo, to: run.repo };
@@ -769,6 +782,9 @@ function shown(text, run) {
 function orchGlyph() {
   return process.env.FADE_ORCHESTRATE_GLYPH ?? "\u{F06A9}";
 }
+function switchGlyph() {
+  return process.env.FADE_ORCHESTRATE_SWITCH_GLYPH ?? "\u{F051F}";
+}
 function chordBytes(key) {
   const k = key.trim().toLowerCase();
   const ctrl = /^ctrl\+([a-z])$/.exec(k);
@@ -820,7 +836,8 @@ function statusLines(run, opts = {}) {
   const hint = `[${opts.key ?? "Alt+F"}]`;
   if (opts.swap) {
     const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
-    const line2 = `${head}Orchestrator: switching ${opts.swap.from}\u2192${opts.swap.to}${pct} \xB7 ${hint}${stall}${paused}`;
+    const sg = switchGlyph() === "" ? "" : `${switchGlyph()} `;
+    const line2 = `${head}Orchestrator: ${sg}switching ${opts.swap.from}\u2192${opts.swap.to}${pct} \xB7 ${hint}${stall}${paused}`;
     return [shown(ramp(line2, opts.swap.percent ?? 0), run)];
   }
   const line = `${head}Orchestrator: ${shortState(run.state)} R${run.round}/${run.max_rounds} \xB7 T${passed}/${total} \xB7 ${hint}${stall}${paused}${opts.suffix ? ` \xB7 ${opts.suffix}` : ""}`;
@@ -1176,6 +1193,14 @@ function engineProof() {
   }
   return out;
 }
+var PROOF_TTL_MS = Number(process.env.FADE_ORCHESTRATE_PROOF_TTL_MS ?? 1e4);
+var proofCache;
+function engineProofCached() {
+  const ttl = Number(process.env.FADE_ORCHESTRATE_PROOF_TTL_MS ?? PROOF_TTL_MS);
+  if (ttl > 0 && proofCache && Date.now() - proofCache.at < ttl) return proofCache.proof;
+  proofCache = { proof: engineProof(), at: Date.now() };
+  return proofCache.proof;
+}
 function processStartEpoch(pid) {
   try {
     const stat = readFileSync3(`/proc/${pid}/stat`, "utf8");
@@ -1237,7 +1262,7 @@ function laneMoe(lane, opts = {}) {
   };
 }
 function moeRows(lanes, opts = {}) {
-  const proof = opts.proof ?? engineProof();
+  const proof = opts.proof ?? engineProofCached();
   return lanes.map((lane) => {
     const m = laneMoe(lane, { ...opts, proof });
     const age = m.profile_age_s !== void 0 ? `${(m.profile_age_s / 3600).toFixed(1)} h old` : "no file";
@@ -1708,7 +1733,6 @@ function fadeOrchestrate(pi) {
   let run;
   let runDir;
   let pending;
-  let switching;
   let settledNotified = false;
   let metrics;
   let laneBest = 0;
@@ -1718,7 +1742,6 @@ function fadeOrchestrate(pi) {
   let conflictReported = false;
   let chordResolved = false;
   let probeHasAnswered = false;
-  let chordHeld = false;
   let turnSeq = 0;
   let turnPhase;
   let turnSwapMs = 0;
@@ -1811,7 +1834,7 @@ function fadeOrchestrate(pi) {
     if (!run) return;
     const live = runDir ? readJson(join5(runDir, STATE_FILENAME)) : void 0;
     const r = refreshChecks(run, live);
-    if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} \u2014 ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
+    if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} \u2014 ${r.removed.length} replaced, ${r.added.length} added, ${r.redrafted} re-declared, ${r.to} total`, "info");
     const root = refreshRoot(run, live);
     if (root.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-rooted the run \u2014 ${root.to} (was ${root.from})`, "info");
     if (root.refused) ctx.ui.notify(`orchestrate: ${statePath()} asked to re-root the run \u2014 refused: ${root.refused}`, "warning");
@@ -1897,13 +1920,40 @@ function fadeOrchestrate(pi) {
     }
     return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
   };
-  const switchLane = async (lane, ctx) => {
+  let switchGen = 0;
+  let switchChain = Promise.resolve();
+  const requestLane = (lane, ctx) => {
+    const gen = ++switchGen;
+    switchChain = switchChain.then(() => gen === switchGen ? runSwitch(lane, ctx, gen) : void 0).catch(() => void 0);
+  };
+  const runSwitch = async (lane, ctx, gen) => {
     const model = ctx.modelRegistry.find(PROVIDER, lane);
     if (!model) {
       fail(ctx, `model ${PROVIDER}/${lane} is not in the registry`);
       return;
     }
+    const gate = await gateRouterIdle(lane, ctx);
+    if (gate.over_budget && run) {
+      pushRejection(run, "task", `the ${lane} load was paid after the idle gate ran its full ${Math.round(GATE_BUDGET_MS / 1e3)}s: ${gate.polls} polls, ${gate.last.reason}`);
+      persist();
+    }
+    await observeSwaps();
+    const flip = flipState(run?.lane ?? lane, FLIP_WINDOW_MS);
+    if (flipBreaker(flip)) {
+      const who = flip.competing.join(", ") || "the other lane";
+      if (run) {
+        run.paused = true;
+        run.operator_note = `lane thrash: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; the loop is HALTED and paid no ${lane} load \u2014 /orchestrate lanes reset clears the ledger and lands it`;
+        pushRejection(run, "task", `LANE THRASH: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; ${lane} refused, loop halted, ZERO load paid`);
+        pending = { lane, phase: turnPhase ?? "lane" };
+      }
+      persist();
+      paint(ctx);
+      ctx.ui.notify(`orchestrate: LANE THRASH \u2014 ${flip.flips} swaps in ${flip.window_s}s naming ${who}: the loop is HALTED and paid no load. /orchestrate lanes reset clears the ledger and lands ${lane}.`, "error");
+      return;
+    }
     const switched = await pi.setModel(model);
+    if (gen !== switchGen) return;
     if (switched !== true && switched?.switched !== true) {
       fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
       return;
@@ -1914,12 +1964,16 @@ function fadeOrchestrate(pi) {
     paint(ctx);
     const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
     const watch = startSwapWatch(lane, moe, (percent) => {
-      if (!swapPill) return;
+      if (gen !== switchGen || !swapPill) return;
       swapPill = { ...swapPill, percent };
       paint(ctx);
     });
     ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router\u2026`);
     const loaded = await loadLane(lane);
+    if (gen !== switchGen) {
+      watch.cancel();
+      return;
+    }
     ctx.ui.setWorkingMessage();
     swapPill = void 0;
     if (!loaded.ok) {
@@ -1935,7 +1989,9 @@ function fadeOrchestrate(pi) {
     persist();
     paint(ctx);
     await applyToolPolicy(lane);
+    if (gen !== switchGen) return;
     setTimeout(async () => {
+      if (gen !== switchGen) return;
       await ensurePhaseTool();
       const text = run.state === "repair" ? briefings.repair(run) : lane === CODE_LANE && run.gate_last && run.gate_last.passed === false ? briefings.gate(run) : lane === CODE_LANE ? briefings.code(run) : briefings.verify(run);
       pi.sendUserMessage(text);
@@ -1973,9 +2029,9 @@ function fadeOrchestrate(pi) {
     if (!run.paused && pending) {
       const deferred = pending;
       pending = void 0;
-      void switchLane(deferred.lane, ctx);
+      requestLane(deferred.lane, ctx);
     }
-    if (dir.next) void switchLane(dir.next, ctx);
+    if (dir.next) requestLane(dir.next, ctx);
   };
   const showPanel = async (ctx) => {
     const provider = panelProvider(ctx);
@@ -2053,17 +2109,16 @@ function fadeOrchestrate(pi) {
     "alt+shift+v": true
   };
   const resolveChord = () => {
-    if (!CHORD || chordResolved) return void 0;
+    if (!CHORD || chordResolved || RAW_DELIVERABLE) return void 0;
     const conflict = hostConflict(FADE_KEY);
     const owner = conflict?.keybindings?.[0] ?? conflict?.owner;
     const held = conflict !== void 0 || !probeHasAnswered && HOST_HELD_CHORDS[FADE_KEY] === true;
     chordResolved = true;
-    chordHeld = held;
     if (conflictReported) return void 0;
     conflictReported = true;
     if (!held) return void 0;
     const who = conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "its key table";
-    return RAW_DELIVERABLE ? `the host binds ${keyLabel(FADE_KEY)} (${who}) and the extension claims the raw byte: ${keyLabel(DELIVERED_KEY)} opens the screen, ${keyLabel(FALLBACK_KEY)} is the fallback` : `the host binds ${keyLabel(FADE_KEY)} (${who}): the screen opens on ${keyLabel(FALLBACK_KEY)} (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE)`;
+    return `the host binds ${keyLabel(FADE_KEY)} (${who}): the screen opens on ${keyLabel(FALLBACK_KEY)} (FADE_ORCHESTRATE_KEY picks a chord the probe reports FREE)`;
   };
   const applyPhase = (phase, payload) => {
     if (!run) throw new Error("unreachable: no run");
@@ -2303,7 +2358,7 @@ ${SCHEMA_HINT}` : text);
     registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
   }
   pi.registerCommand("orchestrate", {
-    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
+    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
     handler: async (args, ctx) => {
       let raw = args.trim();
       const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
@@ -2343,6 +2398,28 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify("orchestrate: condensed handover sent", "info");
         return;
       }
+      if (first === "lanes" || first === "lane") {
+        if ((raw.split(/\s+/)[1] ?? "") !== "reset") {
+          ctx.ui.notify("orchestrate: `/orchestrate lanes reset` clears the flip ledger and lands the owed lane", "warning");
+          return;
+        }
+        if (!run) {
+          ctx.ui.notify("orchestrate: no run active", "info");
+          return;
+        }
+        const owed = pending;
+        pending = void 0;
+        resetFlipLedger();
+        flipBadge = void 0;
+        run.paused = false;
+        run.operator_note = void 0;
+        const wanted = owed?.lane ?? run.lane;
+        ctx.ui.notify(`orchestrate: flip ledger cleared; landing ${wanted}`, "info");
+        persist();
+        paint(ctx);
+        void requestLane(wanted, ctx);
+        return;
+      }
       if (first === "skip" || first === "verify" || first === "reset" || first === "pause" || first === "halt" || first === "code") {
         if (!run) {
           ctx.ui.notify("orchestrate: no run active", "info");
@@ -2355,9 +2432,9 @@ ${SCHEMA_HINT}` : text);
         if (!run.paused && pending) {
           const deferred = pending;
           pending = void 0;
-          await switchLane(deferred.lane, ctx);
+          requestLane(deferred.lane, ctx);
         }
-        if (dir.next) await switchLane(dir.next, ctx);
+        if (dir.next) requestLane(dir.next, ctx);
         return;
       }
       if (first === "stop") {
@@ -2374,7 +2451,7 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
         if (raw.includes("--clear")) {
           try {
-            unlinkSync(join5(runDir, ACTIVE_FILENAME));
+            unlinkSync2(join5(runDir, ACTIVE_FILENAME));
           } catch {
           }
           run = void 0;
@@ -2479,17 +2556,16 @@ ${SCHEMA_HINT}` : text);
       settledNotified = false;
       paint(ctx);
       startMetricsTimer();
-      const key = keyLabel(DELIVERED_KEY);
       if (TERMINAL[state.state] === true) {
-        runNote = `run ${state.run_id} is ${state.state} (${statePath()}) \u2014 ${key} opens the screen`;
+        runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
       } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
         setTimeout(() => {
           const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
           if (idle && ctx.isIdle()) pi.sendUserMessage(handoverText(state));
         }, 250);
-        runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1) \xB7 ${key} opens the screen`;
+        runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
       } else {
-        runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state \xB7 ${key} opens the screen`;
+        runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state`;
       }
     }
     const line = [chordNote, runNote].filter((n) => n !== void 0).join(" \xB7 ");
@@ -2557,7 +2633,7 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify(`orchestrate: coding_done synthesized from git + gate (round ${run.round}); the verifier swap is paid once`, "warning");
         void recordTurn("synthesized");
         settledNotified = false;
-        await switchLane(applied.next, ctx);
+        requestLane(applied.next, ctx);
         return;
       }
       if (tier === "stall") {
@@ -2590,7 +2666,7 @@ ${SCHEMA_HINT}`);
     }
     classifyTurnEnd(run, true);
     void recordTurn(turnPhase ?? next.phase);
-    await switchLane(next.lane, ctx);
+    requestLane(next.lane, ctx);
   });
   pi.on("tool_call", (event) => {
     if (!run || isDelegatedSession()) return void 0;
