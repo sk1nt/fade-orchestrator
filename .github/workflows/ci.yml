@@ -15,44 +15,43 @@ jobs:
           cache: npm
       - name: Install
         run: npm ci
+      - name: Provenance sweep
+        # No internal ticket ids, dated measurement diaries, `file:line` pointers or private repo
+        # paths may ship. Timestamps inside fixtures are DATA; a date written as prose is a hit.
+        # The literals use a character class so this step's own text cannot match the pattern it
+        # enforces.
+        run: |
+          ! grep -rnE '\bY[0-9]{1,2}\b|2026-1[01]-|monoli[h]|deploy/o[m]p|fade[o]theworld|fade-f[a]bric|[a-z]+\.ts:? [0-9]{2,4}' src test docs README.md demo .github package.json --exclude-dir=out --exclude-dir=node_modules
       - name: Typecheck
         run: npm run typecheck
-      # The interactive install path skips this on purpose (OMP loads .ts directly), so the
-      # bundle the publish loop ships is proved here: esbuild must emit a non-empty dist/index.js.
+      # OMP loads src/*.ts directly, so this is the bundle the publish loop ships: esbuild must emit
+      # a non-empty dist/index.js.
       - name: Build
         run: npm run build
       - name: Bundle is present
         run: test -s dist/index.js
+      - name: The committed bundle equals a fresh build
+        run: npm run build && git diff --exit-code -- dist/index.js
       - name: Unit tests
         run: npm test
       # The gate rig drives the whole phase protocol against a FAKE router on an ephemeral port:
       # no omp CLI, no basalt, no provider — so it is a real CI gate, not a host-only rig. It is
       # the file that proves the single-load-at-agent_end rule, the verifier sandbox, the turn
-      # ledger and the Y21 flip guard.
+      # ledger and the flip guard.
       - name: Gate rig (fake router, no host needed)
         run: npm run test:gate
-      # The delivered status surface is ONE compact line on the top widget (the footer row and
-      # the monolith's multi-line dump above the editor are both retired, operator 2026-11-15),
-      # and the Alt+Shift+F panel is the detail screen. The line's placement is load-bearing for
-      # the transcript, so a regression has to fail CI, not just review.
+      # The shipped status surface is ONE line on the top widget, with the Alt+F panel as the detail
+      # screen; the line's placement is load-bearing for the transcript, so a regression fails CI.
       - name: The status line ships on the top widget
         run: |
           grep -q 'setWidget(TOP_WIDGET_KEY' src/index.ts
           grep -q 'export const TOP_WIDGET_KEY' src/ui.ts
-          # Every `setStatus` in the ONE writer (`src/index.ts`) must be GUARDED. The status BAR is
-          # the documented opt-in (FADE_ORCHESTRATE_SURFACE=status, README + docs/OVERLAY.md), proved
-          # on a real terminal by the pty rig ("FADE_ORCHESTRATE_SURFACE=status puts the same text on
-          # the host's status surface") and asserted as the negative by the rpc rig (zero status-bar
-          # rows on the default surface). A write outside those guards is the regression this step
-          # is for. The blanket ban this step carried went RED the day the opt-in shipped — the file
-          # legitimately calls setStatus twice (src/index.ts:279 behind `statusWritten`, :307 inside
-          # the SURFACE branch), and a CI gate that forbids a documented path is a false gate. A
-          # grep over `src/ui.ts` is not usable here: that file names setStatus in prose only.
-          # The guard check is a line-distance heuristic, deliberately: a refactor that routes setStatus
-          # through a helper breaks it (fix the step with the refactor), and a call placed within 8 lines
-          # under the `SURFACE` const (`:76`) passes vacuously. The real guard is the rpc rig's frame
-          # assertion (`test/rpc_rig.mjs`: zero status-bar rows on the default surface, on a live host)
-          # — this step is the cheap tripwire that a host-less CI can run.
+          # Every `setStatus` in the one writer (`src/index.ts`) must sit behind a surface guard: the
+          # status BAR is the documented opt-in (`FADE_ORCHESTRATE_SURFACE=status`, README +
+          # docs/OVERLAY.md), and the top widget is the default. A write outside those guards paints
+          # the host's footer on a surface the user never chose. This is a deliberate line-distance
+          # tripwire a host-less CI can run; the real assertion is the rpc rig's frame check in
+          # `test/rpc_rig.mjs` (zero status-bar rows on the default surface, on a live host).
           bash -c 'guards=$(grep -n -E "if \(statusWritten\)|SURFACE === .status." src/index.ts | cut -d: -f1); test -n "$guards" || { echo "no status-surface guard found"; exit 1; }; for l in $(grep -n "setStatus(ORCH_STATUS_KEY" src/index.ts | cut -d: -f1); do ok=0; for g in $guards; do if [ "$l" -gt "$g" ] && [ $((l - g)) -le 8 ]; then ok=1; fi; done; if [ "$ok" != 1 ]; then echo "unguarded setStatus at line $l"; exit 1; fi; done; echo "setStatus guarded: $(grep -c "setStatus(ORCH_STATUS_KEY" src/index.ts) call sites, guards at $(echo $guards | tr " " ,)"'
-      # The RPC rig (test/rpc_rig.mjs) needs the omp CLI and a live provider, so it runs on the
-      # host that owns a basalt router: FADE_ORCHESTRATE_LIVE_SMOKE=1 node test/rpc_rig.mjs
+      # The rpc and pty rigs need the omp CLI, tmux and a provider, so they run on a host that owns a
+      # basalt router: `FADE_ORCHESTRATE_LIVE_SMOKE=1 npm run test:rpc`, `npm run test:pty`.

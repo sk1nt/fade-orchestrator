@@ -8,8 +8,8 @@ import { existsSync } from "node:fs";
  * omp 18.20.2 hands an extension factory a LOADING-PHASE proxy whose property `get` of a guarded
  * action method throws `Extension runtime not initialized. Action methods cannot be called during
  * extension loading.` — the same throw as calling it. A throw inside the factory body fails the
- * load, and the measured cost in a live operator session (2026-11-15) was the whole surface at
- * once: no status row, no panel, no `/orchestrate`, no `fade_phase` tool, because every
+ * load, and the cost in a live session is the whole surface at once: no status row, no panel,
+ * no `/orchestrate`, no `fade_phase` tool, because every
  * `registerTool`/`registerCommand` below the throw never runs. The session's log carried only
  * `Warning: Failed to load extension …/fade_orchestrate.ts: Extension runtime not initialized. …`.
  *

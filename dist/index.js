@@ -1,6 +1,7 @@
 // src/index.ts
 import { unlinkSync } from "node:fs";
 import { basename, dirname, join as join5 } from "node:path";
+import { execFileSync as execFileSync2 } from "node:child_process";
 import { Type } from "typebox";
 
 // src/router.ts
@@ -34,20 +35,56 @@ async function laneHealth() {
     return void 0;
   }
 }
-var SETTLE_POLL_MS = 2e3;
-var SETTLE_MAX_MS = 12e4;
-async function loadLane(lane) {
-  for (let waited = 0; waited < SETTLE_MAX_MS; waited += SETTLE_POLL_MS) {
-    if ((await laneHealth())?.loading !== true) break;
+var VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 8192);
+var healthStates = (h) => ["status", "state"].map((k) => typeof h[k] === "string" && h[k].length > 0 ? h[k].toLowerCase() : void 0).filter((v) => v !== void 0);
+var vramFreeMib = (h) => {
+  const direct = finite(h.vram_free_mib) ?? finite(h.free_vram_mib);
+  const nested = finite(h.vram?.free_mib);
+  return direct ?? nested;
+};
+function serveVerdict(h) {
+  if (h === void 0) return { serve: false, reason: `router unreachable at ${ROUTER}: /health refused; a router that cannot answer is not a context a swap can land in` };
+  const bad = healthStates(h).find((s) => s !== "ok" && s !== "ready" && s !== "healthy");
+  if (bad !== void 0) {
+    return { serve: false, reason: `router health reports "${bad}": a context that stopped saying ok cannot serve the next lane` };
+  }
+  if (h.loading === true) {
+    const sw = h.swap;
+    const pct = finite(h.percent);
+    return { serve: false, reason: `swap in flight${sw?.from ? ` ${sw.from} -> ${sw.to ?? "?"}` : ""}${pct !== void 0 ? ` at ${Math.round(pct)}%` : ""}: a second load is the queued ping-pong, not a faster lane` };
+  }
+  const free = vramFreeMib(h);
+  if (free !== void 0 && free <= 0) return { serve: false, reason: `zero free VRAM (${free} MiB): the CUDA context is dead \u2014 the recorded half-dead shape` };
+  if (free !== void 0 && free < VRAM_MIN_FREE_MIB) return { serve: false, reason: `free VRAM ${free} MiB is under the ${VRAM_MIN_FREE_MIB} MiB pack floor: no lane lands here` };
+  const model = typeof h.model === "string" ? h.model.trim() : "";
+  if (h.loaded === true || h.loaded === "true") {
+    if (model === "") return { serve: false, reason: "health claims a loaded context that names no model: nothing is serving" };
+  }
+  return { serve: true, reason: `context can serve${model !== "" ? ` (${model}${h.loading === false ? ", idle" : ""})` : ""}${free !== void 0 ? `, ${Math.round(free)} MiB free` : ", VRAM not reported"}` };
+}
+async function settleInFlight() {
+  let health = await laneHealth();
+  for (let waited = 0; health?.loading === true && waited < SETTLE_MAX_MS; waited += SETTLE_POLL_MS) {
     const { promise: settle, resolve: settleDone } = Promise.withResolvers();
     setTimeout(settleDone, SETTLE_POLL_MS);
     await settle;
+    health = await laneHealth();
   }
+  return health;
+}
+var SETTLE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_POLL_MS ?? 2e3);
+var SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?? 12e4);
+async function loadLane(lane) {
+  const t0 = Date.now();
+  const health = await settleInFlight();
   const resident = (await listLanes()).models.find((m) => m.status === "loaded")?.id;
   const flip = flipState(resident, FLIP_WINDOW_MS);
   const guarded = flipGuarded(flip);
   if (resident === lane) return { ok: true, detail: `already resident; no swap issued${flipNote(flip)}`, elapsed_s: 0, guarded, flip };
-  const t0 = Date.now();
+  const verdict = serveVerdict(health);
+  if (verdict.serve === false) {
+    return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1e3, guarded, flip };
+  }
   try {
     const r = await fetch(`${ROUTER}/v1/load`, {
       method: "POST",
@@ -218,7 +255,14 @@ function porcelain(repo) {
 function adaptiveRounds(nTasks, budget) {
   return Math.min(budget, Math.max(3, 2 + Math.ceil(nTasks / 2)));
 }
-var SCHEMA_HINT = 'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} \u2014 ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}.';
+var TIER_ROUNDS = { trivial: 2, standard: 4, deep: 6 };
+var isComplexity = (v) => v === "trivial" || v === "standard" || v === "deep";
+function roundsForTasks(tasks, budget) {
+  const declared = tasks.map((t) => t.complexity).filter(isComplexity);
+  if (declared.length === 0) return adaptiveRounds(tasks.length, budget);
+  return Math.min(budget, Math.max(2, ...declared.map((c) => TIER_ROUNDS[c])));
+}
+var SCHEMA_HINT = `Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} \u2014 ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}. A planning check whose ACCEPTED state is not exit-0 says so in the expected text's first words \u2014 "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.`;
 function checkParses(cmd) {
   try {
     execFileSync("/bin/bash", ["-n", "-c", cmd], { stdio: "pipe", timeout: 5e3 });
@@ -227,6 +271,12 @@ function checkParses(cmd) {
     const err = e;
     return { ok: false, detail: `${err.stderr ?? ""}${err.message ?? String(e)}`.replace(/\s+/g, " ").slice(0, 220) };
   }
+}
+function expectation(expected) {
+  const e = (expected ?? "").trim();
+  if (/^(no output|no matches?|empty( |$)|silent)\b/i.test(e)) return "quiet";
+  if (/^(fails?|failed|non-?zero|exits? ?[1-9]\d*|exit code [1-9]\d*|[1-9]\d* ?(on exit|exit))\b/i.test(e)) return "nonzero";
+  return "exit0";
 }
 function runGate(checks, cwd) {
   const results = checks.map(([cmd, expected]) => {
@@ -237,16 +287,35 @@ function runGate(checks, cwd) {
         expected,
         ok: false,
         invalid: true,
+        want: "exit0",
         tail: `not a command \u2014 bash -n: ${parse.detail} | plan defect: re-declare this check (planning_done); no tree state can make it pass`
       };
     }
+    const want = expectation(expected);
+    let exit0 = false;
+    let out = "";
     try {
-      const out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 12e4, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
-      return { cmd, expected, ok: true, tail: `${out}`.slice(-400) };
+      out = execFileSync("/bin/bash", ["-lc", cmd], { cwd, timeout: 12e4, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
+      exit0 = true;
     } catch (e) {
       const err = e;
-      return { cmd, expected, ok: false, tail: `${err.stdout ?? ""}${err.message ?? String(e)}`.slice(-400) };
+      out = `${err.stdout ?? ""}`;
+      const code = typeof err.status === "number" ? err.status : void 0;
+      if (want === "nonzero") {
+        return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected \u2014 the plan declares this state: ${expected} | exit ${code ?? "non-zero"}: ${`${out}${err.message ?? String(e)}`.slice(-300)}`.slice(-400) };
+      }
+      if (want === "quiet" && out.trim() === "") {
+        return { cmd, expected, ok: true, want, as_expected: true, tail: `as expected \u2014 no output, exit ${code ?? "non-zero"}; the plan declares this state: ${expected}` };
+      }
+      return { cmd, expected, ok: false, want, tail: `${out}${err.message ?? String(e)}`.slice(-400) };
     }
+    if (want === "nonzero") {
+      return { cmd, expected, ok: false, want, tail: `expected a failure and the command exited 0 \u2014 the plan's declared state is stale, re-declare the check: ${expected} | ${out.slice(-300)}` };
+    }
+    if (want === "quiet" && out.trim() !== "") {
+      return { cmd, expected, ok: false, want, tail: `expected no output and the command printed ${out.trim().split("\n").length} line(s): ${out.slice(0, 300)}` };
+    }
+    return { cmd, expected, ok: true, want, tail: `${out}`.slice(-400) };
   });
   return { at: (/* @__PURE__ */ new Date()).toISOString(), passed: results.every((r) => r.ok), results };
 }
@@ -294,8 +363,9 @@ function entryTouches(e, files) {
 function gateSummary(run) {
   const g = run.gate_last;
   if (!g) return "(no pre-swap gate recorded)";
-  const parts = g.results.map((r) => `${r.ok ? "ok" : r.invalid ? "INVALID" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
-  return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}: ${parts.join(" | ") || "no checks"}`;
+  const parts = g.results.map((r) => `${r.ok ? r.as_expected ? "ok*" : "ok" : r.invalid ? "INVALID" : "FAIL"} ${r.cmd}${r.ok ? "" : ` -> ${r.tail}`}`);
+  const asExp = g.results.filter((r) => r.as_expected).length;
+  return `gate ${g.at} ${g.passed ? "GREEN" : "RED"}${asExp ? ` (${asExp} as expected)` : ""}: ${parts.join(" | ") || "no checks"}`;
 }
 function synthesizeCodingDone(run, repo) {
   const raw = porcelain(repo);
@@ -328,6 +398,16 @@ function tagCheckpoint(repo, run, taskId) {
   } catch (e) {
     return { tag, ok: false, error: msg(e) };
   }
+}
+function critiquesFor(run, ids) {
+  const out = [];
+  for (const id of ids) {
+    const hits = (run.rejection_history ?? []).filter((r) => (r.task_id === id || `${r.reason}`.includes(id)) && (r.kind === "verification" || r.kind === "task"));
+    if (hits.length === 0) continue;
+    const last = hits[hits.length - 1];
+    out.push(`  ${id} \u2014 rejected ${hits.length}\xD7 (latest round ${last.round}, ${last.kind}): ${last.reason}${hits.length > 1 ? "  \u21D0 the same diff was already tried; change the CAUSE, not the wording" : ""}`);
+  }
+  return out;
 }
 function handover(run) {
   const stable = [
@@ -412,12 +492,13 @@ function validateTasks(raw) {
     if (!Array.isArray(t.files) || t.files.length === 0) return { error: `${id}: files must be a non-empty array` };
     for (const f of t.files) if (!isRepoRelative(f)) return { error: `${id}: file ${JSON.stringify(f)} is not repo-relative` };
     if (typeof t.acceptance !== "string" || t.acceptance.trim() === "") return { error: `${id}: acceptance is required` };
+    if (t.complexity !== void 0 && !isComplexity(t.complexity)) return { error: `${id}: complexity must be trivial|standard|deep (got ${JSON.stringify(t.complexity)})` };
     const deps = t.dependencies ?? [];
     if (!Array.isArray(deps)) return { error: `${id}: dependencies must be an array` };
     for (const d of deps) {
       if (typeof d !== "string" || !seen.has(d)) return { error: `${id}: dependency ${JSON.stringify(d)} must name an earlier task` };
     }
-    tasks.push({ id, objective: String(t.objective), files: t.files, acceptance: String(t.acceptance), dependencies: deps, round: 0 });
+    tasks.push({ id, objective: String(t.objective), files: t.files, acceptance: String(t.acceptance), dependencies: deps, round: 0, ...isComplexity(t.complexity) ? { complexity: t.complexity } : {} });
   }
   return { tasks };
 }
@@ -475,18 +556,20 @@ var briefings = {
     `Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`
   ].join("\n"),
   /**
-   * Y7: the coder's BATCH briefing — one window, one turn, one `coding_done`. Every task of
+   * The coder's BATCH briefing — one window, one turn, one `coding_done`. Every task of
    * `roundWindow().readyNow` is spelled out UNTRUNCATED (objective, files, acceptance,
    * dependencies) because a card the lane cannot read in full is a card it implements from
-   * imagination; the blocked tasks are listed with the ids that hold them so the lane knows what
-   * to leave alone; and the one-payload contract is stated in the turn's own words, which is the
-   * half that kills the per-task window (the refusal in `validateDone` is the other half).
+   * imagination; the blocked tasks are listed with the ids that hold them so the lane knows
+   * what to leave alone; and the one-payload contract is stated in the turn's own words, which
+   * is the half that kills the per-task window (the refusal in `validateDone` is the other
+   * half).
    */
   window: (run) => {
     const { readyNow, blocked, open } = roundWindow(run);
     const inWindow = new Set(readyNow.map((t) => t.id));
     const blockedIds = new Set(blocked.map((b) => b.id));
     const deferred = open.filter((t) => !inWindow.has(t.id) && !blockedIds.has(t.id)).map((t) => t.id);
+    const critiques = run.round > 1 ? critiquesFor(run, readyNow.map((t) => t.id)) : [];
     const entry = (id) => `{"id":"${id}","status":"passed"|"failed"|"blocked","result":"what the acceptance command observed"}`;
     return [
       `Phase 1 (coding) \u2014 ONE WINDOW, round ${run.round}/${run.max_rounds} \xB7 T${readyNow.length}/${open.length} \xB7 lane ${run.lane} \xB7 orchestrated run ${run.run_id}.`,
@@ -501,6 +584,9 @@ var briefings = {
       ]),
       blocked.length > 0 ? `NOT in this window, unmet dependencies \u2014 do not start them and never name one in coding_done: ${blocked.map((b) => `${b.id} blocked by ${b.blockedBy.join(", ")}`).join("; ")}.` : `Nothing is blocked by a dependency.`,
       deferred.length > 0 ? `Ready but past the ${MAX_WINDOW_TASKS}-task window cap (the NEXT window's work, leave it alone now): ${deferred.join(", ")}.` : "",
+      critiques.length > 0 ? `Rejected before \u2014 the verifier's critique for the tasks of THIS window, by task id; a task rejected twice has already had this diff tried, so change the cause:` : "",
+      ...critiques,
+      `Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections \u2014 nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
       `Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`
     ].filter(Boolean).join("\n");
   },
@@ -513,14 +599,23 @@ var briefings = {
   ].join("\n"),
   repair: (run) => {
     const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
+    const ids = (run.repair_tasks ?? []).map((t) => t.id);
+    const critiques = critiquesFor(run, ids);
+    const checklist = (run.repair_tasks ?? []).map((t) => `${t.id}: ${t.acceptance}`);
     return [
       `Phase 1 (repair), round ${run.round} of orchestrated run ${run.run_id}.`,
       `Goal: ${run.goal}`,
       `Repair tasks: ${JSON.stringify(run.repair_tasks)}`,
+      // The critique the task itself earned, with its count — the anti-oscillation line.
+      ...critiques.length > 0 ? ["Rejected before \u2014 the verifier's words, BY TASK:", ...critiques] : [],
       ...prior.length > 0 ? ["Previously rejected \u2014 fix the cause, do not repeat the attempt:", ...prior.map((p) => `  ${p}`)] : [],
+      // Compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
+      `Working tree: ${diffStat(run.repo)}`,
+      checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
+      `Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections \u2014 no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
       `Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
       `Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   },
   gate: (run) => {
     const results = run.gate_last?.results ?? [];
@@ -547,9 +642,9 @@ var briefings = {
     return `Orchestrated run ${run.run_id} stopped at round ${run.round}; resident lane left as ${run.lane}.`;
   },
   /**
-   * Y1 Tier 1: the lane ended its turn without calling `fade_phase`. No round was spent and no
-   * swap happens — the same lane is re-briefed in VRAM with the ONE thing it owes, plus the
-   * published schema, and told exactly what the next miss costs.
+   * Tier 1 of the protocol ladder: the lane ended its turn without calling `fade_phase`. No
+   * round was spent and no swap happens — the same lane is re-briefed in VRAM with the ONE
+   * thing it owes, plus the published schema, and told exactly what the next miss costs.
    */
   nudge: (run) => {
     const phase = PHASE_FOR_STATE[run.state] ?? "coding_done";
@@ -563,9 +658,9 @@ var briefings = {
     ].join("\n");
   },
   /**
-   * Y1 Tier 3: the circuit breaker tripped. The run is paused, the lane is left as it is, and
-   * this is the diagnostic an operator acts on: what the machine saw, what is RED, what git
-   * says, and the exact files to open.
+   * Tier 3 of the protocol ladder: the circuit breaker tripped. The run is paused, the lane is
+   * left as it is, and this is the diagnostic an operator acts on: what the machine saw, what
+   * is RED, what git says, and the exact files to open.
    */
   stalled: (run) => {
     const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
@@ -587,7 +682,6 @@ var briefings = {
     ].filter(Boolean).join("\n");
   }
 };
-var LANES_LABEL = `${THINK_LANE} plans and verifies; ${CODE_LANE} codes.`;
 
 // src/ui.ts
 import { hostname, userInfo } from "node:os";
@@ -680,7 +774,7 @@ function statusLines(run, opts = {}) {
   const paused = run.paused === true ? " \xB7 paused" : "";
   const glyph = orchGlyph();
   const head = glyph === "" ? "" : `${glyph} `;
-  const hint = `[${opts.key ?? "Alt+Shift+F"}]`;
+  const hint = `[${opts.key ?? "Alt+F"}]`;
   if (opts.swap) {
     const pct = opts.swap.percent != null ? ` ${Math.round(opts.swap.percent)}%` : "";
     const line2 = `${head}Orchestrator: switching ${opts.swap.from}\u2192${opts.swap.to}${pct} \xB7 ${hint}${stall}${paused}`;
@@ -947,7 +1041,7 @@ function startSwapWatch(to, moe, onSample) {
       stopped = true;
       if (!sawSwap && from === toLane) return void 0;
       const m = await fetchJson(`${ROUTER}/metrics`);
-      const reqs = (Array.isArray(m?.requests) ? m.requests : []).filter((r) => typeof r.model === "string" && r.model.replace(":", "") === toLane.replace(":", "")).map((r) => ({ model: r.model, prompt_n: r.prompt_n ?? r.prompt_tokens ?? 0, durations: r.durations ?? [] })).filter((r) => r.durations.length > 3).sort((a, b) => a.prompt_n - b.prompt_n);
+      const reqs = (Array.isArray(m?.requests) ? m.requests : []).filter((r) => typeof r.model !== "string" || r.model.replace(":", "") === toLane.replace(":", "")).map((r) => ({ model: r.model, prompt_n: r.prompt_n ?? r.prompt_tokens ?? 0, durations: r.durations ?? [], decode_tok_s: r.decode_tok_s, ttft_s: r.ttft_s })).filter((r) => r.durations.length > 3 || typeof r.decode_tok_s === "number" && r.decode_tok_s > 0).sort((a, b) => a.prompt_n - b.prompt_n);
       const big = reqs.filter((r) => r.prompt_n >= 500);
       const first = rateFromRequest(big.length > 0 ? big[0] : reqs[0]);
       const steady = rateFromRequest(reqs[reqs.length - 1]);
@@ -972,15 +1066,17 @@ function startSwapWatch(to, moe, onSample) {
 function moeCacheRow(requests) {
   const withHit = (requests ?? []).filter((r) => typeof r.hit_rate === "number");
   if (withHit.length === 0) return { label: "prefix cache", value: "no hit_rate reported" };
-  const last = withHit[withHit.length - 1];
+  const last = withHit[0];
   const n = Math.min(withHit.length, 8);
-  const recent = withHit.slice(-n);
+  const recent = withHit.slice(0, n);
   const mean = recent.reduce((s, r) => s + (r.hit_rate ?? 0), 0) / recent.length;
-  const ssd = recent.filter((r) => typeof r.ssd_share === "number");
-  const ssdText = ssd.length > 0 ? ` \xB7 ssd ${(ssd.reduce((s, r) => s + (r.ssd_share ?? 0), 0) / ssd.length * 100).toFixed(1)}%` : "";
+  const share = (key) => {
+    const vals = recent.filter((r) => typeof r[key] === "number").map((r) => r[key]);
+    return vals.length === 0 ? `${key === "ssd_share" ? "ssd" : "pcie"} not reported` : `${key === "ssd_share" ? "ssd" : "pcie"} ${(vals.reduce((s, v) => s + v, 0) / vals.length * 100).toFixed(1)}%`;
+  };
   return {
     label: "prefix cache",
-    value: `${(mean * 100).toFixed(1)}% hit over ${n} req \xB7 last ${((last.hit_rate ?? 0) * 100).toFixed(1)}% (${last.reused ?? 0} tok reused)${ssdText}`
+    value: `${(mean * 100).toFixed(1)}% hit over ${n} req \xB7 last ${((last.hit_rate ?? 0) * 100).toFixed(1)}% (${last.reused ?? 0} tok reused) \xB7 ${share("pcie_share")} \xB7 ${share("ssd_share")}`
   };
 }
 function laneBestRate(s, lane) {
@@ -994,7 +1090,7 @@ function persistMetrics(dir, snap) {
 
 // src/moe.ts
 import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
-import { join as join4 } from "node:path";
+import { join as join4, resolve } from "node:path";
 var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
 function readServeConfig(path) {
   if (!path) return void 0;
@@ -1010,7 +1106,8 @@ function readServeConfig(path) {
     return void 0;
   }
 }
-function runningEngineArgs() {
+function engineProof() {
+  const out = {};
   try {
     for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
       let cmd;
@@ -1019,12 +1116,40 @@ function runningEngineArgs() {
       } catch {
         continue;
       }
-      if (/\bbasalt\b/.test(cmd) && /--serve|serve\b/.test(cmd)) return cmd.split("\0").join(" ");
+      const flat = cmd.split("\0").join(" ");
+      if (!out.engineCmdline && /\/basalt\b/.test(flat) && /--serve/.test(flat) && !/\bpython\b/.test(flat.split(" ")[0] ?? "")) {
+        out.engineCmdline = flat;
+        out.enginePid = Number(pid);
+        out.engineStartEpoch = processStartEpoch(Number(pid));
+      }
+      if (!out.routerCmdline && /serve\.server/.test(flat)) {
+        out.routerCmdline = flat;
+        const cfg = /--config[= ](\S+)/.exec(flat)?.[1];
+        if (cfg) out.routerConfigPath = cfg;
+      }
+      if (out.engineCmdline && out.routerCmdline) break;
     }
   } catch {
   }
-  return void 0;
+  return out;
 }
+function processStartEpoch(pid) {
+  try {
+    const stat = readFileSync3(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const starttime = Number(fields[19]);
+    const uptime = Number(readFileSync3("/proc/uptime", "utf8").split(" ")[0]);
+    if (!Number.isFinite(starttime) || !Number.isFinite(uptime)) return void 0;
+    return Math.floor(Date.now() / 1e3 - (uptime - starttime / 100));
+  } catch {
+    return void 0;
+  }
+}
+var sameFile = (a, b) => {
+  const na = resolve(a);
+  const nb = resolve(b);
+  return na === nb || na.replace(/\/+$/, "") === nb.replace(/\/+$/, "");
+};
 function laneMoe(lane, opts = {}) {
   const cfg = readServeConfig(opts.configPath);
   const model = cfg?.models?.[lane];
@@ -1041,32 +1166,39 @@ function laneMoe(lane, opts = {}) {
       note: 'save-capable pack: the serve config does not set "expert-profile-save" (operator act: add it at the model alias, then reload the lane)'
     };
   }
-  const live = opts.liveCmdline;
-  const isLive = live === void 0 ? true : live.includes("--expert-profile-save") && live.includes(savePath);
+  const proof = opts.proof ?? engineProof();
+  const argvLive = opts.liveCmdline !== void 0 && opts.liveCmdline.includes("--expert-profile-save") && opts.liveCmdline.includes(savePath);
+  const configIsRunning = opts.configPath !== void 0 && proof.routerConfigPath !== void 0 && sameFile(proof.routerConfigPath, opts.configPath);
+  const isLive = opts.liveCmdline !== void 0 ? argvLive : argvLive || configIsRunning;
   let exists = false;
   let age_s;
+  let writtenByEngine;
   try {
     const st = statSync(savePath);
     exists = st.isFile();
     age_s = (Date.now() - st.mtimeMs) / 1e3;
+    if (proof.engineStartEpoch !== void 0) writtenByEngine = st.mtimeMs / 1e3 >= proof.engineStartEpoch;
   } catch {
     exists = false;
   }
+  const note = isLive ? exists && writtenByEngine === false ? "live: the running router serves this config; the profile PREDATES this engine \u2014 placing from it needs the lane (re)load, and the engine rewrites it every expert-profile-save-every minutes" : void 0 : `configured, NOT live: the running router serves ${proof.routerConfigPath ?? "no config path (a direct engine launch)"}, not ${opts.configPath ?? "the configured path"} (reload the lane/router to apply)`;
   return {
     lane,
     state: isLive ? "live" : "configured",
     profile_path: savePath,
     profile_exists: exists,
     ...age_s !== void 0 ? { profile_age_s: age_s } : {},
-    note: isLive ? void 0 : "configured, NOT live: the running engine was started before the flag existed (reload the lane to apply)"
+    config_is_running: configIsRunning,
+    ...writtenByEngine !== void 0 ? { written_by_running_engine: writtenByEngine } : {},
+    ...note !== void 0 ? { note } : {}
   };
 }
 function moeRows(lanes, opts = {}) {
-  const live = opts.liveCmdline ?? runningEngineArgs();
+  const proof = opts.proof ?? engineProof();
   return lanes.map((lane) => {
-    const m = laneMoe(lane, { ...opts, liveCmdline: live });
+    const m = laneMoe(lane, { ...opts, proof });
     const age = m.profile_age_s !== void 0 ? `${(m.profile_age_s / 3600).toFixed(1)} h old` : "no file";
-    const value = m.state === "unsupported" ? "unsupported (Flash-Next only; relearned per swap)" : m.state === "configured" && !m.profile_path ? "not configured (add expert-profile-save, reload lane)" : `${m.state} \xB7 ${m.profile_exists ? age : "no profile yet"}${m.profile_exists ? " \xB7 warm start" : ""}`;
+    const value = m.state === "unsupported" ? "unsupported (Flash-Next only; relearned per swap)" : m.state === "configured" && !m.profile_path ? "not configured (add expert-profile-save, reload lane)" : m.state === "configured" ? `configured, NOT live \xB7 ${m.profile_exists ? age : "no profile yet"}` : `${m.state} \xB7 ${m.profile_exists ? age : "no profile yet"} \xB7 ${m.written_by_running_engine === true ? "written by this engine \xB7 warm start" : m.profile_exists ? "earlier engine's file \xB7 warm on reload" : "nothing learned yet"}`;
     return { label: `MoE ${lane}`, value };
   });
 }
@@ -1125,9 +1257,17 @@ function swapRows(swaps) {
 }
 function gateRows(gate) {
   if (!gate) return [{ label: "gate", value: "no gate run this round", tone: "dim" }];
-  const failing = gate.results.filter((r) => !r.ok);
-  const rows = [{ label: "gate", value: `${gate.passed ? "GREEN" : "RED"} ${failing.length}/${gate.results.length} failing \xB7 ${clockOf(gate.at)}`, tone: gate.passed ? "ok" : "bad" }];
-  for (const f of failing) rows.push({ label: "  red", value: `${f.cmd} \u2192 ${f.expected}`, tone: "bad" });
+  const bad = gate.results.filter((r) => !r.ok);
+  const asExpected = gate.results.filter((r) => r.as_expected);
+  const rows = [
+    {
+      label: "gate",
+      value: `${gate.passed ? "GREEN" : "RED"} ${bad.length}/${gate.results.length} failing${asExpected.length ? ` \xB7 ${asExpected.length} as expected` : ""} \xB7 ${clockOf(gate.at)}`,
+      tone: gate.passed ? "ok" : "bad"
+    }
+  ];
+  for (const f of bad) rows.push({ label: "  red", value: `${f.cmd} \u2192 ${f.expected}`, tone: "bad" });
+  for (const a of asExpected) rows.push({ label: "  ok*", value: `${a.cmd} \u2192 ${a.expected}`, tone: "dim" });
   return rows;
 }
 function clockOf(iso) {
@@ -1381,7 +1521,19 @@ function panelLines(d, width, view = { sel: 0 }, theme) {
   const out = lines.map((l) => redact(l, redactOn(), d.run.repo));
   return { lines: out, taskRows };
 }
-var CLOSE_KEYS = { "\x1B": true, q: true, "": true };
+var KITTY_CSI_U = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
+var MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
+function isEscape(data) {
+  if (data === "\x1B") return true;
+  const kitty = KITTY_CSI_U.exec(data);
+  if (kitty) {
+    return Number(kitty[1]) === 27 && (kitty[4] === void 0 ? 1 : Number(kitty[4])) === 1 && (kitty[5] === void 0 ? 1 : Number(kitty[5])) !== 3;
+  }
+  const mok = MODIFY_OTHER_KEYS.exec(data);
+  if (mok) return Number(mok[2]) === 27 && Number(mok[1]) === 1;
+  return false;
+}
+var CLOSE_KEYS = { q: true, "": true };
 var ACTION_KEYS = { s: true, v: true, r: true, p: true, c: true, h: true };
 var PanelComponent = class {
   data;
@@ -1445,7 +1597,7 @@ var PanelComponent = class {
     const all = arr(this.data.run.tasks);
     const tasks = all.length;
     const h = this.getHeight();
-    if (CLOSE_KEYS[data] === true) return this.done(JSON.stringify({ key: "close" }));
+    if (isEscape(data) || CLOSE_KEYS[data] === true) return this.done(JSON.stringify({ key: "close" }));
     if (ACTION_KEYS[data] === true) {
       const t = all[this.sel];
       return this.done(JSON.stringify({ key: data, ...t ? { taskId: t.id } : {} }));
@@ -1497,7 +1649,9 @@ async function openPanel(ctx, provider, onAction, headless = process.env.FADE_OR
 // src/index.ts
 var GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3e3);
 var GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 6e4);
-var FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+shift+f";
+var FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+f";
+var FASTPATH_LINES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_LINES ?? 15);
+var FASTPATH_FILES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_FILES ?? 1);
 var SURFACE = process.env.FADE_ORCHESTRATE_SURFACE === "status" ? "status" : "widget";
 var MUTATING_TOOLS = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
 var MAIN_SESSION_DIR = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_/;
@@ -1616,6 +1770,24 @@ function fadeOrchestrate(pi) {
     const r = refreshChecks(run, live);
     if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} \u2014 ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
   };
+  const fastPathDiff = (repo) => {
+    try {
+      const numstat = execFileSync2("git", ["-C", repo, "diff", "--numstat", "HEAD"], { encoding: "utf8" });
+      const untracked = execFileSync2("git", ["-C", repo, "ls-files", "--others", "--exclude-standard"], { encoding: "utf8" });
+      let lines = 0;
+      let files = 0;
+      for (const row of numstat.split("\n")) {
+        if (row.trim() === "") continue;
+        const [add, del] = row.split("	");
+        files += 1;
+        lines += (add === "-" ? 0 : Number(add) || 0) + (del === "-" ? 0 : Number(del) || 0);
+      }
+      files += untracked.split("\n").filter((s) => s.trim() !== "").length;
+      return { files, lines };
+    } catch {
+      return { files: -1, lines: -1 };
+    }
+  };
   let statusWritten = false;
   const clearSurface = (ctx) => {
     ctx.ui.setWidget(TOP_WIDGET_KEY, void 0, { placement: "aboveEditor" });
@@ -1630,7 +1802,7 @@ function fadeOrchestrate(pi) {
       ctx.ui.setWidget(OVERLAY_WIDGET_KEY, void 0);
       return;
     }
-    const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(chordHeld ? FALLBACK_KEY : FADE_KEY) });
+    const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(DELIVERED_KEY) });
     if (!lines) {
       clearSurface(ctx);
       return;
@@ -1777,6 +1949,8 @@ function fadeOrchestrate(pi) {
   };
   const CHORD = chordBytes(FADE_KEY);
   const FALLBACK_KEY = process.env.FADE_ORCHESTRATE_FALLBACK_KEY ?? "alt+shift+i";
+  const RAW_DELIVERABLE = CHORD !== void 0 && CHORD.startsWith("\x1B");
+  const DELIVERED_KEY = RAW_DELIVERABLE ? FADE_KEY : FALLBACK_KEY;
   const openPanelGuarded = async (ctx) => {
     if (panelOpen) return;
     panelOpen = true;
@@ -1828,7 +2002,7 @@ function fadeOrchestrate(pi) {
     chordHeld = held;
     if (conflictReported) return;
     conflictReported = true;
-    const text = held ? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) \u2014 the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z` : `orchestrate: ${keyLabel(FADE_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
+    const text = held && RAW_DELIVERABLE ? `orchestrate: the host's table binds ${keyLabel(FADE_KEY)} (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "a keybinding"}), so the SHORTCUT for it is refused; the extension claims the raw byte, so ${keyLabel(FADE_KEY)} opens the orchestration screen and the host action does not run (proved by test/pty_rig.mjs). ${keyLabel(FALLBACK_KEY)} is the registered fallback, /orchestrate overlay the command path, and FADE_ORCHESTRATE_KEY=alt+e (free in the measured table) the alternative` : held ? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) \u2014 the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z. An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone` : `orchestrate: ${keyLabel(DELIVERED_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
     const at = setTimeout(() => ctx.ui.notify(text, "info"), 500);
     at.unref?.();
   };
@@ -1845,7 +2019,7 @@ function fadeOrchestrate(pi) {
       st.tasks = payload.tasks.map((t) => ({ ...t, round: st.round }));
       st.checks = payload.checks;
       st.tier = st.tasks.length <= 2 ? "S" : st.tasks.length <= 4 ? "M" : "L";
-      st.max_rounds = adaptiveRounds(st.tasks.length, st.max_rounds);
+      st.max_rounds = roundsForTasks(st.tasks, st.max_rounds);
       st.repair_tasks = [];
       st.state = "coding";
       return { next: CODE_LANE, nextState: "coding" };
@@ -2004,6 +2178,31 @@ ${SCHEMA_HINT}` : text);
           };
         }
       }
+      if (params.phase === "coding_done" && applied.nextState === "verifying" && run.gate_last?.passed === true) {
+        const st2 = run;
+        const firstTry = !(st2.rejection_history ?? []).some((r) => r.round === st2.round && (r.kind === "task" || r.kind === "verification"));
+        const allPassed = st2.tasks.length > 0 && st2.tasks.every((t) => t.status === "passed");
+        const diff = firstTry && allPassed ? fastPathDiff(st2.repo) : void 0;
+        if (diff && diff.files >= 1 && diff.files <= FASTPATH_FILES && diff.lines < FASTPATH_LINES) {
+          st2.phases.push({ phase: "verification_done", lane: st2.lane, accepted: true, round: st2.round, at: (/* @__PURE__ */ new Date()).toISOString(), notes: `fast path: ${diff.files} file(s), ${diff.lines} changed lines < ${FASTPATH_LINES}, gate green on the first try \u2014 the verifier swap was not paid` });
+          st2.state = "complete";
+          const tags2 = st2.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st2.repo, st2, t.id));
+          const ok2 = tags2.filter((t) => t.ok).map((t) => t.tag);
+          const refused2 = tags2.filter((t) => !t.ok);
+          checkpointNote = ok2.length > 0 ? `; checkpoints ${ok2.join(", ")}` : "";
+          if (refused2.length > 0) checkpointNote += `; checkpoint FAILED ${refused2.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+          turnPhase = "verification_done";
+          persist();
+          paint(ctx);
+          pending = void 0;
+          settledNotified = false;
+          ctx.abort();
+          return {
+            content: [{ type: "text", text: `fast path: gate green on the first try, ${diff.lines} changed lines in ${diff.files} file(s) under the ${FASTPATH_LINES}-line threshold; the run is complete on the ${st2.lane} lane and the verifier swap was not paid${checkpointNote}` }],
+            details: { phase: "coding_done", state: "complete", fast_path: true, files: diff.files, lines: diff.lines, threshold_lines: FASTPATH_LINES, threshold_files: FASTPATH_FILES, next_lane: null, checkpoints: st2.checkpoints ?? {} }
+          };
+        }
+      }
       persist();
       paint(ctx);
       pending = applied.nextState === "failed" || applied.nextState === "complete" ? void 0 : { lane: applied.next, phase: params.phase };
@@ -2045,9 +2244,19 @@ ${SCHEMA_HINT}` : text);
     registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
   }
   pi.registerCommand("orchestrate", {
-    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
+    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
     handler: async (args, ctx) => {
-      const raw = args.trim();
+      let raw = args.trim();
+      const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
+      if (demo) {
+        const off = demo[1] === "off" || demo[1] === "0";
+        if (off) delete process.env.FADE_ORCHESTRATE_REDACT;
+        else process.env.FADE_ORCHESTRATE_REDACT = "1";
+        raw = raw.replace(demo[0], " ").replace(/\s+/g, " ").trim();
+        paint(ctx);
+        ctx.ui.notify(`orchestrate: demo redaction ${off ? "OFF" : "ON"} \u2014 the row, pill and panel mask the account, host, home and repo path (display only)`, "info");
+        if (raw === "") return;
+      }
       const first = raw.split(/\s+/)[0] ?? "";
       if (first === "status") {
         if (!run) {
@@ -2192,7 +2401,7 @@ ${SCHEMA_HINT}` : text);
   pi.on("session_start", async (_event, ctx) => {
     if (isDelegatedSession()) return;
     await ensurePhaseTool();
-    if (CHORD && !inputUnsub) {
+    if (RAW_DELIVERABLE && !inputUnsub) {
       inputUnsub = ctx.ui.onTerminalInput((data) => {
         if (data !== CHORD || panelOpen) return void 0;
         void openPanelGuarded(ctx);

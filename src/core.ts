@@ -1,12 +1,12 @@
 /**
  * The state machine's data half: the run schema, the phase/validation rules, and the briefings
- * each lane is fed. Behavior is the monolith's (deploy/omp/fade_orchestrate.ts, the 2026-11-15
- * split) — the wording of every validation error is load-bearing: the model steers by it.
+ * each lane is fed. The wording of every validation error is load-bearing — the model steers by
+ * the exact text — so it is part of the protocol, not decoration.
  */
 import { execFileSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { CODE_LANE, THINK_LANE, msg } from "./router.ts";
+import { msg } from "./router.ts";
 
 export const STATE_KEY = "fade.omp_orchestrate.v1";
 export const ACTIVE_FILENAME = "ACTIVE.json";
@@ -16,12 +16,11 @@ export const MAX_ROUNDS = 6;
 export const MAX_TASKS = 6;
 export const TERMINAL: Record<string, true> = { complete: true, failed: true, stopped: true };
 export const PHASE_FOR_STATE: Record<string, string> = { planning: "planning_done", coding: "coding_done", repair: "coding_done", verifying: "verification_done" };
-export const STATUS_KEY = "fade";
 
 /**
- * One rejection: a phase the verifier bounced, a payload the schema refused (Y2: a formatting
- * slip, tracked as a COUNT, never a round and never a swap), a task forced, or a lane that ended
- * a turn with no `fade_phase` call at all (the Tier-1 protocol debt, Y1).
+ * One rejection: a phase the verifier bounced, a payload the schema refused (a formatting slip,
+ * tracked as a COUNT, never a round and never a swap), a task forced, or a lane that ended a
+ * turn with no `fade_phase` call at all (the protocol debt).
  */
 export interface Rejection {
 	round: number;
@@ -38,13 +37,12 @@ export const MAX_REJECTIONS = 50;
  * clobbered. A pre-gate file resumes as a fresh, unpaused run with zero protocol debt.
  */
 export function normalizeRun(st: RunState): RunState {
-	// The arrays the surfaces deref are defaulted HERE, at the read boundary, because they are
-	// measured missing in real files and every consumer that derefs one crashes a surface: a state
-	// written mid-plan had no `phases` (the panel threw), a hand-seeded state had no `repair_tasks`
-	// (the panel threw), and `tasks`/`checks` are read raw by the row (`src/ui.ts`), the briefing
-	// builder (`core.ts` 286/337/343/344) and the gate (`index.ts` 756/1081). Defaulting the
-	// protocol counters alone left that class alive on every surface but the panel (verifier review
-	// 2026-11-15). A value already carried in the file is never clobbered.
+	// The arrays the surfaces deref are defaulted HERE, at the read boundary, because real state
+	// files arrive without them and every consumer that derefs one crashes a surface: a state
+	// written mid-plan has no `phases` (the panel throws), a hand-seeded state has no
+	// `repair_tasks` (the panel throws), and `tasks`/`checks` are read raw by the row, the
+	// briefing builder and the gate. Defaulting the protocol counters alone leaves that class
+	// alive on every surface. A value already carried in the file is never clobbered.
 	if (!Array.isArray(st.tasks)) st.tasks = [];
 	if (!Array.isArray(st.repair_tasks)) st.repair_tasks = [];
 	if (!Array.isArray(st.phases)) st.phases = [];
@@ -63,13 +61,13 @@ export function pushRejection(run: RunState, kind: Rejection["kind"], reason: st
 	if (run.rejection_history.length > MAX_REJECTIONS) run.rejection_history.splice(0, run.rejection_history.length - MAX_REJECTIONS);
 }
 
-/** Count of recorded rejections of one kind. The schema separator (Y2) is a COUNT, not a new list. */
+/** Count of recorded rejections of one kind. The schema separator is a COUNT, not a new list. */
 export function countRejections(run: RunState, kind: Rejection["kind"]): number {
 	return (run.rejection_history ?? []).filter((r) => r.kind === kind).length;
 }
 
 /**
- * The Tier-1 protocol gate (Y1). A turn that ends without an accepted `fade_phase` payload is
+ * The protocol nudge ladder. A turn that ends without an accepted `fade_phase` payload is
  * protocol debt, NOT a coding round: `round` and `max_rounds` are never touched here, so the
  * round budget a plan reserved is not burned by a lane that stayed silent.
  *  stall_count 1 -> "nudge"      re-brief the lane in VRAM (no swap, no round)
@@ -95,10 +93,10 @@ export function classifyTurnEnd(run: RunState, hadPhase: boolean): TurnEnd {
 
 /**
  * Is `repo` a git working tree? Probed, never assumed. Outside a working tree `git diff` does NOT
- * fail cleanly: with two path args (and, measured 2026-11-15, with `--stat` alone in the harness's
- * own status call) it switches to `--no-index` mode and answers with its ~60-line usage page,
- * which then rides into the briefing as the `Working tree:` line. One quiet `rev-parse --git-dir`
- * answers for every git call the run makes, so the degraded state is named in one line.
+ * fail cleanly: with two path args, and with `--stat` alone, it switches to `--no-index` mode
+ * and answers with its ~60-line usage page, which then rides into the briefing as the
+ * `Working tree:` line. One quiet `rev-parse --git-dir` answers for every git call the run makes,
+ * so the degraded state is named in one line.
  */
 export function isGitRepo(repo: string): boolean {
 	try {
@@ -113,7 +111,7 @@ export function isGitRepo(repo: string): boolean {
 export const notARepo = (repo: string): string =>
 	`(not a git repo: ${repo} — no git evidence; start the run inside a working tree, or run \`git init\` in it)`;
 
-/** `git status --porcelain` verbatim (capped): the T2 synthesizer's evidence base. */
+/** `git status --porcelain` verbatim (capped): the synthesizer's evidence base. */
 export function porcelain(repo: string): string {
 	if (!isGitRepo(repo)) return notARepo(repo);
 	try {
@@ -127,19 +125,18 @@ export function porcelain(repo: string): string {
 
 /**
  * Adaptive round budget: 2 rounds (code+verify) per planning, +1 per 2 tasks, floored at 3 and
- * capped at the requested budget. Measured basis: 6-task runs land inside 2 coding rounds;
- * the budget is for repair rounds, so a small plan must not reserve six swaps.
+ * capped at the requested budget. The budget exists for repair rounds — long runs land inside
+ * two coding rounds — so a small plan must not reserve six swaps.
  */
 export function adaptiveRounds(nTasks: number, budget: number): number {
 	return Math.min(budget, Math.max(3, 2 + Math.ceil(nTasks / 2)));
 }
 
 /**
- * Y8 adaptive round budgets, declared by the PLAN. The spec's tiers are trivial 2 / standard 4 /
- * deep 6; the flat 6 the loop shipped with reserved five repair swaps for a two-line edit, and a
- * swap is 13-25 s and 52-130 GiB. A task declares `complexity` in `planning_done`, and the run's
- * cap is the MAXIMUM tier it declares — one deep task buys six rounds, a plan of trivial edits
- * buys two.
+ * Adaptive round budgets, declared by the PLAN. The tiers are trivial 2 / standard 4 / deep 6; a
+ * flat six reserves five repair swaps for a two-line edit, and a swap is 13-25 s and 52-130 GiB.
+ * A task declares `complexity` in `planning_done`, and the run's cap is the MAXIMUM tier it
+ * declares — one deep task buys six rounds, a plan of trivial edits buys two.
  */
 export type Complexity = "trivial" | "standard" | "deep";
 export const TIER_ROUNDS: Record<Complexity, number> = { trivial: 2, standard: 4, deep: 6 };
@@ -147,7 +144,7 @@ export const isComplexity = (v: unknown): v is Complexity => v === "trivial" || 
 
 /**
  * The run's round cap: the tiers the plan declares win (the max over its tasks); a plan that
- * declares none falls back to the measured task-count curve in `adaptiveRounds`; the operator's
+ * declares none falls back to the task-count curve in `adaptiveRounds`; the operator's
  * `--rounds` budget is the ceiling in BOTH cases (an explicit budget outranks the plan). Floor 2:
  * one round is code + verify, so a run that cannot repair once is not a loop.
  */
@@ -159,8 +156,8 @@ export function roundsForTasks(tasks: Task[], budget: number): number {
 
 /**
  * Emitted verbatim into the tool error after the second schema rejection (auto-repair hint).
- * Y7: the `coding_done` example shows TWO entries on purpose — the batch shape is what the lane
- * is taught, and the shape it sees in the hint is the shape it writes.
+ * The `coding_done` example shows TWO entries on purpose — the batch shape is what the lane is
+ * taught, and the shape it sees in the hint is the shape it writes.
  */
 export const SCHEMA_HINT =
 	'Payload schemas (exact, no extra keys; payload is the JSON object serialized to a string): planning_done {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}; coding_done {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window; verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}. A planning check whose ACCEPTED state is not exit-0 says so in the expected text\'s first words — "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.';
@@ -183,13 +180,11 @@ export interface GateResult {
 }
 /**
  * Can bash even PARSE this check string? A check is a claim the machine runs, and a string that
- * does not parse fails before exec, so the gate records an exit code no tree state can move.
- * Measured on run `20261115T091232Z-rqtj`: the plan declared
- * `bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?` — `<pinned` is an
- * input redirect and `dir>` an output redirect whose required word is the `;` operator — and the
- * round livelocked: seven `coding_done` reports, seven identical refusals, zero lane loads, because
- * "the check failed" and "the check is not a command" looked identical to the gate. The gate must
- * never spawn such a row, and a plan that carries one is refused where the plan is authored.
+ * does not parse fails before exec, so the gate records an exit code no tree state can move: a
+ * `<placeholder>` in the text is an input redirect whose required word swallows the `;` operator,
+ * and the round livelocks — repeated `coding_done` reports, identical refusals, zero lane loads,
+ * because "the check failed" and "the check is not a command" look identical to the gate. The
+ * gate must never spawn such a row, and a plan that carries one is refused where it is authored.
  */
 export function checkParses(cmd: string): { ok: boolean; detail: string } {
 	try {
@@ -202,13 +197,11 @@ export function checkParses(cmd: string): { ok: boolean; detail: string } {
 }
 
 /**
- * The plan's `expected` text can NAME a state that is not exit-0. Measured 2026-11-15 on run
- * `20261115T142431Z-r73i` (repo `fade-fabric`): the plan declared
- * `git -C . rev-parse --git-dir` → "fails: the tree is not a git repo yet, so nothing is
- * committable until init" and `grep -rln "burnin\." probes benches` → "no output: no probe or
- * bench emits burnin.* metrics". Both are the ACCEPTED state, and both landed as RED rows, so the
- * operator saw a red screen on a run whose expectations were met. The declared forms are the head
- * words below; anything else keeps the exit-0 rule.
+ * The plan's `expected` text can NAME a state that is not exit-0. "fails: <why>" declares the
+ * accepted state to be a non-zero exit (a check that the tree is not a git repo before
+ * `git init`), and "no output: <why>" declares empty stdout to be the pass. Under the plain
+ * exit-0 rule both land as RED rows on a run whose expectations were met. The declared forms
+ * are the head words below; anything else keeps the exit-0 rule.
  */
 export function expectation(expected: string): "exit0" | "nonzero" | "quiet" {
 	const e = (expected ?? "").trim();
@@ -218,7 +211,7 @@ export function expectation(expected: string): "exit0" | "nonzero" | "quiet" {
 }
 
 /**
- * The pre-swap gate (T4): the verifier swap costs a 13-25 s pack load; running the plan's own
+ * The pre-swap gate: the verifier swap costs a 13-25 s pack load; running the plan's own
  * checks on the code lane FIRST means the swap is only ever paid for a tree whose deterministic
  * checks already pass. Exit code is the verdict (deterministic); the `expected` text rides to
  * the verifier briefing for the judgement calls, and its head words can declare the accepted
@@ -270,14 +263,12 @@ export function runGate(checks: [string, string][], cwd: string): GateResult {
 }
 
 /**
- * The gate runs the plan's checks, and the checks are DATA. Measured 2026-11-15, run
- * 20261115T091232Z-rqtj: two of the eight commands were unrunnable (`--artifacts` is not a flag of
- * scan_resident_parity.sh, whose flags are --ref/--out/--lanes/--keep, and a `<placeholder>` is a
- * shell redirect, so `bash -lc` died on the `<`). They were repaired in `state.json`, and the gate
- * stayed red on the SAME two strings forever: `runGate` reads the owner session's in-memory
- * `run.checks`, and only `session_start` re-reads the file. Refresh the run's checks from the
- * on-disk state, keyed by `run_id` so a state file belonging to another run is never adopted, and
- * report the delta so the refresh is visible, never silent.
+ * The gate runs the plan's checks, and the checks are DATA. Repairing a check string in
+ * `state.json` does not move the gate: `runGate` reads the owner session's in-memory
+ * `run.checks`, and only `session_start` re-reads the file, so the gate stays red on the SAME
+ * repaired strings forever. Refresh the run's checks from the on-disk state, keyed by `run_id`
+ * so a state file belonging to another run is never adopted, and report the delta so the
+ * refresh is visible, never silent.
  */
 export function refreshChecks(run: RunState, live: RunState | undefined): { changed: boolean; to: number; added: string[]; removed: string[] } {
 	const before = run.checks.map((c) => c[0]);
@@ -354,11 +345,11 @@ export interface SynthesizedDone {
 }
 
 /**
- * Tier-1 T2 (Y1): the coder lane ended a turn with no `fade_phase` call twice. The result is
- * SYNTHESIZED from what the machine can prove — `git status --porcelain`, `git diff --stat` and
- * the deterministic pre-swap gate exit codes — never from a model's word. A task whose declared
- * files are absent from the porcelain output is `blocked`, naming the evidence that is missing;
- * nothing here ever claims a result no source supports.
+ * The coder lane ended a turn with no `fade_phase` call twice. The result is SYNTHESIZED from
+ * what the machine can prove — `git status --porcelain`, `git diff --stat` and the deterministic
+ * pre-swap gate exit codes — never from a model's word. A task whose declared files are absent
+ * from the porcelain output is `blocked`, naming the evidence that is missing; nothing here
+ * ever claims a result no source supports.
  */
 export function synthesizeCodingDone(run: RunState, repo: string): SynthesizedDone {
 	const raw = porcelain(repo);
@@ -378,16 +369,16 @@ export function synthesizeCodingDone(run: RunState, repo: string): SynthesizedDo
 	return { done, sources: { porcelain: raw, diffStat: stat, gate } };
 }
 
-/** Y16: tags are namespaced per run so a repair round never shadows an earlier run's checkpoint. */
+/** Tags are namespaced per run so a repair round never shadows an earlier run's checkpoint. */
 export function checkpointName(run: RunState, taskId: string): string {
 	return `omp-ckpt/${run.run_id}/${taskId}-passed`;
 }
 
 /**
- * Checkpoint the tree at the moment a task passed (Y16). The orchestrator never commits, so the
- * tag names the HEAD the task was accepted against; `git checkout -f <tag> -- .` plus
- * `git clean -fd` against the pair restores the tree exactly. Re-tagging a re-passed task moves
- * the tag forward (`-f`) instead of failing the phase.
+ * Checkpoint the tree at the moment a task passed. The orchestrator never commits, so the tag
+ * names the HEAD the task was accepted against; `git checkout -f <tag> -- .` plus `git clean
+ * -fd` against the pair restores the tree exactly. Re-tagging a re-passed task moves the tag
+ * forward (`-f`) instead of failing the phase.
  */
 export function tagCheckpoint(repo: string, run: RunState, taskId: string): { tag: string; ok: boolean; error?: string } {
 	const tag = checkpointName(run, taskId);
@@ -403,10 +394,11 @@ export function tagCheckpoint(repo: string, run: RunState, taskId: string): { ta
 }
 
 /**
- * Y4 negative memory: the critiques THIS task has already been given, with the count and the round
- * the newest landed. The named failure is rounds 2–6 oscillating between two broken fixes, and the
- * cure is per-task: a coder that sees a flat transcript of everything the verifier ever said does
- * not know which critique is about the file it is editing, and re-issues the same diff.
+ * Negative memory per task: the critiques THIS task has already been given, with the count and
+ * the round the newest landed. The failure this guards against is a run oscillating between two
+ * broken fixes across repair rounds, and the cure is per-task: a coder that sees a flat
+ * transcript of everything the verifier ever said does not know which critique is about the file
+ * it is editing, and re-issues the same diff.
  */
 export function critiquesFor(run: RunState, ids: string[]): string[] {
 	const out: string[] = [];
@@ -422,11 +414,9 @@ export function critiquesFor(run: RunState, ids: string[]): string[] {
 /**
  * Condensed handover — the "get on topic faster" contract. The prompt is built STABLE FIRST:
  * goal, phase contract, task definitions; the volatile tail (statuses, gate tails, rejections,
- * diff stat) goes last. Basalt's conversation cache reuses a request's prefix (measured
- * `hit_rate` / `reused` on /metrics: 44.9% early, 82.3% once the prefix settles; 106k-token
- * prefill ran 3.5 s at 1,499 tok/s, so a 2–6k condensed handover costs tenths of a second), and a
- * prefix that changes near the end keeps the cache warm — the same discipline a new lane gets
- * for free when it starts from this digest instead of replaying the transcript.
+ * diff stat) goes last. Basalt's conversation cache reuses a request's prefix, and a prefix that
+ * changes near the end keeps the cache warm — the same discipline a new lane gets for free when
+ * it starts from this digest instead of replaying the transcript.
  */
 export function handover(run: RunState): { stable: string[]; volatile: string[] } {
 	const stable = [
@@ -477,7 +467,7 @@ export interface Task {
 	round: number;
 	status?: string;
 	result?: string;
-	/** Y8: the plan's own complexity tier, declared at `planning_done`; it sets the run's cap. */
+	/** The plan's own complexity tier, declared at `planning_done`; it sets the run's cap. */
 	complexity?: Complexity;
 }
 
@@ -506,25 +496,25 @@ export interface RunState {
 	repair_tasks: Task[];
 	reason?: string;
 	started_utc: string;
-	/** v2: every bounced phase/payload, newest last; the repair briefing feeds the last five. */
+	/** Every bounced phase/payload, newest last; the repair briefing feeds the last five. */
 	rejection_history: Rejection[];
-	/** v2: count of schema-refused fade_phase payloads; at 2+ the tool returns SCHEMA_HINT. */
+	/** Count of schema-refused fade_phase payloads; at 2+ the tool returns SCHEMA_HINT. */
 	schema_retries: number;
-	/** v2: last pre-swap gate run on the code lane (T4); the gate briefing replays the tails. */
+	/** Last pre-swap gate run on the code lane; the gate briefing replays the tails. */
 	gate_last?: GateResult;
 	/** v2: plan-size tier from planning_done (S ≤2 tasks, M ≤4, L more). */
 	tier?: "S" | "M" | "L";
-	/** Y1: cumulative turns that ended with NO fade_phase call; the round budget never moves. */
+	/** Cumulative turns that ended with NO fade_phase call; the round budget never moves. */
 	protocol_retries?: number;
-	/** Y1: consecutive phase-less turns; 1 nudge, 2 synthesize, 3 stall. Reset by any accepted phase. */
+	/** Consecutive phase-less turns; 1 nudge, 2 synthesize, 3 stall. Reset by any accepted phase. */
 	stall_count?: number;
-	/** Y1 T3 / Y13: the loop is halted (circuit breaker) or operator-paused; nothing more is sent. */
+	/** The loop is halted (circuit breaker) or operator-paused; nothing more is sent. */
 	paused?: boolean;
-	/** Y13: the operator's note, recorded by [s]/[p] and replayed in the handover. */
+	/** The operator's note, recorded by [s]/[p] and replayed in the handover. */
 	operator_note?: string;
-	/** Y1 T2: a coding_done the machine synthesized from git + gate exit codes, not from the lane. */
+	/** A coding_done the machine synthesized from git + gate exit codes, not from the lane. */
 	synthesized?: { phase: string; round: number; at: string };
-	/** Y16: task id -> the checkpoint tag naming the HEAD that task passed against. */
+	/** Task id -> the checkpoint tag naming the HEAD that task passed against. */
 	checkpoints?: Record<string, string>;
 }
 
@@ -537,7 +527,7 @@ export function readJson<T>(path: string): T | undefined {
 }
 
 /**
- * Durable write (Y5): temp + fsync + rename + fsync of the parent directory. A `kill -9` in the
+ * Durable write: temp + fsync + rename + fsync of the parent directory. A `kill -9` in the
  * middle of a multi-hour run leaves `state.json` parsing as the PREVIOUS phase — a reader never
  * sees a half-written record, and the rename itself survives the crash because the directory
  * entry is flushed after it. Directory fsync is best-effort (platforms that refuse an `r` fd on
@@ -607,8 +597,8 @@ export function validateChecks(raw: unknown): { checks?: [string, string][]; err
 		const cmd = pair[0] as string;
 		// A check is a claim the machine RUNS. Refuse one that is not a command HERE, at the plan's
 		// authoring edge: a `bash -n` failure never execs, so it is red for every tree the run can
-		// produce, and a plan carrying one livelocks the coder (run 20261115T091232Z-rqtj: seven
-		// refusals, zero lane loads, because the gate could not tell a broken string from a failure).
+		// produce, and a plan carrying one livelocks the coder — repeated refusals, zero lane
+		// loads, because the gate cannot tell a broken string from a failure.
 		const parse = checkParses(cmd);
 		if (!parse.ok) {
 			return {
@@ -638,21 +628,20 @@ export function sameTaskPlan(a: Task[], b: unknown[]): boolean {
 }
 
 /**
- * Y7: the tasks ONE coder window takes. The unit of cost is the lane swap — 15-20 s and
- * 52-130 GiB, paid once per turn at `agent_end` — so a round costs the NUMBER OF WINDOWS, not the
- * number of tasks: a 3-task plan reported one task per turn pays six transitions where two do the
- * job.
+ * The tasks ONE coder window takes. The unit of cost is the lane swap — 15-20 s and 52-130 GiB,
+ * paid once per turn at `agent_end` — so a round costs the NUMBER OF WINDOWS, not the number of
+ * tasks: a 3-task plan reported one task per turn pays six transitions where two do the job.
  *
- * 4 is set against the bounds this file and `index.ts` already publish:
- *  - planning calls `tasks.length <= 4` tier M, so a whole M plan is ONE window: a 3-task round
+ * 4 is set against the bounds the loop publishes:
+ *  - planning caps a tier-M plan at 4 tasks, so a whole M plan is ONE window: a 3-task round
  *    is code + verify — exactly 2 swaps, by construction;
  *  - `adaptiveRounds` budgets the plan at 2 tasks per round (2 + ceil(n/2)), so 4 is DOUBLE the
- *    rate the round budget assumes: the plan the planner sizes for two coding rounds lands in one
- *    window and leaves the reserved rounds for repairs;
- *  - the plan ceiling is `MAX_TASKS` (6 in this build, 8 at the ceiling), so 4 keeps every task
- *    card UNTRUNCATED (objective, files, acceptance, dependencies) inside one coder context along
- *    with its own test runs, and bounds a bounced window to at most half a maximal plan — a
- *    repair round is never "redo the whole plan".
+ *    rate the round budget assumes: the plan the planner sizes for two coding rounds lands in
+ *    one window and leaves the reserved rounds for repairs;
+ *  - the plan ceiling is `MAX_TASKS`, so 4 keeps every task card UNTRUNCATED (objective, files,
+ *    acceptance, dependencies) inside one coder context along with its own test runs, and bounds
+ *    a bounced window to at most half a maximal plan — a repair round is never "redo the whole
+ *    plan".
  */
 export const MAX_WINDOW_TASKS = 4;
 
@@ -682,10 +671,10 @@ export function windowPool(run: RunState): Task[] {
 }
 
 /**
- * Y7: the window the coder takes in THIS turn. `open` is every unpassed task in the pool;
- * `readyNow` is the open tasks whose every dependency is resolved (passed, including a forced
- * skip), in plan order, capped at `MAX_WINDOW_TASKS`; `blocked` names each open task with an
- * unmet dependency and those ids. A ready task cut by the cap is in neither list — it is the NEXT
+ * The window the coder takes in THIS turn. `open` is every unpassed task in the pool; `readyNow`
+ * is the open tasks whose every dependency is resolved (passed, including a forced skip), in
+ * plan order, capped at `MAX_WINDOW_TASKS`; `blocked` names each open task with an unmet
+ * dependency and those ids. A ready task cut by the cap is in neither list — it is the NEXT
  * window's `readyNow`, and `briefings.window` names it so the lane never starts it early.
  */
 export function roundWindow(run: RunState): RoundWindow {
@@ -713,7 +702,7 @@ export interface DoneEntry {
 export const WINDOW_RULE = "one coding_done per window: report EVERY task of this window in ONE payload, never one payload per task";
 
 /**
- * Y7: validate a whole `coding_done` — SEVERAL tasks at once, all of them marked by `applyDone`.
+ * Validate a whole `coding_done` — SEVERAL tasks at once, all of them marked by `applyDone`.
  * A payload naming NO task in `roundWindow().readyNow` while one exists is refused with the rule
  * named: that one-task-per-turn report is exactly what makes a 3-task round cost six swaps, and
  * the refusal is what closes the per-task window.
@@ -755,6 +744,18 @@ export function applyDone(run: RunState, done: DoneEntry[]): Task[] {
 	return marked;
 }
 
+/**
+ * The run root's git state, said out loud where it changes what the loop can prove. Measured
+ * 2026-11-15 on run 20261115T193201Z-vsuq (repo fade-fabric, NOT a git repo): the T2 phase
+ * synthesizer reads `git status --porcelain`, so EVERY task landed `blocked` with the sentinel
+ * tail, and the operator met a wall of six red rows two rounds after a clean-looking start. The
+ * cause is knowable at the first keystroke, so the first keystroke says it.
+ */
+export const gitCaveat = (repo: string): string =>
+	isGitRepo(repo)
+		? ""
+		: ["The run root " + repo + " is NOT a git repo: git status/git diff evidence does not exist here, so the phase synthesizer names every task blocked and the checkpoint tags are unavailable.",
+		  "The act is `git init " + repo + "` (or start the run inside a working tree)."].join(" ");
 export const briefings = {
 	plan: (run: RunState): string =>
 		[
@@ -762,6 +763,7 @@ export const briefings = {
 			`Goal: ${run.goal}`,
 			`Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
 			`Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
+			gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`,
 		].join("\n"),
 	code: (run: RunState): string =>
@@ -770,22 +772,24 @@ export const briefings = {
 			`Goal: ${run.goal}`,
 			`Tasks: ${JSON.stringify(run.tasks)}`,
 			`Implement exactly these tasks in ${run.repo}. After each task run its acceptance command and record what it observed. Do not commit.`,
+			gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
 		].join("\n"),
 	/**
-	 * Y7: the coder's BATCH briefing — one window, one turn, one `coding_done`. Every task of
+	 * The coder's BATCH briefing — one window, one turn, one `coding_done`. Every task of
 	 * `roundWindow().readyNow` is spelled out UNTRUNCATED (objective, files, acceptance,
 	 * dependencies) because a card the lane cannot read in full is a card it implements from
-	 * imagination; the blocked tasks are listed with the ids that hold them so the lane knows what
-	 * to leave alone; and the one-payload contract is stated in the turn's own words, which is the
-	 * half that kills the per-task window (the refusal in `validateDone` is the other half).
+	 * imagination; the blocked tasks are listed with the ids that hold them so the lane knows
+	 * what to leave alone; and the one-payload contract is stated in the turn's own words, which
+	 * is the half that kills the per-task window (the refusal in `validateDone` is the other
+	 * half).
 	 */
 	window: (run: RunState): string => {
 		const { readyNow, blocked, open } = roundWindow(run);
 		const inWindow = new Set(readyNow.map((t) => t.id));
 		const blockedIds = new Set(blocked.map((b) => b.id));
 		const deferred = open.filter((t) => !inWindow.has(t.id) && !blockedIds.has(t.id)).map((t) => t.id);
-		// Y4: a re-briefed window (round > 1) carries the critique PER TASK, so the lane knows
+		// A re-briefed window (round > 1) carries the critique PER TASK, so the lane knows
 		// which rejection belongs to the file it is about to edit.
 		const critiques = run.round > 1 ? critiquesFor(run, readyNow.map((t) => t.id)) : [];
 		const entry = (id: string) => `{"id":"${id}","status":"passed"|"failed"|"blocked","result":"what the acceptance command observed"}`;
@@ -810,6 +814,7 @@ export const briefings = {
 			...critiques,
 			`Context: this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections — nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.`,
 			`Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`,
+			gitCaveat(run.repo),
 		].filter(Boolean).join("\n");
 	},
 	verify: (run: RunState): string =>
@@ -829,14 +834,15 @@ export const briefings = {
 			`Phase 1 (repair), round ${run.round} of orchestrated run ${run.run_id}.`,
 			`Goal: ${run.goal}`,
 			`Repair tasks: ${JSON.stringify(run.repair_tasks)}`,
-			// Y4: the critique the task itself earned, with its count — the anti-oscillation line.
+			// The critique the task itself earned, with its count — the anti-oscillation line.
 			...(critiques.length > 0 ? ["Rejected before — the verifier's words, BY TASK:", ...critiques] : []),
 			...(prior.length > 0 ? ["Previously rejected — fix the cause, do not repeat the attempt:", ...prior.map((p) => `  ${p}`)] : []),
-			// Y14 compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
+			// Compaction: the diff and the checklist answer "where am I"; no prior-round logs ride.
 			`Working tree: ${diffStat(run.repo)}`,
 			checklist.length > 0 ? `Checklist: ${checklist.join(" | ")}` : "",
 			`Context: this prompt carries the task definitions, the diff stat, the checklist and the last rejections — no prior-round tool logs. Re-running the acceptance command is the only re-read this round needs.`,
 			`Implement the repairs in ${run.repo}, run each acceptance command, do not commit.`,
+			gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="coding_done", payload={"done":[{"id":"T<n>","status":"passed"|"failed"|"blocked","result":"..."}]}`,
 		].filter(Boolean).join("\n");
 	},
@@ -863,9 +869,9 @@ export const briefings = {
 		return `Orchestrated run ${run.run_id} stopped at round ${run.round}; resident lane left as ${run.lane}.`;
 	},
 	/**
-	 * Y1 Tier 1: the lane ended its turn without calling `fade_phase`. No round was spent and no
-	 * swap happens — the same lane is re-briefed in VRAM with the ONE thing it owes, plus the
-	 * published schema, and told exactly what the next miss costs.
+	 * Tier 1 of the protocol ladder: the lane ended its turn without calling `fade_phase`. No
+	 * round was spent and no swap happens — the same lane is re-briefed in VRAM with the ONE
+	 * thing it owes, plus the published schema, and told exactly what the next miss costs.
 	 */
 	nudge: (run: RunState): string => {
 		const phase = PHASE_FOR_STATE[run.state] ?? "coding_done";
@@ -879,9 +885,9 @@ export const briefings = {
 		].join("\n");
 	},
 	/**
-	 * Y1 Tier 3: the circuit breaker tripped. The run is paused, the lane is left as it is, and
-	 * this is the diagnostic an operator acts on: what the machine saw, what is RED, what git
-	 * says, and the exact files to open.
+	 * Tier 3 of the protocol ladder: the circuit breaker tripped. The run is paused, the lane is
+	 * left as it is, and this is the diagnostic an operator acts on: what the machine saw, what
+	 * is RED, what git says, and the exact files to open.
 	 */
 	stalled: (run: RunState): string => {
 		const path = join(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
@@ -902,4 +908,3 @@ export const briefings = {
 	},
 };
 
-export const LANES_LABEL = `${THINK_LANE} plans and verifies; ${CODE_LANE} codes.`;

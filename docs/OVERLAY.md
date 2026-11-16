@@ -1,6 +1,6 @@
 # The status line and the Alt+F screen
 
-What the operator sees, where it is placed, and why it is placed there. Every statement below is
+What you see, where it is placed, and why it is placed there. Every statement below is
 implemented in `src/ui.ts` (the line), `src/panel.ts` (the screen), `src/screendata.ts` (its data
 contract) and `src/index.ts` (the wiring), and each section names the file that proves it.
 
@@ -45,8 +45,7 @@ KEYS with the `◆resident` marker. A name carrying no quant and no GPU count pa
 through, so an unknown model is never masked.
 
 `FADE_ORCHESTRATE_SURFACE=status` opts into the host's status-bar surface (`setStatus`) instead of
-the top widget. The default ships the widget: the footer row is the host's and the operator retired
-the pill there.
+the top widget. The default ships the widget: the footer row is the host's own surface.
 
 **The row names the chord it honors.** The key hint is `keyLabel(chordHeld ? FALLBACK_KEY :
 FADE_KEY)` (`src/index.ts`): the configured chord when the host's probe reports it FREE, the
@@ -62,7 +61,7 @@ The key was chosen by measurement, twice, because the first measurement was not 
 
 **`ctrl+o` is out.** The host owns it as the built-in action **`app.tools.expand`**, and a built-in
 binding is not merely skipped at registration — the host **acts on it**. Measured in a real 150×45
-terminal (2026-11-15): sending `C-o` printed `Tool output expansion: enabled` and the extension's
+terminal: sending `C-o` printed `Tool output expansion: enabled` and the extension's
 `onTerminalInput` listener never received `0x0f`; registering the chord is refused with
 `Extension shortcut conflicts with built-in shortcut`.
 
@@ -102,29 +101,29 @@ the fallback and names the variable, so a colliding configuration is visible rat
 ```
 orchestrate: Ctrl+O is held by the host (reserved) — the screen opens on Alt+Shift+I.
 Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host
-holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z
-```
+holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z.
+An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone
 
 `pi.getShortcutConflict(chord)` is **not callable from a hook that can run**: omp 18.20.2's
 loading-phase proxy throws for it (and for `setModel`/`getActiveTools`/…), `session_start` fires
-inside that window, and an idle TUI session — the pty rig, an operator reading the wall — never fires
-`agent_start`. Measured 2026-11-15: with the disclosure tied to the probe alone it reached the screen
+inside that window, and an idle TUI session — the pty rig, a person reading the wall — never fires
+Measured: with the disclosure tied to the probe alone it reached the screen
 in **no** rig state. So the shipped rule is two-tier: `probeHasAnswered` separates "threw" from "free",
 the probe's answer is the authority when it answers, and when it never answers the extension's copy of
 the host's chord table (`HOST_HELD_CHORDS`, the list quoted above) decides. The chord is always
 disclosed, and the table is a fallback, never a claim of freedom the probe refused to prove.
 
 The disclosure is **deferred 500 ms**, not fired inline: the FIRST notify of a session is swallowed by
-the host's TUI attach (measured 2026-11-15 in the pty rig — the disclosure fired at `session_start` and
+the host's TUI attach (measured in the pty rig — the disclosure fired at `session_start` and
 never reached the scrollback, while the notify ~20 lines later in the same hook rendered every time).
 The one-shot flags are set synchronously, so the deferral cannot double-print, and the rig reads it
 from the scrollback with a bounded wait rather than one snapshot at the row.
 
 The pty rig proves both states in an isolated agent dir (every entry of `~/.omp/agent` symlinked
-except `keybindings.*`, so the desk's own config cannot leak in) and on a **private tmux server**
-(`-L fade-pty-<pid>`): two rigs against `/tmp/tmux-1000/default` kill each other, measured 2026-11-15
-— one rig's cleanup took the shared server, the other's session died mid-run at `send-keys` and its log
-opened with `no server running`. A per-rig session name does not isolate; the **server** is shared.
+except `keybindings.*`, so the user's own keybinding config cannot leak in) and on a **private tmux
+server** (`-L fade-pty-<pid>`): two rigs against `/tmp/tmux-1000/default` kill each other, measured
+— one rig's cleanup took the shared server, the other's session died mid-run at `send-keys` and its
+log opened with `no server running`. A per-rig session name does not isolate; the **server** is shared.
 
 - **DEFAULT** — nothing configured: the disclosure names the refusal, says `Alt+F` opens the screen
   at the byte level, and names the fallback; `ESC f` opens the panel; `ctrl+o` opens **nothing** —
@@ -134,7 +133,7 @@ opened with `no server running`. A per-rig session name does not isolate; the **
 - **HELD** — `FADE_ORCHESTRATE_KEY=ctrl+o`: the disclosure names the conflict, the fallback and the
   variable; `C-o` opens no screen; `ESC I` (alt+shift+i) opens the panel.
 
-Run 1 runs on this desk's own state and asserts the `ESC f` bytes reach the extension (the host prints
+Run 1 runs on the host's own config and asserts the `ESC f` bytes reach the extension (the host prints
 no `Tool output expansion:` for them), that the panel opens, that it is bounded by the terminal width,
 that its clock moves on the refresh tick while open, that **both** escape encodings close it, and that
 `halt` clears the row.
@@ -154,17 +153,18 @@ The wiring is:
   carry no raw keystrokes).
 
 **Closing the screen is a parse, not a byte.** The host hands the focused component RAW bytes
-(`pi-tui` `tui.js:420-425` → `focusedComponent.handleInput(data)`), and its own escape matcher
-(`keys.js:648-654`) recognizes three forms: the legacy `\x1b`, the Kitty keyboard-protocol CSI-u
+(`pi-tui`'s input dispatch calls `focusedComponent.handleInput(data)`), and its own escape matcher
+(`matchesKey(data, "escape")`, built on `matchesKittySequence` and `matchesModifyOtherKeys`)
+recognizes three forms: the legacy `\x1b`, the Kitty keyboard-protocol CSI-u
 sequence (`\x1b[27u`, `\x1b[27;<mod>u`) and xterm's `modifyOtherKeys` (`\x1b[27;<mod>;27~`). The
 panel compared only the legacy byte, so on a terminal that enables the Kitty protocol — kitty,
-wezterm, ghostty, foot — ESC did nothing while `q` closed (the operator's report, 2026-11-15).
+wezterm, ghostty, foot — ESC did nothing while `q` closed.
 `isEscape()` in `src/panel.ts` now matches all three, ignores the Kitty RELEASE form (`...:3u`) so
 one press is one close, and refuses ESC carrying a modifier (the raw listener owns ESC + letter
 chords). `test/panel.test.mjs` drives each encoding through `handleInput`; the pty rig closes the
 panel with the legacy Escape **and** the injected CSI-u sequence (`send-keys -H 1b 5b 32 37 75`),
 because tmux's `screen` terminal has no Kitty protocol and cannot produce it unaided — which is
-exactly why the rig passed with ESC dead at the desk.
+exactly why the rig passed with ESC dead.
 
 A delegated session (a subagent's own session file) binds **no extra** listener: one listener per
 process, proved by `test/gate_rig.mjs` and `test/rpc_rig.mjs`.
@@ -210,7 +210,7 @@ Layout rules, all proved in `test/panel.test.mjs`:
 - **The selected task carries its details** (files, deps, round, acceptance, result, checkpoint
   tag); every other task stays one line.
 - **Scroll follows the selection, and only the selection.** `j`/`k` and the refresh tick bring the
-  selected task on screen; `g`, `G`, `PgUp`, `PgDn` are the operator moving the view, and a frame
+  selected task on screen; `g`, `G`, `PgUp`, `PgDn` are the user moving the view, and a frame
   does not snap back under them.
 
 ## The metrics, and the rule about numbers
@@ -237,7 +237,7 @@ under `engine`, answers `/health` `loaded` as a boolean with the lane under `mod
 `live.tok_s` null at idle and publishes NO `model` field per request. The rig's stub router used a
 flat payload with `loaded: <lane key>` — a contract the live router never answered — and that is how
 a crash on the real payload passed the rig: the reader took `true` for a lane name, the renderer
-threw on `name.indexOf`, and Ctrl+O opened nothing at the desk. The stub now mirrors the capture
+threw on `name.indexOf`, and the panel opened nothing on the real host. The stub now mirrors the capture
 field for field, and the panel asserts the numbers that capture contains.
 
 The panel never dies on a shape it did not predict: every router field is type-guarded on the way in
@@ -263,7 +263,7 @@ class this screen exists to prevent.
 | `esc` `q` `ctrl+c` | close, touching no loop control — `esc` in every encoding the host delivers (see above) |
 
 The bar **wraps**; it never clips. It is 120 visible columns, so on the 110-column default surface a
-single-line bar lost its tail — the key the operator needs most, `[esc] close`, was not on screen.
+single-line bar lost its tail — the key a user needs most, `[esc] close`, was not on screen.
 `wrapText()` in `src/panel.ts` folds it onto as many rows as the width needs, at every width the
 panel supports.
 
@@ -278,7 +278,7 @@ the process open.
 strips the repo path, the OS account, `/home/<someone>`, `~` and this machine's hostname from
 **every** rendered line, so a screenshot is safe to paste. **Display-only**: `state.json`,
 `metrics.jsonl` and `swap_history.json` keep the truth verbatim, and a fresh session starts
-unredacted. Off by default: the operator's own truth stays on the screen.
+unredacted. Off by default: the user's own truth stays on the screen.
 
 ## Proof surface
 
@@ -287,9 +287,9 @@ unredacted. Off by default: the operator's own truth stays on the screen.
 | `test/panel.test.mjs` | the renderer: fits 40→120 columns, flush frame, the key bar keeps every key, selection details, scroll rules, live tick, both open surfaces, and **every ESC encoding** closing (`\x1b`, `\x1b[27u`, `\x1b[27;1u`, `\x1b[27;1;27~`; the release form and ESC+modifier NOT closing; `q` closing) |
 | `test/panel_data.test.mjs` (guard) | a run state written mid-plan can lack `phases`; the screen reads it as no critique and renders — measured as a throw in the rpc rig (`undefined is not an object (evaluating 'src.run.phases.length')`), which turned the panel into an error notify |
 | `test/panel_data.test.mjs` | the data contract: rows from a real-shaped `/metrics` snapshot, the named-absent states, the abbreviated model named once |
-| `test/ui_status.test.mjs` | the status line: the operator's grammar, the terminal/no-run clear rule, the swap pill, the flip line, the chord bytes (`ESC f` is the delivered chord, `ESC I` the fallback, and why `ctrl+shift+<letter>` has no byte form), the key label, the row's key hint |
-| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the Y9 fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row |
-| `test/load_hostile.mjs` | the Y10 pre-unload gate against a hostile `/health`: an `error` state, a `cuda_fatal` state, zero VRAM, VRAM under the floor, a negative nested reading, a loaded context naming no model, and a swap in flight each issue **zero** `POST /v1/load` with the class named; the measured healthy line loads exactly once; a closed server is refused as `unreachable` |
+| `test/ui_status.test.mjs` | the status line: the row's grammar, the terminal/no-run clear rule, the swap pill, the flip line, the chord bytes (`ESC f` is the delivered chord, `ESC I` the fallback, and why `ctrl+shift+<letter>` has no byte form), the key label, the row's key hint |
+| `test/gate_rig.mjs` | the whole protocol against a fake host and a stub router: the row is docked `aboveEditor`, no status-bar row ships by default, the host's table **refuses** the `alt+f` registration and the `ESC f` raw listener consumes and opens, the fallback chord is the one registered, a RED gate issues zero `POST /v1/load`, the fast path pays zero loads and its threshold pays one swap, `--demo-redact` masks the panel and leaves `state.json` verbatim, a terminal run clears the row |
+| `test/load_hostile.mjs` | the pre-unload gate against a hostile `/health`: an `error` state, a `cuda_fatal` state, zero VRAM, VRAM under the floor, a negative nested reading, a loaded context naming no model, and a swap in flight each issue **zero** `POST /v1/load` with the class named; the measured healthy line loads exactly once; a closed server is refused as `unreachable` |
 | `test/pty_rig.mjs` | the real terminal: tmux + the `omp` binary + the live extension, the row on screen, the `ESC f` bytes (`-H 1b 66`, measured as one 2-byte read) opening the panel, the keys, the legacy Escape **and** the injected Kitty CSI-u escape closing, halt clearing, and both chord states (DEFAULT: `ctrl+o` stays the host's, no panel; HELD: the disclosure names the conflict and `ESC I` opens) (`FADE_ORCHESTRATE_LIVE_SMOKE=1`) |
 | `test/rpc_rig.mjs` | the headless surface through `omp --mode rpc`: the row's pill (`[Alt+F]`), the overlay's panel frames, the redaction-OFF half (the seeded file name rides unmasked), skip/halt persistence, the clear on halt |
 
@@ -300,6 +300,6 @@ while the extension is loading, and the host dispatches `session_start` inside t
 uncaught throw there does not print a stack — it **disables the extension**, so every downstream
 assertion fails behind `Failed to load extension`. The gate rig's host defines those methods, so it
 passes while the real host rejects the same code. That class is proved only by the live rigs
-(`pty_rig`, `rpc_rig`) and, at the desk, by the extension actually loading; the wiring swallows the
+(`pty_rig`, `rpc_rig`) and, in the field, by the extension actually loading; the wiring swallows the
 probe (`shortcutConflict`) and defers the phase-tool activation to `agent_start`, where the runtime
 is live.

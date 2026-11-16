@@ -3,7 +3,7 @@
  * (`POST /v1/load {"model": NAME}` blocks until the swap finishes). All three endpoints used
  * here answer on the router port; every failure names the stage, the HTTP status and the body.
  *
- * The host-specific parts are configuration, not constants (public-repo requirement):
+ * The host-specific parts are configuration, not constants:
  *   FADE_ORCHESTRATE_ROUTER   default http://127.0.0.1:18014
  *   FADE_ORCHESTRATE_PROVIDER default strata-flash
  *   FADE_ORCHESTRATE_THINK_LANE default deepseek   (plans + verifies)
@@ -49,21 +49,21 @@ export async function laneHealth(): Promise<RouterHealth | undefined> {
 }
 
 /**
- * Y10: the PRE-UNLOAD GATE. `POST /v1/load` is not additive — it unloads the resident context to
+ * The PRE-UNLOAD GATE. `POST /v1/load` is not additive — it unloads the resident context to
  * make room for the next pack — so the decision is judged on the router's own `/health` line, in
- * words, BEFORE the byte is sent. The classes are the ones this box has measured, and an absent
+ * words, BEFORE the byte is sent. The classes are the ones `/health` can show, and an absent
  * reading is never reported as a zero:
- *  * `unreachable` — `/health` refused: a router that cannot answer is not a context a swap can
- *    land in (the recorded shapes: the referee's `status=6/ABRT` CUDA launch that raced the lane,
- *    and the `:18014` slowness after the 2026-11-09 OOM);
+ *  * `unreachable` — `/health` refused: a router that cannot answer is not a context a swap
+ *    can land in (a CUDA launch that raced the lane, and any router that died with the lane,
+ *    surface here);
  *  * `error state` — the line's `status`/`state` is not `ok`: a context that stopped saying `ok`
  *    cannot serve the next lane (the hung-context and half-dead-CUDA class surfaces here);
  *  * `no model` — `loaded: true` while `model` names nothing: a context that claims to be loaded
  *    and cannot say what it loaded is not serving;
  *  * `zero VRAM` / `below the floor` — reported free VRAM at or under zero, or under
  *    `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` (default 8192): no pack lands there;
- *  * `swap in flight` — `loading: true` at the END of the settle window. The measured ping-pong
- *    (2026-11-14 21:55:50-21:58:33: `swap: flash-next ready in 16.4 s`, then `(1 waiting)`,
+ *  * `swap in flight` — `loading: true` at the END of the settle window. The ping-pong this
+ *    gate exists to stop (journal: `swap: flash-next ready in 16.4 s`, then `(1 waiting)`,
  *    `(3 waiting)`) is exactly a second load queued behind a running one.
  */
 export interface ServeVerdict {
@@ -134,19 +134,19 @@ export const SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?
  * (journal `swap: <lane> ready in …`) — so it is issued exactly once per lane BOUNDARY:
  *  * an in-flight swap is settled first. Loading while `/health` reports `loading: true`
  *    queues behind it, and the router answers the queue by swapping to the entry the queued
- *    request names: the ping-pong measured 2026-11-14 21:55:50-21:58:33 (`swap: flash-next
- *    ready in 16.4 s`, then `swap flash-next -> deepseek (1 waiting)` in the SAME second,
- *    then `(3 waiting)` twice more) — the lane flipped back and forth every 15-25 s.
+ *    request names: a ping-pong (`swap: flash-next ready in 16.4 s`, then
+ *    `swap flash-next -> deepseek (1 waiting)` in the SAME second, then `(3 waiting)` twice
+ *    more) that flips the lane back and forth every 15-25 s.
  *  * the resident entry is never reloaded. The round loop asks for the code lane twice in a
  *    row (`verification_done needs_repair` → code, next round's `planning_done` → code), and
  *    a second load of a resident pack re-reads 52 GiB for nothing.
- *  * Y10: the router's own `/health` line is read FIRST (`serveVerdict`), and a context that
- *    cannot serve — unreachable, an error state, a loaded context naming no model, zero/low free
- *    VRAM, a swap still in flight — is REFUSED with the class named, and `/v1/load` is never sent.
+ *  * the router's own `/health` line is read FIRST (`serveVerdict`), and a context that cannot
+ *    serve — unreachable, an error state, a loaded context naming no model, zero/low free VRAM,
+ *    a swap still in flight — is REFUSED with the class named, and `/v1/load` is never sent.
  */
 export async function loadLane(lane: string): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
 	const t0 = Date.now();
-	// Y10: settle any in-flight swap FIRST and keep the health line the window ended on — that
+	// Settle any in-flight swap FIRST and keep the health line the window ended on — that
 	// reading is the gate's evidence.
 	const health = await settleInFlight();
 	const resident = (await listLanes()).models.find((m) => m.status === "loaded")?.id;
@@ -176,7 +176,7 @@ export async function loadLane(lane: string): Promise<{ ok: boolean; detail: str
 	}
 }
 
-/** Y10: the answer the pre-unload gate reads — is the resident lane SERVING right now? */
+/** The answer the pre-unload gate reads — is the resident lane SERVING right now? */
 export interface RouterBusy {
 	busy: boolean;
 	/** Requests queued at the router — the number in its own `swap … (1 waiting)` line. */
@@ -212,9 +212,9 @@ function prefillRate(r: Record<string, any> | undefined): number | undefined {
 
 /**
  * The newest `/metrics` record the engine has NOT closed: no `finish`, no `duration_s`, no
- * `decode_tok_s`, no `ttft_s`, and a prompt rate — i.e. the prompt is being read right now. The
- * rows the engine has finished carry all four numbers (measured on this host: `finish: "stop"`,
- * `duration_s`, `decode_tok_s`, `ttft_s`), so a finished row is never mistaken for a service.
+ * `decode_tok_s`, no `ttft_s`, and a prompt rate — i.e. the prompt is being read right now.
+ * The rows the engine has finished carry all four fields (`finish`, `duration_s`,
+ * `decode_tok_s`, `ttft_s`), so a finished row is never mistaken for a service.
  */
 function openRequestRow(metrics: Record<string, any> | undefined): Record<string, any> | undefined {
 	const rows = Array.isArray(metrics?.requests) ? (metrics.requests as Record<string, any>[]) : [];
@@ -230,17 +230,17 @@ function openRequestRow(metrics: Record<string, any> | undefined): Record<string
 }
 
 /**
- * Is the resident lane serving? `POST /v1/load` unloads it mid-request, and the router answers a
- * request queued at that instant by swapping to the entry the QUEUED request names — the measured
- * `swap flash-next -> deepseek (1 waiting)` (2026-11-14 21:55:50), 15-20 s and 52-130 GiB each.
- * Three signals, all read from the router's own surface, never inferred from a timer:
+ * Is the resident lane serving? `POST /v1/load` unloads it mid-request, and the router answers
+ * a request queued at that instant by swapping to the entry the QUEUED request names —
+ * `swap flash-next -> deepseek (1 waiting)` — 15-20 s and 52-130 GiB each flip. Three signals,
+ * all read from the router's own surface, never inferred from a timer:
  *  * `/health` `loading: true` — a swap is already in flight (`swap.from/to`, `percent`);
  *  * `/metrics` `live` — `slots.active` requests decoding, `queued`/`slots.queue_depth` waiting;
  *  * `/metrics` `requests` — the newest record is a prompt in flight: a prompt rate with no
  *    `decode_tok_s` and no `ttft_s` reported yet.
  * An UNREACHABLE router is `busy: false` with a reason naming it. The caller gates on this to
- * DEFER a load; stalling a run on a router that cannot answer is worse than the swap it saves, and
- * a missing reading is never reported as a zero.
+ * DEFER a load; stalling a run on a router that cannot answer is worse than the swap it saves,
+ * and a missing reading is never reported as a zero.
  */
 export async function routerBusy(): Promise<RouterBusy> {
 	const [health, metrics] = await Promise.all([laneHealth(), metricsSnapshot()]);
@@ -271,20 +271,18 @@ export async function routerBusy(): Promise<RouterBusy> {
 }
 
 /**
- * Y21: the FLIP GUARD. A swap is 13-25 s of 52-130 GiB, so a churning lane is the most expensive
- * failure this box has. Measured 2026-11-15 04:00-05:34 (fade-basalt-gpu1 journal): ~40
- * alternating `swap deepseek -> flash-next (1 waiting)` / `swap flash-next -> deepseek (1
- * waiting)` lines, one per turn, while an orchestration run held the thinking lane. Every one of
- * them came from a client that is NOT the orchestrator: OMP's title generator and Mnemopi's
- * memory completion both resolve through `@smol`, and once the cloud leg hit a ChatGPT usage
- * limit both fell back onto `strata-flash/flash-next` (log lines `title-generator: start …
- * provider=strata-flash id=flash-next` and `Mnemopi: memory completion model failed; trying the
- * next configured fallback`). The router answers a queued request by swapping to the entry that
- * request names, so the orchestrator cannot prevent the swap — it can NAME it, refuse to pay a
- * reload of its own, and surface the churn before an operator reads it as a hung run. Each
- * in-flight swap the router reports is recorded once; a swap whose target is not the resident
- * lane, inside the window, is a flip. The window and the trigger count are configuration so a rig
- * can run a whole window in milliseconds.
+ * The FLIP GUARD. A swap is 13-25 s of 52-130 GiB, so a churning lane is the most expensive
+ * failure mode the router has. The churn does not come from the orchestrator: other clients on
+ * the host (OMP's title generator, Mnemopi's memory completion) resolve through the shared
+ * provider, and when their primary leg fails they fall back onto the orchestrator's code lane
+ * (log lines `title-generator: start … provider=strata-flash id=flash-next` and
+ * `Mnemopi: memory completion model failed; trying the next configured fallback`). The router
+ * answers a queued request by swapping to the entry that request names, so the orchestrator
+ * cannot prevent the swap — it can NAME it, refuse to pay a reload of its own, and surface the
+ * churn before an operator reads it as a hung run. Each in-flight swap the router reports is
+ * recorded once; a swap whose target is not the resident lane, inside the window, is a flip.
+ * The window and the trigger count are configuration so a rig can run a whole window in
+ * milliseconds.
  */
 export const FLIP_WINDOW_MS = Number(process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS ?? 120_000);
 export const FLIP_MIN_SWAPS = Number(process.env.FADE_ORCHESTRATE_FLIP_MIN_SWAPS ?? 2);

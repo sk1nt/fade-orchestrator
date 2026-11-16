@@ -2,9 +2,8 @@
  * The screen's data: ONE typed snapshot the panel renders, assembled from the router, the run's
  * durable records and the host's context meter.
  *
- * The rule the aggregation obeys (the same rule the turn ledger obeys, Y18): a number nobody
- * measured is NAMED, never printed as a zero. An unreachable router answers `tiers: [{label:
- * "router", value: "… unreachable"}]` and a `missing` entry; a run with no swaps says
+ * The rule the aggregation obeys: a number nobody measured is NAMED, never printed as a zero. An
+ * unreachable router answers `tiers: [{label: "router", value: "… unreachable"}]` and a `missing`
  * `no swaps recorded`; a session whose model has no context meter says `no context meter`. A panel
  * of zeros is decoration, and decoration is how a dead wire reads as a quiet market.
  *
@@ -34,7 +33,7 @@ export interface MetricRow {
 export interface LaneRow {
 	lane: string;
 	role: "think" | "code";
-	/** The registry display name compacted (`deepseek (4.1 flash IQ1_M)`); the id when unnamed. */
+	/** The lane key; the model name rides only on the engine column's `resident` row (`modelLabel`). */
 	model: string;
 	/** The lane the router reports resident right now. */
 	resident: boolean;
@@ -108,10 +107,8 @@ export function sparkline(values: number[]): string {
 }
 
 /**
- * The lane rows: role and the router's resident fact. The lane KEY, never the display name — the
- * model name lives in exactly one place on the screen (the engine column's `resident` row), because
- * the operator reads the same model twice otherwise (order 2026-11-15: "I don't need the model name
- * twice"). The `◆resident` marker on this line names which lane the router holds.
+ * The lane rows: role and the router's resident fact, named by lane KEY — model naming defers to
+ * `modelLabel`. The `◆resident` marker on this line names which lane the router holds.
  */
 export function laneRows(src: ScreenSource, metrics: MetricsSnapshot | undefined): LaneRow[] {
 	const resident = metrics?.loaded;
@@ -140,7 +137,7 @@ export function turnRows(turns: TurnRecord[]): MetricRow[] {
 	return rows;
 }
 
-/** The swap rows: what each pack swap cost, and the ramp class the first completion measured. */
+/** The swap rows: what each pack swap cost, and the ramp class of its first completion. */
 export function swapRows(swaps: SwapRow[]): MetricRow[] {
 	return swaps.slice(0, SCREEN_SWAPS).map((s) => {
 		const ramp = s.ramp === "map_restored" ? "MoE restored" : s.ramp === "hot_steady" ? "hot steady" : s.ramp === "cold_ramp" ? "cold ramp" : "ramp ?";
@@ -193,15 +190,13 @@ export function formatElapsed(seconds: number): string {
 }
 
 /**
- * The ONE row that names the model: the engine column's `resident` row, printed as the registry
- * display name compacted to the operator's abbreviated form ("flash-next (IQ3_S, dual)"). The lane
- * key comes from the router's `model` field (basalt 0.4.0 answers `loaded` as a BOOLEAN), so the
- * display name comes from the registry names the caller injects; with no name the key rides, never
- * a fabricated label. The panel's lane line and the status row name no model at all (operator order
- * 2026-11-15: no double naming).
+ * The ONE row that names the model: the engine column's `resident` row, printed through
+ * `modelLabel` — the naming rule lives there. The lane key comes from the router's `model` field
+ * (basalt 0.4.0 answers `loaded` as a BOOLEAN), so the display name comes from the registry names
+ * the caller injects; with no name the key rides, never a fabricated label.
  *
- * The type guard is not decoration: a router field that is not a lane key reached here as `true`
- * and `name.indexOf("(")` threw, which killed the panel OPEN — the screen rendered nothing on the live
+ * The type guard is not decoration: `loaded` is not guaranteed to be a lane key, and a non-string
+ * reaching `modelLabel` throws, which kills the panel OPEN and leaves no screen on the live
  * router. A screen must never die on a shape it did not predict.
  */
 export function nameResidentRow(tiers: MetricRow[], metrics: MetricsSnapshot | undefined, names: Record<string, string | undefined> | undefined): MetricRow[] {
@@ -237,10 +232,9 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 	if (!context) missing.push("no context meter");
 
 	let critique: string | undefined;
-	// A run state written mid-plan can lack `phases` entirely, and a screen must never die on a shape
-	// it did not predict: measured in the rpc rig, this line threw `undefined is not an object
-	// (evaluating 'src.run.phases.length')` and the panel arrived as an error notify instead of a
-	// screen. An absent history is simply no critique.
+	// A run state written mid-plan can lack `phases` entirely, and a screen must never die on a
+	// shape it did not predict: `src.run.phases.length` throws `undefined is not an object` on
+	// such a state and the panel arrives as an error notify. An absent history is no critique.
 	const phases = Array.isArray(src.run.phases) ? src.run.phases : [];
 	for (let i = phases.length - 1; i >= 0; i--) {
 		const p = phases[i] as { phase?: string; notes?: unknown };

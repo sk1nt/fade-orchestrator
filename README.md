@@ -5,10 +5,8 @@ An [OMP](https://github.com/earendil-works) coding-agent extension that runs one
 contract (`fade_phase`) moves between them. It is built for a local
 [basalt](https://github.com/sk1nt) router that serves several quantized packs on one GPU and can
 only keep one resident — every design decision below is shaped by the 13–25 s it costs to swap a
-52 GiB pack.
-
-Extracted from the `fadetheworld` trading desk (2026-11-15); the router URL, provider id, and the
-two lane entries are configuration, nothing here is host-specific.
+52 GiB pack. The router URL, provider id, and the two lane entries are configuration; nothing here
+is host-specific.
 
 ## How it works
 
@@ -29,7 +27,7 @@ two lane entries are configuration, nothing here is host-specific.
 
 - **One load site.** The lane swap is issued in `agent_end`, after the turn is closed. A load
   issued into a turn whose chat requests are still queued makes the router swap back to the entry
-  the queued requests name — measured as a 0–2 s ping-pong on 2026-11-14. The orchestrator never
+  the queued requests name — measured live as a 0–2 s ping-pong. The orchestrator never
   pays a swap that a resident entry already covers: `loadLane` settles an in-flight swap first
   and refuses to reload the resident pack (52 GiB re-read for nothing).
 - **Pre-swap gate.** `coding_done` runs every planned check on the code lane *before* the
@@ -52,11 +50,11 @@ two lane entries are configuration, nothing here is host-specific.
   back to the coder. The guard reads the **on-disk** run and enforces only the verifier's turn:
   delegation (`task`) is never blocked (a subagent writes nothing, and its session is inert by the
   rule below), and a session that adopted the thinking lane at start cannot keep refusing the
-  operator's editor after the run left `verifying` — that self-lockout was measured live.
+  user's editor after the run left `verifying` — that self-lockout was measured live.
 - **Checkpoints.** Every task the verifier accepts leaves `omp-ckpt/<run_id>/T<n>-passed` in the
   repo, namespaced per run so two runs on one tree never collide; the tag prints in the overlay.
 - **Delegated sessions are inert.** A subagent shares the cwd, so an unguarded `session_start`
-  adopts the operator's run and drives the router from a session that does not own it (measured:
+  adopts its parent's run and drives the router from a session that does not own it (measured:
   70.1 s of pack swap and 181.7 GiB loaded across two spin-ups, zero verifier tokens).
   `PI_SESSION_FILE` identifies the delegated shape (nested inside a stamped parent-session dir);
   such a session adopts nothing, nudges nothing, loads nothing and cannot start a run.
@@ -78,6 +76,37 @@ two lane entries are configuration, nothing here is host-specific.
   **only** from numbers the router reported: with no `pp`+`tg` available the line is not written —
   the ledger never carries a fabricated zero.
 
+## Screen capture
+
+No clip is stored in the repo. The capture is regenerated from `demo/linkedin.tape` with
+[vhs](https://github.com/charmbracelet/vhs) in a real terminal:
+
+```bash
+npm run demo:record    # needs vhs, tmux and the omp CLI on PATH, and FADE_DEMO_REPO pointing
+                       # at the project the clip shows (default: this package's root)
+```
+
+`demo/recording.mjs` seeds a run in that project's `var/omp-orchestrate/`, starts `omp` with the live
+extension in a 150x45 tmux terminal rooted there, and drives ONE clock: `Alt+F` opens the panel, the
+selection moves, the pre-swap gate lands GREEN on the code lane, `/orchestrate verify` pays a lane
+swap while the status row ramps, the verifier's view carries the measured swap cost, `halt` clears
+the row. The clip lands in `demo/out/` — generated, not shipped.
+
+What is shipped and what is staged, stated plainly:
+
+- **Shipped code, running, measured:** the real `omp` binary, the real extension, the panel renderer,
+  the raw-byte `Alt+F` chord, the act behind `[v]` / `/orchestrate verify`, `POST /v1/load`, the swap
+  watcher and the `swap_history.json` row it writes, the turn ledger, the status row's colour ramp.
+- **Staged:** the run on disk (goal, tasks, phases, gate) and the router. The stub answers with the
+  payload captured from a live lane (`engine 0.4.0`, 13112/24576 expert slots, best decode
+  622 tok/s) and holds the `/v1/load` response until the pack is resident, as the live router does.
+  It binds its own port (18199), so recording can never swap the pack a live session is decoding on.
+- **Nothing in the demo project is destroyed.** Every run file the demo writes is snapshotted first;
+  `npm run demo:stop` kills the demo's processes, restores the snapshot and prints a per-file hash
+  comparison. A live run that happens to be in `var/omp-orchestrate/` is preserved like any other.
+- The grid is measured, not assumed: 1586x1060 at `FontSize 15` / `LineHeight 1.12` / `Padding 26`
+  is 150x45 cells, the terminal `test/pty_rig.mjs` proves the panel in. Check it with `stty size`.
+
 ## Install
 
 ```bash
@@ -95,92 +124,33 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
 | `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane) |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements |
-| `FADE_ORCHESTRATE_KEY` | `alt+f` | the screen's key. The host's own table **binds** `alt+f` (`tui.editor.cursorWordRight`), so `registerShortcut` is **refused** for it and the extension claims the **raw byte**: `onTerminalInput` consumes `ESC f` (`1b 66`) before the host's binding runs, and the pty rig proves the panel opens while `cursorWordRight` does not (the same rig earlier watched ESC `f` move the word, 2026-11-15). `ctrl+o` is `app.tools.expand` and the host **acts** on its own bindings; the pty rig presses `C-o` and requires the extension to open nothing. Free single-alt chords in the measured 38-action table: `alt+c/e/j/q/s/t/u/v/w/x/z`. No host binding is ever moved |
+| `FADE_ORCHESTRATE_KEY` | `alt+f` | the screen's key. The host's own table **binds** `alt+f` (`tui.editor.cursorWordRight`), so `registerShortcut` is **refused** for it and the extension claims the **raw byte**: `onTerminalInput` consumes `ESC f` (`1b 66`) before the host's binding runs, and the pty rig proves the panel opens while `cursorWordRight` does not. `ctrl+o` is `app.tools.expand` and the host **acts** on its own bindings; the pty rig presses `C-o` and requires the extension to open nothing. Free single-alt chords in the host's 38-action table: `alt+c/e/j/q/s/t/u/v/w/x/z`. No host binding is ever moved; [`docs/OVERLAY.md`](docs/OVERLAY.md) carries the full chord history |
 | `FADE_ORCHESTRATE_FALLBACK_KEY` | `alt+shift+i` | the registered companion chord (ESC + uppercase `I`, probe-reported FREE). Registered as a shortcut where the host's probe accepts it, and taken at the raw-input layer like the primary chord; it is what opens the screen when `FADE_ORCHESTRATE_KEY` points at a chord the host holds |
 | `FADE_ORCHESTRATE_SURFACE` | unset | the status line's surface. Default = the host's **top widget** (`placement: aboveEditor`); `status` opts into the host's status-bar row |
 | `FADE_ORCHESTRATE_PANEL_REFRESH_MS` | `2000` | the open screen's refresh tick (floor 500 ms); the tick is `unref`'d and cleared on close |
 | `FADE_ORCHESTRATE_GLYPH` | `󰚩` | the status line's leading glyph; an empty value drops it (a terminal without a Nerd Font) |
-| `FADE_ORCHESTRATE_REDACT` | unset | `1` — or `/orchestrate --demo-redact`, `--demo-redact=off` to put it back — strips the repo path, account, `/home/…`, `~` and this hostname from every rendered **line**, so a screenshot is safe. **Display-only**: `state.json`, `metrics.jsonl` and `swap_history.json` are written verbatim, and a fresh session starts unredacted (gate rig block 21, `test/panel.test.mjs`, `test/rpc_rig.mjs`) |
+| `FADE_ORCHESTRATE_REDACT` | unset | `1` — or `/orchestrate --demo-redact`, `--demo-redact=off` to put it back — strips the repo path, account, `/home/…`, `~` and this hostname from every rendered **line**, so a screenshot is safe. **Display-only**: `state.json`, `metrics.jsonl` and `swap_history.json` are written verbatim, and a fresh session starts unredacted (`test/gate_rig.mjs`, `test/panel.test.mjs`, `test/rpc_rig.mjs`) |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the screen as a widget (110 columns) instead of an overlay component (RPC/print hosts) |
 | `FADE_ORCHESTRATE_BASALT_CONFIG` | unset | the basalt serve config JSON; enables the per-lane MoE placement panel (`expert-profile-save`) |
-| `FADE_ORCHESTRATE_GATE_CMD_TIMEOUT_MS` | `300000` | the pre-swap gate's per-command wall budget; the rig class measured 180.8 s (`node test/rpc_rig.mjs`), so a 120 s constant could never leave the round |
-| `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | Y9: the fast path's bound — a gate-green round that touched ≤ 1 file and < 15 changed lines on the FIRST try completes with ZERO lane loads; the same round on a 20-line diff pays exactly one swap (gate rig block 22 prices both sides) |
-| `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | Y10: the pre-unload floor. A router that reports free VRAM under it — or zero/negative, an error state, a loaded context that names no model, a swap still in flight, or no answer at all — **refuses** the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
+| `FADE_ORCHESTRATE_GATE_BUDGET_MS` | `60000` | the pre-swap gate's per-command wall budget; the rigs shrink it so the timeout class is proved in milliseconds |
+| `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | the fast path's bound — a gate-green round that touched ≤ 1 file and < 15 changed lines on the FIRST try completes with ZERO lane loads; the same round on a 20-line diff pays exactly one swap (`test/gate_rig.mjs` prices both sides) |
+| `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | the pre-unload floor. A router that reports free VRAM under it — or zero/negative, an error state, a loaded context that names no model, a swap still in flight, or no answer at all — **refuses** the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
 | `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the health line the window ENDS on is the gate's evidence. The rigs shrink it so the hung-context class is proved in milliseconds |
 
-## Publish and tree parity
+## Surface and commands
 
-`deploy/omp/` in the fade repo is the split **source**: `scripts/ops/orchestrator_publish.sh` maps
-it to this repo with `git subtree split` (history preserved) and, before any push, proves the
-split's tree equals `deploy/omp` at HEAD and names the divergence class — a push that would discard
-remote commits **refuses** unless `--force` is passed deliberately (measured 2026-11-15: five
-commits lived on the clone and were not in the split; the old blind `--force` deleted them).
-
-The clone you install from is a **consumer**: keep it at the split head
-(`git fetch && git reset --hard <split>`), and in the fade repo run
-`scripts/ops/omp_tree_parity_check.sh` — exit 0 `trees equal` (compared by tree object id), exit 1
-`BREAK` naming every differing path, exit 2 a named `SKIP clone_missing`. The clone is the code the
-extension **loads** (the `fade_orchestrate.ts` symlink resolves into it); the split is the code that
-**ships**; this gate is what stops those from becoming two different programs.
-
-## Surface
-
-The operator gets **one line** all day and **one screen** on demand. Both are specified in
-[`docs/OVERLAY.md`](docs/OVERLAY.md) — layout, metrics, keys, the surface switch, the measured
-reason the screen rides `Alt+F` at the raw-input layer while `Ctrl+O` stays the host's, and how that is
-disclosed at startup. The
-chord is wired twice on purpose: registered as a shortcut (`pi.registerShortcut(FADE_KEY)`, so the
-host parses it) **and** taken at the raw-input layer (`onTerminalInput`, so the byte is consumed
-wherever the host's shortcut table declines it).
+The loop shows **one status line** — one row on the top widget, above the editor, only while a run
+is live; while a lane is loading the row turns **multicolored** (a per-character hue ramp whose
+phase rides the load percent) and names the incoming pack — and **one screen** on `Alt+F`, in the
+shape of the host's own agents panel. The surface is an env switch: `FADE_ORCHESTRATE_SURFACE=status`
+opts into the host's status-bar row. The single authority for the surface — the status line's
+format, the ramp, the model-naming rule, the chord's measured history, the panel's rows and keys,
+redaction, and the proof inventory — is [`docs/OVERLAY.md`](docs/OVERLAY.md).
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run (preflights the router: think lane must load).
 - `/orchestrate status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`
+- `/orchestrate handover` — send the condensed digest now (any time, mid-run).
 - `/lanes` — live router census (both entries' status + `/health`).
-- **The status line** — one row on the top widget, above the editor, only while a run is live:
-  `󰚩 Orchestrator: code R1/6 · T2/5 · [Alt+F]`, with `· protocol <n>/3` while the Tier-1 counter
-  runs, `· paused` while the loop is parked and a tok/s suffix when the router reports one. While a
-  lane is loading, the state segment becomes the switch and the row turns **multicolored** — a
-  per-character hue ramp whose phase rides the load percent, so it visibly moves on every sample:
-  `Orchestrator: switching deepseek→flash-next (IQ3_S, dual) 47% · [Alt+F]`. Color means *working*:
-  the steady row ships no escape codes at all. The line is **cleared** — the widget removed — on a
-  terminal run (`complete`/`failed`/`stopped`, including a run adopted from disk at `session_start`)
-  and when this session does not own the run.
-  The bracket names the chord that **opens the screen**: the configured chord while the host's probe
-  reports it FREE, the fallback chord when the host holds the configured one — never the held key
-  itself.
-- **Model names are abbreviated, and named exactly once.** The form is
-  `<model> (<QUANT>, <GPU count>)` — `flash-next (IQ3_S, dual)`, `deepseek (IQ1_M, dual)`; version,
-  family word and the RAM/SSD tier are dropped, because the quant and the GPU count are the two
-  facts that change the loop's economics. The single place the name rides on the screen is the
-  engine column's `resident` row; the panel's lane line carries the lane KEYS with the `◆resident`
-  marker, and the steady status line names no model at all (the host's model segment is the model's
-  surface; the switching row names the incoming lane, because that is what the switch is about).
-  Printing the same model twice was the operator's objection, so the surfaces are split:
-  one line for the loop's state, one row for the engine's identity.
-- **`Alt+F`** — the orchestration screen, in the shape of the host's own agents panel. The host's table
-  binds `alt+f` to `tui.editor.cursorWordRight`, so the SHORTCUT is refused and the extension takes the
-  byte: `onTerminalInput` consumes `ESC f` and the host's action does not run (pty rig, 2026-11-15).
-  `ctrl+o` (the operator's first ask) is `app.tools.expand`, and a built-in binding is ACTED ON, not
-  skipped — a raw `C-o` printed `Tool output expansion: enabled` and never reached the extension
-  (measured); `alt+o` is `app.links.hint`. `alt+shift+i` is the registered fallback and
-  `/orchestrate overlay` the command path. The screen: a header
-  (run, state, round, tier, age, refresh clock, the lane KEYS with the `◆resident` fact), a **selectable**
-  task list whose selected task carries its files, deps, acceptance, result and checkpoint tag, the
-  phase rail with the lane that produced each phase, the engine column (engine version — the router
-  publishes no quantization, so the quant rides in the resident row's label — the abbreviated
-  resident model, expert slots and spill, decode tok/s, best recent, prefix-cache hit, MoE
-  placement, the host's context meter, the last pre-swap gate), the swap ledger with the measured
-  cost and ramp, the last verifier critique, recent rejections, the lane-flip guard, and a
-  `NOT MEASURED` block naming every number nobody measured. Keys: `↑↓`/`j-k` select, `PgUp/PgDn/g/G`
-  scroll, `s` skip, `v` verify, `r` reset, `p` pause, `c` code, `h` halt, `esc` close — the bar
-  WRAPS rather than clips, because a key the operator cannot see is a key they will not press. It
-  re-reads on a 2 s tick, so the numbers move while you watch. The keystroke is taken at the
-  raw-input layer and **no host binding is moved**: the pty rig presses `ctrl+o` and requires the
-  host's own toggle to fire (its notify count increasing) while the panel stays closed. `esc` closes the
-  screen in EVERY encoding the host's parser recognizes — the legacy byte, the Kitty keyboard-protocol
-  CSI-u sequence (`ESC [ 2 7 u`) and xterm's `modifyOtherKeys` — because a panel comparing only `\x1b`
-  is dead on kitty, wezterm, ghostty and foot, where ESC arrives as CSI-u; tmux's `screen` terminal has
-  no Kitty protocol, which is why the old rig passed with ESC dead at the desk.
 
 State lives in `<cwd>/var/omp-orchestrate/`: `ACTIVE.json`, `state.json` (schema v2: rejection
 history by kind — `verification` / `schema` / `task` / `protocol` — tier, schema retries, gate
@@ -202,7 +172,7 @@ Measured engine facts (`docs/configuration/index.md` of basalt 0.4.0):
 | `expert-profile-save` | **Flash-Next only.** Saves the adaptive tier's placement on exit and every `expert-profile-save-every` minutes; a start places from it. Needs the adaptive tier. |
 | `expert-profile` | Which experts start in VRAM (default `data/profiles/<arch>-<layers>x<experts>.prof`). |
 
-Operator act (per lane, host config, not this package):
+The act (per lane, host config, not this package):
 
 1. in the serve config's model entry add
    `"expert-profile-save": "<repo>/var/basalt-profiles/<alias>.prof"` and
@@ -215,15 +185,15 @@ The overlay then shows `MoE <lane>: live · 2.4 h old · warm start`. Three stat
   carry the flag (a config edit without a reload is exactly this).
 - **unsupported** — DeepSeek-V4.1 has no save path in engine 0.4.0 (only the pack's static
   profile, `src/models/deepseek41/tier.cpp`; `write_expert_profile` is wired only by the qwen4exp
-  `--expert-profile-save` path). The verifier pack relearns placement on every swap and cannot be
-  made warm by configuration.
+  `--expert-profile-save` path). The thinking lane's pack relearns placement on every swap and
+  cannot be made warm by configuration.
 
 ## Why the thinking lane pins `IQ1_M` (not `IQ2_XXS`)
 
 Both DeepSeek packs can be served under two aliases; this package defaults the plan/verify lane to
-the **IQ1_M** pack because it stays resident where IQ2_XXS spills. On the host that measured this,
-the second alias was retired after the decision — the numbers, method and receipts are what is kept. Measured on
-one host (122 GiB RAM, 2 × 32.6 GiB VRAM, identical settings both sides):
+the **IQ1_M** pack because it stays resident where IQ2_XXS spills, and IQ2's spill costs ~2.8×
+decode. Measured on a reference host (122 GiB RAM, 2 × 32.6 GiB VRAM, identical settings both
+sides):
 
 | | expert slots | spill | decode (warm) | wall, short answer |
 |---|---:|---|---:|---:|
@@ -234,11 +204,9 @@ IQ2 is the accuracy favourite on the KL/top-1 arms (0.2408 / 85.15 % vs 0.2779 /
 the other way, 3.1074 vs 3.0456) and a 10-question deterministic spot check tied at 10/10 — so the
 choice is throughput, not knowledge. The overlay makes it visible: the **expert slots** row prints
 the engine's own `spill`, and `spill.experts > 0` is the signal that the pack is served from disk.
-Full numbers, method and the reproduce-anywhere commands: [`docs/quant-choice.md`](docs/quant-choice.md).
-
-An alias costs nothing *while you are deciding*: swaps are `POST /v1/load {"model":"<alias>"}` and
-clients wait through them, so an A/B is one request, never a restart. Once decided, drop the alias —
-the verified pack, the numbers and the receipts are the record, and the served mapping is the answer.
+Swaps are `POST /v1/load {"model":"<alias>"}` and clients wait through them, so an A/B is one
+request, never a restart. Full numbers, method and the reproduce-anywhere commands:
+[`docs/quant-choice.md`](docs/quant-choice.md).
 
 ## Fast handover (getting a fresh lane on topic)
 
@@ -248,7 +216,7 @@ goal, phase contract, task definitions, then statuses, gate tails, rejections an
 diff stat — and orders it **stable first, volatile last**.
 
 Why that order: basalt's conversation cache reuses a request's prefix, and `/metrics` reports it
-per request (`hit_rate`, `reused`). Measured on this host: `hit=44.9%` early,
+per request (`hit_rate`, `reused`). Measured on a reference host: `hit=44.9%` early,
 `hit=82.3%` once the prefix settles; a 106k-token prompt prefills in **3.5 s at 1,499 tok/s**
 (`pp=111459`), so the same prompt served again with an 82% hit finishes its prefill in 0.5 s.
 The orchestrator's handover is 2–6k tokens: tenths of a second, and stable-first keeps the hit
@@ -262,36 +230,30 @@ Ways to load it:
 - every lane-switch briefing already carries the previous round's results, rejections and the
   last verifier critique.
 
-## The closed rows, and the command that proves each
-
-| Row | What it ships | Proof |
-|---|---|---|
-| Y3 | the pre-swap gate owns the swap: a RED gate issues ZERO `POST /v1/load` and lands a task rejection; a GREEN gate pays exactly ONE lane load | `node test/gate_rig.mjs` (blocks 4-5) |
-| Y4 | the verifier's words reach the NEXT round per task: the repair and window briefings carry that task's own rejections, never the run's whole history | `node test/core.test.mjs` |
-| Y7 | one repair round carries the whole task window (the 3-task cap is honored), so a repair is one dispatch, not one per task | `node test/core.test.mjs` |
-| Y8 | the round budget is the PLAN's: a `complexity` tier per task (`trivial` 2 / `standard` 4 / `deep` 6) sets the cap, the measured count curve is the fallback, `--rounds` is the ceiling | `node test/core.test.mjs` |
-| Y9 | the fast path: gate green + ≤ 1 file + < 15 changed lines + first try ⇒ the round completes with ZERO lane loads; the same round on a 20-line diff pays exactly one swap, and a rejected round is not a first try | `node test/gate_rig.mjs` (block 22) |
-| Y10 | the pre-unload gate: an error state, zero/low free VRAM, a loaded context naming no model, a swap in flight, or an unreachable router REFUSES the lane load with the class named, and no byte is sent | `node test/load_hostile.mjs` |
-| Y14 | the repair prompt is compact: diff stat + the checklist + the rejections, and the prior rounds' tool logs are NOT replayed into it | `node test/core.test.mjs` |
-| Y19 | `--demo-redact` masks the repo path, account, home and hostname on every rendered line, leaves the durable files verbatim, and is reversible (`--demo-redact=off`) | `node test/gate_rig.mjs` (block 21), `node test/panel.test.mjs`, `node test/rpc_rig.mjs` |
-
 ## Tests
 
 ```bash
-npm test                 # 138 unit tests: keymap, state v2, gate, MoE, history, livedata, the
+npm test                 # 149 unit tests: keymap, state v2, gate, MoE, history, livedata, the
                          # screen's renderer (every ESC encoding closes), the screen's data
                          # contract, the status line
-npm run test:gate        # fake-pi + stub router: the whole phase protocol, the pre-swap gate
-                         # (zero loads on red), the Alt+F raw listener, the Y9 fast path, the
-                         # --demo-redact surface, the top-widget surface
-node test/load_hostile.mjs # Y10: a hostile /health (error state, zero/low VRAM, no model, swap
-                         # in flight, unreachable) issues ZERO POST /v1/load with the class named
-npm run test:pty         # the real terminal: tmux + the omp binary + the live extension,
-                         # FADE_ORCHESTRATE_LIVE_SMOKE=1 (host-only: it needs omp and tmux)
-node test/rpc_rig.mjs    # headless proof through `omp --mode rpc`: the line, the screen's
-                         # content, the redaction OFF half, skip/halt persistence (needs the omp
-                         # CLI; runs ~90 s)
+npm run test:gate        # the gate rig — a host-less CI gate (fake pi + stub router): the whole
+                         # phase protocol, the pre-swap gate (zero loads on red), the Alt+F raw
+                         # listener, the fast path, the --demo-redact surface, the top-widget
+                         # surface
+node test/load_hostile.mjs # the pre-unload gate against a hostile /health (error state,
+                         # zero/low VRAM, no model, swap in flight, unreachable): ZERO
+                         # POST /v1/load with the class named
+npm run test:pty         # the pty rig — host-only, needs the omp CLI and tmux: the real
+                         # terminal, the live extension, FADE_ORCHESTRATE_LIVE_SMOKE=1
+node test/rpc_rig.mjs    # the rpc rig — host-only, needs the omp CLI: headless proof through
+                         # `omp --mode rpc`: the line, the screen's content, the redaction OFF
+                         # half, skip/halt persistence (runs ~90 s)
 ```
+
+`dist/index.js` is a **generated bundle** — the esbuild output of `src/*.ts`, committed so the
+tree carries a loadable single file; the unit tests and rigs import the bundle
+`test/build.mjs` writes into `.test-build/`, not `dist/`. `demo/out/` screen captures are
+generated by `npm run demo:record` and are not shipped.
 
 The rigs drive the command surface with the router pointed at a closed port: the status line must
 render with nothing networked, and the screen must name every number it cannot measure. RPC carries
@@ -310,10 +272,10 @@ missing repo instead of inventing working-tree evidence, and checkpoint tags are
 Both rigs seed their root with `git init` + a commit for the same reason.
 
 **The rigs strip the caller's session identity.** `isDelegatedSession` treats a session whose jsonl
-sits inside a dated parent dir as a delegated subagent — the shape that makes a worker inert on the
-operator's run. A rig launched from a `task` agent inherits that agent's `PI_SESSION_FILE`, so every
+sits inside a dated parent dir as a delegated subagent — the shape that makes a worker inert on its
+parent's run. A rig launched from a `task` agent inherits that agent's `PI_SESSION_FILE`, so every
 launched `omp` was classified delegated: the status row suppressed by the `owned` rule and
-`/orchestrate plan` refused (measured 2026-11-15 — 17 pty checks failed against a bare TUI frame with
+`/orchestrate plan` refused (17 pty checks failed against a bare TUI frame with
 `orchestrate: no run active` as the only extension line, and the rpc stream carried the refusal
 verbatim). The rpc rig deletes `PI_SESSION_FILE`/`PI_SESSION_ID` from the child env; the pty rig
 launches through `env -u PI_SESSION_FILE -u PI_SESSION_ID`. The child host then owns its session
@@ -323,17 +285,19 @@ identity (`--no-session`), which is what the rig is measuring.
 
 ```
 src/index.ts      extension wiring: tool, commands, hooks, lane switching, the panel's raw-key listener
-src/core.ts       state machine data half: schema v2, validation, briefings (Y4 per-task critique,
-                  Y14 compact repair), the gate runner, the Y7 window
-src/router.ts     basalt router client: listLanes/laneHealth/loadLane + the Y10 pre-unload gate
+src/core.ts       state machine data half: schema v2, validation, briefings (per-task critique,
+                  compact repair), the gate runner, the task window
+src/router.ts     basalt router client: listLanes/laneHealth/loadLane + the pre-unload gate
 src/ui.ts         the status line, the model label, the ramp, the redactor
 src/panel.ts      the Alt+F screen: layout, scroll, keys (every ESC encoding), both surfaces
 src/screendata.ts the screen's data contract: every row, and the name of every missing number
 src/keymap.ts     s/v/r/c/h actions, pure over RunState
 src/livedata.ts   /metrics + /health readers, swap watcher, cold/hot
 src/history.ts    swap and turn ledger stores
+src/moe.ts        per-lane MoE placement: the serve config, the live/unsupported states
 test/             unit tests, the gate rig (fake host), the RPC rig, the pty rig (real terminal)
 docs/OVERLAY.md   the surface: layout, metrics, keys, redaction, proof inventory
+docs/quant-choice.md the IQ1_M pin: the measurement, the method, the reproduce commands
 ```
 
 ## License

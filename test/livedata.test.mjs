@@ -1,7 +1,8 @@
 /**
  * livedata + history unit tests: the pure readers behind the overlay (rates from /metrics
  * request durations, cold/hot against the lane baseline, tier rows) and the swap-history store
- * (append, newest-first order, cap), the Y12 ramp class, and the Y18 per-turn JSONL ledger. No network: fixtures are the measured /metrics shapes.
+ * (append, newest-first order, cap), the ramp class, and the per-turn JSONL ledger. No network:
+ * fixtures are the measured /metrics shapes.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -44,7 +45,7 @@ test("tiersFromMetrics: engine/quant/slots/spill rows from the measured 0.4.0 pa
 		loading: false,
 		percent: null,
 		requests: [{ model: "strata-flash/deepseek", prompt_n: 1000, durations: [10, 0.0077, 0.0077, 0.0077, 0.0077] }],
-		at_utc: "2026-11-15T00:00:00Z",
+		at_utc: "2030-01-01T00:00:00Z",
 	});
 	const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
 	assert.equal(byLabel["engine"], "0.4.0 quant IQ1_M");
@@ -66,7 +67,7 @@ test("tiersFromMetrics: the IQ1 lane reads zero spill, which is the whole choice
 		queue: 0,
 		tok_s: 130,
 		loaded: "deepseek",
-		at_utc: "2026-11-15T00:00:00Z",
+		at_utc: "2030-01-01T00:00:00Z",
 	});
 	const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
 	assert.match(byLabel["expert slots"], /2200 · spill 0\/15360/);
@@ -131,7 +132,7 @@ test("swap history: newest-first, capped at 200, survives re-read", () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-hist-"));
 	try {
 		for (let i = 0; i < 210; i++) {
-			appendSwap(dir, { from: "a", to: "b", elapsed_s: i, first_tg: 91, steady_tg: 130, percent_path: [10, 42, 100], at: `2026-11-15T00:00:${String(i % 60).padStart(2, "0")}Z` });
+			appendSwap(dir, { from: "a", to: "b", elapsed_s: i, first_tg: 91, steady_tg: 130, percent_path: [10, 42, 100], at: `2030-01-01T00:00:${String(i % 60).padStart(2, "0")}Z` });
 		}
 		const rows = readSwaps(dir);
 		assert.equal(rows.length, 200);
@@ -165,10 +166,10 @@ test("rampClass: the measured 91 ramp is cold, 130 steady is hot, a restored MoE
 	assert.equal(rampClass(91, false, 90), "hot_steady", "the steady line is an argument, not a magic number");
 });
 
-test("swap history: elapsed_ms and the Y12 ramp class survive the round trip", () => {
+test("swap history: elapsed_ms and the ramp class survive the round trip", () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-hist-"));
 	try {
-		appendSwap(dir, { from: "deepseek", to: "flash-next", elapsed_s: 14.2, elapsed_ms: 14200, ramp: rampClass(480, false), first_tg: 480, steady_tg: 647, percent_path: [12, 100], at: "2026-11-15T09:12:32Z" });
+		appendSwap(dir, { from: "deepseek", to: "flash-next", elapsed_s: 14.2, elapsed_ms: 14200, ramp: rampClass(480, false), first_tg: 480, steady_tg: 647, percent_path: [12, 100], at: "2030-01-01T09:12:32Z" });
 		const rows = readSwaps(dir);
 		assert.equal(rows.length, 1);
 		assert.equal(rows[0].elapsed_ms, 14200, "the row keeps the transition timer's own unit (measured 14.2 s)");
@@ -178,7 +179,7 @@ test("swap history: elapsed_ms and the Y12 ramp class survive the round trip", (
 	}
 });
 
-const ID = { run_id: "20261115T091232Z-rqtj", turn: 3, round: 1, phase: "coding_done", swap_ms: 14200, round_outcome: "accepted" };
+const ID = { run_id: "20300101T091232Z-rqtj", turn: 3, round: 1, phase: "coding_done", swap_ms: 14200, round_outcome: "accepted" };
 
 test("turnRecordOrNull: an unreachable router yields NO record, so metrics.jsonl is never created", () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-turn-"));
@@ -209,8 +210,8 @@ test("turnMetricsFrom: pp from prompt_ms, tg from durations, kv_hit_pct from the
 });
 
 test("turnRecordOrNull: the record carries the four numbers, and only the numbers it was given", () => {
-	const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3 }, { ...ID, ts: "2026-11-15T09:12:32Z" });
-	assert.deepEqual(rec, { ts: "2026-11-15T09:12:32Z", run_id: ID.run_id, turn: 3, round: 1, phase: "coding_done", pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3, swap_ms: 14200, round_outcome: "accepted" });
+	const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3 }, { ...ID, ts: "2030-01-01T09:12:32Z" });
+	assert.deepEqual(rec, { ts: "2030-01-01T09:12:32Z", run_id: ID.run_id, turn: 3, round: 1, phase: "coding_done", pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 82.3, swap_ms: 14200, round_outcome: "accepted" });
 	const sparse = turnRecordOrNull({ pp: 1499, tg: 480 }, { ...ID, phase: undefined });
 	assert.deepEqual(Object.keys(sparse).sort(), ["pp", "round", "round_outcome", "run_id", "swap_ms", "tg", "ts", "turn"], "no ttft/hit reported means no key, not a zero");
 });
@@ -219,7 +220,7 @@ test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt li
 	const dir = mkdtempSync(join(tmpdir(), "orch-turn-"));
 	const file = join(dir, "metrics.jsonl");
 	try {
-		const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 44.9 }, { ...ID, ts: "2026-11-15T09:12:32Z" });
+		const rec = turnRecordOrNull({ pp: 1499, tg: 130, ttft: 3.5, kv_hit_pct: 44.9 }, { ...ID, ts: "2030-01-01T09:12:32Z" });
 		assert.ok(rec);
 		appendTurn(dir, rec);
 		assert.equal(readFileSync(file, "utf8").split("\n").filter((l) => l !== "").length, 1, "EXACTLY one line");
@@ -227,7 +228,7 @@ test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt li
 		const next = { ...rec, turn: 4, tg: 480, swap_ms: 0 };
 		appendTurn(dir, next);
 		appendFileSync(file, "{not json\n");
-		appendFileSync(file, '{"ts":"2026-11-15T09:13:00Z"}\n');
+		appendFileSync(file, '{"ts":"2030-01-01T09:13:00Z"}\n');
 		const all = readTurns(dir, 10);
 		assert.equal(all.length, 2, "a hand-corrupted line and a numberless line are skipped, not fatal");
 		assert.deepEqual(readTurns(dir, 1), [next], "readTurns returns the LAST n");
@@ -239,7 +240,7 @@ test("appendTurn/readTurns: exactly one line per turn, round-trips, a corrupt li
 	}
 });
 
-// The measured 2026-11-15 live shapes: spill_experts ABSENT (the 0.4.0 /metrics has no spill_used
+// The captured live shapes: spill_experts ABSENT (the 0.4.0 /metrics has no spill_used
 // key — null, NOT a zero), ssd_share null on every request, pcie_share reported (~0.54).
 test("an absent spill reading is named, never zeroed, with the slots total riding", () => {
 	const rows = tiersFromMetrics({ quant: "IQ1_M", slots: 2200, spill_total: 15360, requests: [], at_utc: "x" });

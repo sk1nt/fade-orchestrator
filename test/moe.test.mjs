@@ -83,10 +83,10 @@ test("moeRows renders one measured row per lane", () => {
 	}
 });
 
-// ── the config-based liveness, measured on the live shape (2026-11-15) ──────────────────────────
-// The router on this desk is `python -m serve.server --config <file>`: the model knobs reach the
-// engine through the CONFIG file, never argv. An argv-only liveness test called the working
-// flash-next lane "NOT live"; the running router's --config path is the test, and the profile's
+// ── the config-based liveness, written against the live shape ──────────────────────────────────
+// A router serves models from `--config <file>`: the model knobs reach the engine through the
+// CONFIG file, never argv. An argv-only liveness test calls the working lane "NOT live"; the
+// running router's --config path is the test, and the profile's
 // mtime against the engine process start is the write-side proof.
 const liveCfg = (dir) => mkConfig(dir, [{ alias: "flash-next", model: "qwen3.8.basalt", "expert-profile-save": join(dir, "flash-next.prof"), "expert-profile-save-every": 10 }]);
 

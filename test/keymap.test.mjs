@@ -21,7 +21,7 @@ const mkRun = (over = {}) => ({
 	],
 	repair_tasks: [],
 	phases: [],
-	started_utc: "2026-11-15T00:00:00Z",
+	started_utc: "2030-01-01T00:00:00Z",
 	...over,
 });
 

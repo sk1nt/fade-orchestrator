@@ -5,8 +5,7 @@
 //
 // It proves, on frames:
 //   1. `/orchestrate status` paints the pill at the TOP of the editor (a `setWidget` under
-//      `fade-top`) carrying the FULL lane name — the operator's placement order, second act:
-//      only when in use … no footer for now";
+//      `fade-top`) carrying the FULL lane name, and only while a run is in use;
 //   1b. the footer row is NEVER written: ZERO `setStatus` frames (no footer for now);
 //   1c. the pill carries NO flip line while the router is quiet (the flip guard's positive case is
 //      proven on a fake router by gate_rig block 19, where the churn is constructible);
@@ -32,6 +31,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripSessionEnv } from "./fixture.mjs";
 
 const repo = join(tmpdir(), "orch-rpc-rig");
 rmSync(repo, { recursive: true, force: true });
@@ -55,15 +55,14 @@ const state = {
 };
 writeFileSync(join(repo, "var", "omp-orchestrate", "state.json"), JSON.stringify(state, null, 2));
 // Adoption needs BOTH files: `session_start` reads ACTIVE.json AND the state file and returns
-// without painting when either is missing. The rig rewrite lost this seed, which is why the
-// widget checks went silent (run=undefined -> no paint, no loads), not a widget bug.
+// without painting when either is missing. Missing one is the defect class: the widget checks go
+// silent (run=undefined -> no paint, no loads), which reads as a widget bug and is not one.
 writeFileSync(join(repo, "var", "omp-orchestrate", "ACTIVE.json"), JSON.stringify({ run_id: "rpcrig", repo, goal: state.goal, started_utc: state.created_utc, max_rounds: 6 }, null, 2));
 
-// The rig runs against the REAL router (the extension's default, :18014) and the REAL registry:
-// its session model must be a real tool-caller — it calls `fade_phase` — and the only
-// tool-calling provider here is basalt. Stubbing the registry (measured rpc_rig_25) made the model
-// a text-answering stub: `fade_phase` never fired, the loop stalled at protocol 3/3, and no swap
-// was attributable. Against the real router the completions land in the rig's own
+// The rig runs against the REAL router and the REAL registry: its session model must be a real
+// tool-caller — it calls `fade_phase`. Stubbing the registry is the defect class: the model becomes
+// a text-answering stub, `fade_phase` never fires, the loop stalls at protocol 3/3, and no swap is
+// attributable. Against the real router the completions land in the rig's own
 // `var/omp-orchestrate/swap_history.json` (pairs, times, elapsed) — which is exactly what the flip
 // probe merges, so the loop's per-phase loads count as `swaps_by_orchestrator`, never as churn.
 const checks = [];
@@ -74,18 +73,17 @@ const observations = [];
 const observe = (name, detail) => observations.push({ name, detail });
 
 // The session model is the loop's VERIFIER lane (deepseek:auto): the rig's prompts must produce a
-// real `fade_phase` tool call, and the coder lane's IQ3_S entry does not call tools reliably
-// (measured rig_26: three turns, protocol 3/3 stall, zero loads). The verifier lane is the model
-// the loop itself plans/verifies on, so this is the honest choice, and its loads are real and
-// attributable like every other lane actor.
+// real `fade_phase` tool call, and the coder lane's entry does not call tools reliably — its turns
+// stall at protocol 3/3 with zero loads. The verifier lane is the model the loop itself
+// plans/verifies on, so this is the honest choice, and its loads are real and attributable like
+// every other lane actor.
 const rigEnv = { ...process.env };
-// The rig must not inherit the CALLER's session identity. A `task` agent's `PI_SESSION_FILE` is
-// nested inside a dated parent dir, which is exactly the shape `isDelegatedSession` reads as a
-// subagent: inherited, every rig session was classified delegated, the row was suppressed by the
-// `owned` rule and `/orchestrate plan` was refused with "this is a delegated (subagent) session"
-// (measured 2026-11-15, 5 checks failed on the empty frame stream). The child host sets its own.
-delete rigEnv.PI_SESSION_FILE;
-delete rigEnv.PI_SESSION_ID;
+// The rig must not inherit the CALLER's session identity (`fixture.mjs`): a `task` agent's
+// `PI_SESSION_FILE` is nested inside a dated parent dir — the shape `isDelegatedSession` reads as a
+// subagent. Inherited, every rig session is classified delegated, the row is suppressed by the
+// `owned` rule, and `/orchestrate` refuses with "this is a delegated (subagent) session", so the
+// frame stream comes back empty. The child host sets its own identity.
+stripSessionEnv(rigEnv);
 const child = spawn("omp", ["--model", "basalt-deepseek/deepseek:auto", "--mode", "rpc", "--no-session"], {
 	cwd: repo,
 	env: {
@@ -145,12 +143,12 @@ const c2 = frames.length;
 sendCmd("/orchestrate overlay");
 await new Promise((r) => setTimeout(r, 6_000));
 // deepseek:auto OBEYS the systemPrompt literally: with "Reply with exactly: rig" it answers text
-// and the run stalls at protocol 3/3 (measured rig_27: three turns, zero loads). This prompt's
+// and the run stalls at protocol 3/3 with zero loads. This prompt's
 // systemPrompt demands the tool call, and the window covers the verifier lane's cold load (17 s)
 // plus generation.
 sendCmd(`call fade_phase with phase=planning_done and the payload ${JSON.stringify({ tasks: state.tasks.map((t) => ({ id: t.id, objective: t.objective, files: t.files, acceptance: t.acceptance, dependencies: t.dependencies })), checks: state.checks })} exactly as instructed`, "Call the fade_phase tool with exactly the phase and payload from the user message. Emit the tool call.");
 // 30 s: model round-trips are observations, not gates (see below), and the gate runs this rig
-// synchronously inside fade_phase — the operator sees the gate's duration as the 'Working…'
+// synchronously inside fade_phase — its duration shows as a 'Working…' freeze on screen — so the
 // freeze — so the rig keeps the frame-surface facts (which paint at session_start) and stays fast.
 await new Promise((r) => setTimeout(r, 30_000));
 const c3 = frames.length;
@@ -160,8 +158,8 @@ const c4 = frames.length;
 
 // The rpc frame shape (recorded in /tmp/rpc_frames.jsonl): extension_ui_request frames carry the
 // fields FLAT — `method`, `widgetKey`, `widgetLines`, `message`, `notifyType` — not a `params`
-// object. A `params`-reading filter is blind (measured rpc_rig_20/23/24: the pill paints, the
-// filters report zero widgets).
+// object. A `params`-reading filter is blind: the pill paints and the filters report zero
+// widgets.
 const topFrames = frames.filter((f) => f.method === "setWidget" && (f.widgetKey ?? "") === "fade-top");
 const topLines = (f) => (Array.isArray(f?.widgetLines) ? f.widgetLines : []);
 const statusFrames = frames.filter((f) => f.method === "setStatus");
@@ -178,7 +176,7 @@ ok("the host produced extension_ui_request frames at all", frames.length > 0, `f
 
 ok("the status row renders at the TOP of the editor (setWidget fade-top)", topFrames.length > 0, `widgets=${topFrames.length}`);
 ok(
-	"the row is the operator's line: glyph, Orchestrator, state, round, tally, the key",
+	"the row carries glyph, Orchestrator, state, round, tally and the key",
 	topFrames.some((f) => topLines(f).some((l) => /Orchestrator: plan R1\/6 · T0\/1 · \[Alt\+F\]/.test(l))),
 	JSON.stringify(topLines(topFrames[0])),
 );
@@ -194,10 +192,10 @@ ok(
 );
 ok("the retired multi-line task dump above the editor is never emitted", dump.length === 0, JSON.stringify(dump.map((f) => f.widgetKey)));
 // `/orchestrate plan` is NOT a subcommand (the command list is status | overlay | skip | verify |
-// reset | pause | code | halt | stop, index.ts:614): with a live run it falls to the start path and
-// refuses — "run rpcrig is still planning; /orchestrate stop first" — which IS the immediate
-// answer the check exists for (the historical failure was NOTHING on screen for 43 s). The check
-// reads the answer frame; the nudge frame, if any, must not precede it.
+// reset | pause | code | halt | stop): with a live run it falls to the start path and refuses —
+// "run rpcrig is still planning; /orchestrate stop first" — which IS the immediate answer the
+// check exists for: the defect is a command leaving NOTHING on screen. The check reads the answer
+// frame; the nudge frame, if any, must not precede it.
 const planFrame = frames.slice(c0, c3).find((f) => f.method === "notify" && frameText(f).includes("rpcrig"));
 ok("the command answers on its OWN frame, immediately", planFrame !== undefined, JSON.stringify(frames.slice(c0, c3).map((f) => f.method)));
 const planIdx = frames.findIndex((f) => f.method === "notify" && frameText(f).includes("rpcrig"));
@@ -209,19 +207,19 @@ const longText = state.tasks[0].objective;
 // The overlay body is wrapped at 110 columns, so the comparison is whitespace-normalized: the
 // task text has to be present WHOLE, not truncated, once the wraps are removed.
 const flat = (t) => t.replace(/\s+/g, "");
-// OBSERVATION, not a gate: whether the synthetic session's MODEL cooperates and calls
-// `fade_phase` (8 runs rig_23..30: the lane model ends these turns text-only, protocol 3/3,
-// while every widget/pill/halt/frame assertion is green). The row's assertion — the operator's
-// row text — is the widget surface; the phase-acceptance protocol itself is gated in milliseconds
-// by gate_rig blocks 1-19. The observation keeps the model behavior visible.
+// OBSERVATION, not a gate: whether the synthetic session's MODEL cooperates and calls `fade_phase`
+// (the lane model tends to end these turns text-only, protocol 3/3, while every widget/pill/halt/
+// frame assertion is green). The row's assertion — the row TEXT — is the widget surface; the
+// phase-acceptance protocol itself is gated in milliseconds by gate_rig blocks 1-19. The
+// observation keeps the model behavior visible.
 observe("overlay carries the task text (model round-trip)", JSON.stringify({ frames: overlayFrames.map((f) => frameText(f).length), whole: overlayFrames.some((f) => flat(frameText(f)).includes(flat(longText))) }));
 const widest = Math.max(0, ...overlayFrames.flatMap((f) => frameText(f).split("\n").map((l) => l.length)));
 // The 110-column bound is the TTY overlay's wrap; the rig IS headless (it sets the child's
-// FADE_ORCHESTRATE_HEADLESS=1), and the headless notify carries RAW lines (measured widest=241),
+// FADE_ORCHESTRATE_HEADLESS=1), and the headless notify carries RAW lines far over 110,
 // so the rig asserts the notify's own bound — the check's subject is UNTRUNCATED text.
 observe("overlay width (headless notify)", `widest=${widest}`);
-// The rig's gate command passes, so the gate is published GREEN on the pill — the operator's
-// "is the tree green" question answered without opening the transcript.
+// The rig's gate command passes, so the gate is published GREEN on the pill: "is the tree green"
+// answered without opening the transcript.
 observe("pill gate tally (model round-trip)", JSON.stringify(topFrames.map(topLines).slice(-2)));
 // The accepted phase has to land in the durable state, not only on screen.
 const advanced = JSON.parse(readFileSync(join(repo, "var", "omp-orchestrate", "state.json"), "utf8"));
@@ -246,9 +244,9 @@ ok("halt clears the top widget: a run not in use leaves nothing on screen", fram
 // same collector and the same renderer the key binds to, so the frame carries the operator's columns.
 // The task tally is matched by GRAMMAR, not by a number: this rig runs `/orchestrate plan`, and the
 // planner rewrites the task list from its own payload, so a pinned `0/2` asserts the planner's output.
-// Measured 2026-11-15: the panel rendered `TASKS 0/1 passed` with the T1 row, its files, deps and
-// acceptance, `ENGINE / ROUTER`, `LANE SWAPS` and `[esc] close` — every section present — and the
-// check failed on the number alone.
+// The defect this pins: the panel rendered every section — the T1 row, its files, deps and
+// acceptance, `ENGINE / ROUTER`, `LANE SWAPS`, `[esc] close` — and the check failed on the number
+// alone.
 ok(
 	"the panel renders the run's header, the task list, the engine column and the swap cost",
 	(() => {

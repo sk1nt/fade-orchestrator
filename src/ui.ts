@@ -1,20 +1,18 @@
 /**
  * The status row and the redaction boundary.
  *
- * Main pane: ONE status line at the TOP, docked above the editor, in the operator's own words
- * (2026-11-15: "use a nerdfont … and just say Orchestrator: plan R1/6 T0/0"):
+ * Main pane: ONE status line at the TOP, docked above the editor:
  *   󰚩 Orchestrator: plan R1/6 · T0/0 · [Alt+F]
- * and NOTHING multi-line above the editor while a run is live (the monolith painted a 6+ line task
- * dump there; during long coding runs that dump ate the transcript).
+ * and NOTHING multi-line above the editor while a run is live — a multi-line task dump there eats
+ * the transcript during long coding runs.
  *
  * Placement. The row lives in `ctx.ui.setWidget(TOP_WIDGET_KEY, …)`. The host's status BAR cannot
- * carry it where the operator first asked — immediately after the model name — measured in the
- * host's own renderer: `setStatus` text is printed in the `status` segment at the position the
- * USER's `statusLine.leftSegments`/`rightSegments` put it (on this box: the right side, after
- * `context_pct`), and an extension has no API to add a status-line segment or to move one. So the
- * top row is the delivered surface, and `FADE_ORCHESTRATE_SURFACE=status` opts into
- * `ctx.ui.setStatus(ORCH_STATUS_KEY, …)` for a config that placed the `status` segment after
- * `model`. The footer extension-status row is otherwise never written ("no footer for now").
+ * carry it immediately after the model name: `setStatus` text prints in the `status` segment at
+ * the position the USER's `statusLine.leftSegments`/`rightSegments` put it, and an extension has
+ * no API to add a status-line segment or to move one. So the top row is the delivered surface,
+ * and `FADE_ORCHESTRATE_SURFACE=status` opts into `ctx.ui.setStatus(ORCH_STATUS_KEY, …)` for a
+ * config that placed the `status` segment after `model`. The footer extension-status row is
+ * otherwise never written.
  *
  * The row is written ONLY while a run is in use: `statusLines` answers `undefined` for no run, for
  * a terminal state (`complete`/`failed`/`stopped`, including a run adopted from disk at
@@ -22,7 +20,7 @@
  * every one of those cases.
  *
  * `chordBytes` maps the configured key to the raw byte the raw-input listener consumes: the host
- * reserves `ctrl+o` in its shortcut table (measured: a reserved chord is logged and skipped by
+ * reserves `ctrl+o` in its shortcut table (a reserved chord is logged and skipped by
  * `getShortcuts()`), so the panel is delivered by intercepting the keystroke, never by registering it.
  */
 import { hostname, userInfo } from "node:os";
@@ -44,8 +42,8 @@ export const ORCH_STATUS_KEY = "fade-orch";
 
 /**
  * `FADE_ORCHESTRATE_REDACT=1` makes the bar safe to screenshot: no username, no home path, no
- * hostname, no repo path. Read at call time, so the operator can flip it per run and the headless
- * rig can assert both branches. Display-only: `state.json`, `metrics.jsonl` and
+ * hostname, no repo path. Read at call time, so it can flip per run and the headless rig can
+ * assert both branches. Display-only: `state.json`, `metrics.jsonl` and
  * `swap_history.json` are written by other modules, and the on-disk record stays verbatim.
  */
 export function redactOn(): boolean {
@@ -84,7 +82,7 @@ function machine(): string {
  * The literals go longest-first: the repo path sits under the home directory, so masking the home
  * prefix first would leave `/projects/<repo>` — the repo name — on screen. Only the render
  * boundary (`pill`, `statusTag`, `overlayLines`, and the widget they feed) calls this, which is
- * what keeps the operator's durable record lossless.
+ * what keeps the durable record lossless.
  */
 export function redact(text: string, on: boolean, repo?: string): string {
 	if (!on) return text;
@@ -117,12 +115,11 @@ export function orchGlyph(): string {
  *  - `ctrl+<letter>` is a control code: `ctrl+o` -> 0x0f.
  *  - `alt+<letter>` is ESC + the letter: `alt+f` -> `\x1bf`.
  *  - `alt+shift+<letter>` is ESC + the uppercase letter, so it is byte-distinct from `alt+<letter>`
- *    — and this is the family the panel lives in: the host's runtime reports `alt+f` bound to
- *    `tui.editor.cursorWordRight` and `alt+shift+f` FREE (measured through its own conflict probe).
+ *    — and this is the family the panel lives in: the host's runtime binds `alt+f` to
+ *    `tui.editor.cursorWordRight`, and `alt+shift+f` is free.
  *
  * `ctrl+shift+<letter>` is deliberately NOT here: on a TTY, shift is invisible inside a control
- * code, and that is measured, not inferred — in the pty rig a `ctrl+shift+t` keystroke arrived as
- * `ctrl+t` and ran the host's ctrl+t action, and the pane answered "Thinking blocks: visible".
+ * code, so a `ctrl+shift+t` keystroke arrives as `ctrl+t` and runs the host's ctrl+t action.
  * A chord that must be distinct from a control code has to be an `alt+…` chord.
  */
 export function chordBytes(key: string): string | undefined {
@@ -147,12 +144,13 @@ export function keyLabel(key: string): string {
 }
 
 /**
- * The model segment, abbreviated to the operator's form of 2026-11-15:
+ * The model segment, abbreviated:
  *   "flash-next (Swift Flash Next IQ3_S, dual RTX 5090)"                        -> "flash-next (IQ3_S, dual)"
  *   "deepseek (Basalt DeepSeek-V4.1-Flash UD-IQ1_M, dual RTX 5090, 122 GiB SSD)" -> "deepseek (IQ1_M, dual)"
  * The quant and the GPU count are the two facts that change the loop's economics; the version, the
  * family word and the RAM tier are noise on a 100-column row. A name carrying neither passes its
- * base segment through, so an unknown model is never masked.
+ * base segment through, so an unknown model is never masked. This is the single place the model
+ * naming rule lives: every surface that prints a model name defers to this function.
  */
 export function modelLabel(name: string): string {
 	const paren = name.indexOf("(");
@@ -167,10 +165,10 @@ export function modelLabel(name: string): string {
 }
 
 /**
- * A per-character hue ramp. The row that names a lane switch is colored by design (operator order
- * 2026-11-15: "when actively switching, it should be a multicolored text"), and the percent drives
- * the phase, so each repaint visibly moves the ramp: the row is a progress bar the eye can catch in
- * the corner of the screen. A steady run prints NO escape codes at all — the color means "working".
+ * A per-character hue ramp — the single place the multicolor rule lives. The row that names a lane
+ * switch is colored by design, and the percent drives the phase, so each repaint visibly moves the
+ * ramp: the row is a progress bar the eye can catch in the corner of the screen. A steady run
+ * prints NO escape codes at all — the color means "working".
  */
 export function ramp(text: string, phase = 0): string {
 	const chars = [...text];
@@ -204,12 +202,11 @@ export interface SwapPill {
  * never advertises), and when this session does not own the run. A live run yields one line:
  *   `<glyph> Orchestrator: <state> R<round>/<max> · T<passed>/<total> · [<key>]`
  * with the protocol-stall badge, the paused marker and the tok/s suffix riding behind it, plus a
- * second line naming the competing entries while the flip guard is firing. The steady line carries
- * no model name (operator order 2026-11-15): the host's model segment is the model's surface, and
- * printing it here would name the model a second time.
+ * second line naming the competing entries while the flip guard is firing. The steady line names
+ * no model: the host's model segment is the model's surface.
  *
- * While a lane is loading the line REPLACES its state segment with the switch, multicolored, and
- * the model name appears exactly once — the abbreviated label of the lane coming in.
+ * While a lane is loading the line REPLACES its state segment with the switch, colored by `ramp`,
+ * and the model name appears exactly once — the `modelLabel` of the lane coming in.
  */
 export function statusLines(
 	run: RunState | undefined,
@@ -218,8 +215,8 @@ export function statusLines(
 	if (!run) return undefined;
 	if (TERMINAL[run.state] === true) return undefined;
 	if (opts.owned === false) return undefined;
-	// A state read off disk can lack the arrays (the class measured in the rpc rig); the row is the
-	// one surface painted on every tick, so a missing `tasks` must not throw inside a host callback.
+	// A state read off disk can lack the arrays; the row is the one surface painted on every tick,
+	// so a missing `tasks` must not throw inside a host callback.
 	const tasks = Array.isArray(run.tasks) ? run.tasks : [];
 	const total = tasks.length;
 	const passed = tasks.filter((t) => t.status === "passed").length;
@@ -245,7 +242,7 @@ export function statusLines(
 }
 
 /**
- * Y21: the lane churn the guard saw, as the surface renders it. Produced from the router client's
+ * The lane churn the guard saw, as the surface renders it. Produced from the router client's
  * `FlipState` by the wiring layer; kept as a plain shape here so the renderer has no transport
  * dependency and the rig can drive it directly.
  */

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// load_hostile.mjs — Y10: the PRE-UNLOAD GATE, driven by a hostile basalt `/health`.
+// load_hostile.mjs — the PRE-UNLOAD GATE, driven by a hostile basalt `/health`.
 //
 // `POST /v1/load` is not additive: it unloads the resident context to make room for the next pack
 // (flash-next 52.2 GiB, deepseek 120 GiB, 13-25 s each). So the decision is judged on the router's
@@ -19,7 +19,7 @@ const detail = [];
 
 /** The health lines, keyed by the class each one names. `healthy` is the measured live shape. */
 const HEALTH = {
-	// curl 'http://127.0.0.1:18014/health' (2026-11-15): status ok, model, loaded, loading, percent
+	// a live `/health` line: status ok, model, loaded, loading, percent
 	// null, swap null — and NO VRAM fields, which is why an absent reading is never a zero.
 	healthy: { status: "ok", max_context: 262144, model: "flash-next", images: true, api_key: false, loaded: true, loading: false, service: "basalt", percent: null, swap: null },
 	error: { status: "error", model: "flash-next", loaded: true, loading: false, service: "basalt" },

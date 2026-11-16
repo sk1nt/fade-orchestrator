@@ -1,11 +1,7 @@
 #!/usr/bin/env node
-// The rigs and the unit tests import the BUNDLED extension out of `.test-build/`, so any entry
-// point that runs them has to build that bundle FIRST. Measured 2026-11-15: the pre-swap gate ran
-// `node test/gate_rig.mjs` against a stale bundle left by an older source layout (pre-split, when
-// `index.ts` reached `./router.ts` at runtime) and died with
-// `ERR_MODULE_NOT_FOUND …/.test-build/router.mjs` — the rig IS the acceptance command, so it cannot
-// assume somebody ran `npm test` earlier. The recipe lives here, once, and `npm run test:build` is
-// this file.
+// The rigs and the unit tests import the BUNDLED extension out of `.test-build/`, so any entry point
+// that runs them builds that bundle FIRST. The build dir is EMPTIED, never merged into: a stale
+// bundle is exactly the defect this file kills.
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";

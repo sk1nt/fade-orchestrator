@@ -14,7 +14,10 @@
     "test:build": "node test/build.mjs",
     "test:gate": "node test/gate_rig.mjs",
     "test:rpc": "node test/build.mjs && node test/rpc_rig.mjs",
-    "test:pty": "node test/build.mjs && node test/pty_rig.mjs"
+    "test:pty": "node test/build.mjs && node test/pty_rig.mjs",
+    "demo": "node demo/recording.mjs",
+    "demo:stop": "node demo/recording.mjs --stop",
+    "demo:record": "bash -c 'mkdir -p demo/out && \"${VHS:-vhs}\" demo/linkedin.tape'"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

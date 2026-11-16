@@ -2,18 +2,17 @@
  * Live router data for the overlay: the tiers panel, the swap watcher that times every pack
  * swap, and the cold/hot read of the resident lane.
  *
- * Measured basis (basalt 0.4.0, this host, 2026-11-14/15):
+ * The payload shapes this reader is written against (basalt 0.4.0):
  * - `/health` during a swap: `{"loaded","loading","percent":42,"swap":{"from","to","phase","since"}}`.
  * - `/metrics`: the tier fields are nested under `engine` —
  *   `engine.{quant,version,expert_slots,expert_total,spill:{experts,total,bytes}}`,
- *   `live:{state,queued,slots:{total,active,queue_depth},tok_s}`, and per-request records carrying
- *   `decode_tok_s`, `hit_rate`, `reused`, `pcie_share`, `ssd_share`, `drafts_offered/accepted`
- *   (older payloads carry `durations` whose FIRST element is TTFT and the rest per-token decode
- *   seconds — decode tok/s = 1 / median(rest)). Measured on the same box: the served IQ1_M
- *   `expert_slots` is 2,200 with **no spill** — the tier row is the reason the plugin pins
- *   IQ1_M.
- * - The deepseek promote window measured ~91 tok/s for its first ~1,200 tokens, steady ~130;
- *   flash-next 480-647. Those are the cold-ramp and hot numbers the overlay labels.
+ *   `live:{state,queued,slots:{total,active,queue_depth},tok_s}` — and per-request records carry
+ *   `decode_tok_s`, `hit_rate`, `reused`, `pcie_share`, `ssd_share`, `drafts_offered/accepted`.
+ *   Older payloads carry `durations`, whose FIRST element is TTFT and the rest per-token decode
+ *   seconds, so decode tok/s = 1 / median(rest). The spill reading is what the lane's quantization
+ *   choice rests on (docs/quant-choice.md).
+ * - A lane's first ~1,200 tokens decode at roughly 70% of its steady rate (deepseek ~91 against
+ *   ~130; flash-next 480-647 steady). Those are the cold-ramp and hot numbers the overlay labels.
  */
 import { join } from "node:path";
 import { ROUTER } from "./router.ts";
@@ -58,12 +57,11 @@ export interface MetricsSnapshot {
 	tok_s?: number;
 	/** The router's own best decode rate (`best.decode.tok_s`), the strongest rate it publishes. */
 	best_decode?: number;
-	/** The lane the router RESIDENTS, as a lane key ("flash-next"). Measured on basalt 0.4.0,
-	 *  `/health?phase=display` answers `loaded` as a BOOLEAN ("is a pack resident") and names the
-	 *  lane under `model`. Reading `loaded` as the name — the flat pre-0.4 shape — printed
-	 *  `resident true`, made the `◆resident` marker unmatchable, and threw in the renderer
- *  (`name.indexOf is not a function`), so the panel opened nothing. `src/router.ts` already reads
-	 *  this correctly; this reader now agrees with it. */
+	/** The lane the router RESIDENTS, as a lane key ("flash-next"). basalt 0.4.0 answers `loaded`
+	 *  as a BOOLEAN ("is a pack resident") and names the lane under `model`; the pre-0.4 payload
+	 *  carried the name in `loaded`. Reading the boolean as a name makes the `◆resident` marker
+	 *  unmatchable and breaks the renderer (`name.indexOf` on a boolean), so the lane key comes from
+	 *  a string field only — the rule `src/router.ts` applies too. */
 	loaded?: string;
 	/** The router's own boolean: is any pack resident at all. */
 	packLoaded?: boolean;
@@ -107,9 +105,8 @@ function ttftOf(r: MetricsRequest | undefined): number | undefined {
 	return typeof d === "number" && d > 0 ? d : undefined;
 }
 
-/** Prompt-processing tok/s: the engine's `pp` (the serve log's `pp=111459`), else prompt tokens
- *  over the prefill window — `prompt_ms` when reported, TTFT as the bound. Measured basis: a
- *  106k-token prompt prefills in 3.5 s (1,499 tok/s), the same prompt at an 82% hit in 0.5 s. */
+/** Prompt-processing tok/s: the engine's own `pp`, else prompt tokens over the prefill window —
+ *  `prompt_ms` when reported, TTFT as the bound. */
 function promptRateOf(r: MetricsRequest | undefined): number | undefined {
 	if (!r) return undefined;
 	if (typeof r.pp === "number" && r.pp > 0) return r.pp;
@@ -120,9 +117,9 @@ function promptRateOf(r: MetricsRequest | undefined): number | undefined {
 }
 
 /**
- * The four per-turn numbers the telemetry record needs (Y18), read off the newest /metrics
- * request record. Each field is MISSING when the engine did not report it, and a closed router
- * yields an empty object: `turnRecordOrNull` then writes no line, so the ledger has no zeros.
+ * The four per-turn numbers the telemetry record needs, read off the newest /metrics request
+ * record. Each field is MISSING when the engine did not report it, and a closed router yields an
+ * empty object: `turnRecordOrNull` then writes no line, so the ledger carries no fabricated zero.
  */
 export function turnMetricsFrom(requests: MetricsRequest[] | undefined): TurnMetrics {
 	const reqs = requests ?? [];
@@ -165,9 +162,9 @@ export async function fetchMetrics(): Promise<MetricsSnapshot | undefined> {
 	const bytes = typeof spill?.bytes === "number" ? spill.bytes : undefined;
 	const slots = typeof eng.expert_slots === "number" ? eng.expert_slots : mm.expert_slots?.total;
 	const liveQueued = mm.live?.queued ?? mm.live?.slots?.queue_depth;
-	// Measured on the live router (2026-11-15): `engine.quant` carries the LANE NAME, not a
-	// quantization, so a reader that prints it labels the engine `quant flash-next`. A quant is only
-	// printed when the payload names one that is not the lane.
+	// `engine.quant` carries the LANE NAME, not a quantization, so a reader that prints it labels
+	// the engine `quant flash-next`. A quant is printed only when the payload names one that is not
+	// the lane.
 	const lane = laneKey(hh.model) ?? laneKey(eng.model) ?? laneKey(mm.model);
 	const quant = [eng.quant, mm.quant].find((q) => typeof q === "string" && q.length > 0 && q !== lane);
 	const bestDecode = typeof mm.best?.decode?.tok_s === "number" ? mm.best.decode.tok_s : undefined;
@@ -211,8 +208,8 @@ export function tiersFromMetrics(s: MetricsSnapshot | undefined): TierRow[] {
 
 /**
  * Cold vs hot: the pill suffix. A lane is cold while its decode rate sits under 80% of the best
- * rate observed for that lane since it became resident (the measured deepseek ramp: 91 cold
- * against 130 steady = 0.70).
+ * rate observed for that lane since it became resident: a ramping lane measures ~0.70 of its steady
+ * rate and a settled lane measures 1.0, so 0.8 splits the two without chasing noise.
  */
 export function coldHot(tok_s: number | undefined, laneBest: number | undefined): { label: "cold" | "hot" | "idle"; rate?: number } {
 	if (tok_s === undefined || laneBest === undefined || laneBest <= 0) return { label: "idle" };
@@ -248,9 +245,8 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 			if (pct !== undefined) percentPath.push(pct);
 			onSample?.(pct);
 			// basalt 0.4.0 names the resident lane under `model` and answers `loaded` as a boolean, so
-			// the old `h.loaded === to` test could NEVER fire on this router: every swap ran out the
-			// full 120 s window and the row's percent never moved. The string form stays as the
-			// pre-0.4 / rig shape.
+			// an `h.loaded === to` test can NEVER fire on it: the watch would run out its whole window
+			// and the row's percent would never move. The string form stays as the pre-0.4 / rig shape.
 			const resident = typeof h?.model === "string" ? h.model : typeof h?.loaded === "string" ? h.loaded : undefined;
 			if (resident !== undefined && resident === to && (h?.loading === false || h?.loaded === true)) break;
 			await new Promise((r) => setTimeout(r, 2000));
@@ -267,9 +263,18 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 			if (!sawSwap && from === toLane) return undefined;
 			const m = await fetchJson<Record<string, any>>(`${ROUTER}/metrics`);
 			const reqs = (Array.isArray(m?.requests) ? m.requests : [])
-				.filter((r: any) => typeof r.model === "string" && r.model.replace(":", "") === toLane.replace(":", ""))
-				.map((r: any) => ({ model: r.model, prompt_n: r.prompt_n ?? r.prompt_tokens ?? 0, durations: r.durations ?? [] }))
-				.filter((r) => r.durations.length > 3)
+				// basalt 0.4.0 publishes NO `model` per request: the rows carry `path`/`slot` only. A
+				// filter that requires a lane name discards every request on this engine and the swap
+				// row's rate then reads `0→0 tok/s`. A row that names no lane belongs to the lane the
+				// swap LANDED on — that pack is the only thing resident, so the router cannot have
+				// served anyone else since it came up.
+				.filter((r: any) => typeof r.model !== "string" || r.model.replace(":", "") === toLane.replace(":", ""))
+				.map((r: any) => ({ model: r.model, prompt_n: r.prompt_n ?? r.prompt_tokens ?? 0, durations: r.durations ?? [], decode_tok_s: r.decode_tok_s, ttft_s: r.ttft_s }))
+				// The same engine publishes `decode_tok_s` and NO per-token `durations`; requiring >3
+				// durations discards every request for the same reason. A published rate qualifies on
+				// its own — `rateFromRequest` prefers it — and the durations path stays for the older
+				// payloads that carry them.
+				.filter((r) => r.durations.length > 3 || (typeof r.decode_tok_s === "number" && r.decode_tok_s > 0))
 				.sort((a, b) => a.prompt_n - b.prompt_n);
 			const big = reqs.filter((r) => r.prompt_n >= 500);
 			const first = rateFromRequest(big.length > 0 ? big[0] : reqs[0]);
@@ -298,12 +303,11 @@ export function startSwapWatch(to: string, moe?: LaneMoe, onSample?: (percent: n
 
 
 /**
- * The stable-prefix win, measured: a request's `hit_rate` is the fraction of its prompt reused from
- * the conversation cache (measured 2026-11-15 on the served lane: 0.796-0.858, ~200k tokens reused
- * per request). A handover built STABLE FIRST (core.handover) keeps this high across resumes — the
- * cache itself does NOT cross a lane swap: the same 47k-token prefix reused **0** tokens on the lane
- * a swap landed on (`scripts/ops/basalt_cache_probe.sh --swap`, 2026-11-15), which is exactly why
- * swaps are expensive and the flip guard prices them.
+ * The stable-prefix win: a request's `hit_rate` is the fraction of its prompt reused from the
+ * conversation cache. The cache does NOT cross a lane swap — the same prefix can reuse 0 tokens on
+ * the lane a swap landed on — which is exactly why swaps are expensive and why the flip guard
+ * prices them. A handover built STABLE FIRST (`handoverText` in `src/core.ts`) keeps the hit rate
+ * high across resumes.
  */
 export function moeCacheRow(requests: MetricsRequest[] | undefined): { label: string; value: string } {
 	const withHit = (requests ?? []).filter((r) => typeof r.hit_rate === "number");
@@ -313,8 +317,8 @@ export function moeCacheRow(requests: MetricsRequest[] | undefined): { label: st
 	const recent = withHit.slice(0, n); // newest-first source: the LAST n requests are the FIRST n entries
 	const mean = recent.reduce((s, r) => s + (r.hit_rate ?? 0), 0) / recent.length;
 	// `pcie_share` / `ssd_share` are the routed-expert reads that crossed PCIe / landed in the file
-	// — the spill cost as the engine measures it, per request. Live on this box: pcie reported
-	// (~0.54), ssd_share NULL on every request. An absent reading is NAMED, never rendered as a zero.
+	// — the spill cost as the engine measures it, per request. An absent reading is NAMED, never
+	// rendered as a zero.
 	const share = (key: "ssd_share" | "pcie_share"): string => {
 		const vals = recent.filter((r) => typeof r[key] === "number").map((r) => r[key] as number);
 		return vals.length === 0 ? `${key === "ssd_share" ? "ssd" : "pcie"} not reported` : `${key === "ssd_share" ? "ssd" : "pcie"} ${((vals.reduce((s, v) => s + v, 0) / vals.length) * 100).toFixed(1)}%`;
@@ -338,7 +342,7 @@ export function laneBestRate(s: MetricsSnapshot, lane: string): number | undefin
 	return rates.length > 0 ? Math.max(...rates) : undefined;
 }
 
-/** Persist the latest snapshot next to state.json: the desk and postmortems can read the tiers. */
+/** Persist the latest snapshot next to state.json, so the tiers survive a router that goes away. */
 export function persistMetrics(dir: string, snap: MetricsSnapshot): void {
 	writeJson(join(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
 }

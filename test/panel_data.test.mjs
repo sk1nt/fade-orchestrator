@@ -15,11 +15,6 @@ import { clockOf, collectScreen, compactNumber, formatElapsed, gateRows, laneRow
 import { moeCacheRow, tiersFromMetrics } from "../.test-build/livedata.mjs";
 import { moeRows } from "../.test-build/moe.mjs";
 
-// The bundle in `.test-build/` is built by the ENTRY POINT (`npm run test:build` /
-// `node test/build.mjs`), never from inside a test file: `node --test` runs files in parallel and
-// the build empties the directory, so an in-file build wipes a sibling's imports mid-run (measured
-// 2026-11-15: ui_status.test.mjs failed as a whole file while panel_data rebuilt the bundle).
-
 const task = (id, status, over = {}) => ({ id, objective: `${id} objective`, files: [`${id}.ts`], acceptance: `${id} acceptance`, dependencies: [], round: 1, status, ...over });
 const run = (over = {}) => ({
 	lane: "deepseek",
@@ -29,13 +24,13 @@ const run = (over = {}) => ({
 	tasks: [task("T1", "passed"), task("T2", "pending"), task("T3", "failed")],
 	repair_tasks: [],
 	phases: [
-		{ phase: "planning_done", at: "2026-11-15T12:00:00.000Z", lane: "deepseek", round: 1, accepted: true, payload: {} },
-		{ phase: "verification_done", at: "2026-11-15T12:20:00.000Z", lane: "deepseek", round: 1, accepted: true, payload: {}, notes: "T3 died: the rig asserts a line that never renders" },
+		{ phase: "planning_done", at: "2030-01-01T12:00:00.000Z", lane: "deepseek", round: 1, accepted: true, payload: {} },
+		{ phase: "verification_done", at: "2030-01-01T12:20:00.000Z", lane: "deepseek", round: 1, accepted: true, payload: {}, notes: "T3 died: the rig asserts a line that never renders" },
 	],
 	rejection_history: [],
-	started_utc: "2026-11-15T12:00:00.000Z",
+	started_utc: "2030-01-01T12:00:00.000Z",
 	gate_last: {
-		at: "2026-11-15T12:19:00.000Z",
+		at: "2030-01-01T12:19:00.000Z",
 		passed: false,
 		results: [
 			{ cmd: "npm test", expected: "exit 0", observed: "exit 1", ok: false },
@@ -67,14 +62,14 @@ const metrics = {
 };
 
 const swapFixture = [
-	{ key: "fade.omp_orchestrate.swap.v1", at: "2026-11-15T12:10:00.000Z", from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "cold_ramp", load_percent: 100 },
-	{ key: "fade.omp_orchestrate.swap.v1", at: "2026-11-15T12:18:00.000Z", from: "flash-next", to: "deepseek", elapsed_s: 8.9, first_tg: 120, steady_tg: 128, ramp: "hot_steady", load_percent: 100 },
+	{ key: "fade.omp_orchestrate.swap.v1", at: "2030-01-01T12:10:00.000Z", from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "cold_ramp", load_percent: 100 },
+	{ key: "fade.omp_orchestrate.swap.v1", at: "2030-01-01T12:18:00.000Z", from: "flash-next", to: "deepseek", elapsed_s: 8.9, first_tg: 120, steady_tg: 128, ramp: "hot_steady", load_percent: 100 },
 ];
 
 const turnFixture = [
-	{ key: "fade.omp_orchestrate.turn.v1", turn: 1, round: 1, phase: "planning", at: "2026-11-15T12:01:00.000Z", pp: 1000, tg: 50, ttft: 0.4, swap_ms: 200, kv_hit_pct: 12.5 },
-	{ key: "fade.omp_orchestrate.turn.v1", turn: 2, round: 2, phase: "coding", at: "2026-11-15T12:12:00.000Z", pp: 4000, tg: 200, ttft: 0.6, swap_ms: 14200 },
-	{ key: "fade.omp_orchestrate.turn.v1", turn: 3, round: 2, phase: "coding", at: "2026-11-15T12:14:00.000Z", pp: 4200, tg: 100, ttft: 0.5, swap_ms: 0, kv_hit_pct: 88 },
+	{ key: "fade.omp_orchestrate.turn.v1", turn: 1, round: 1, phase: "planning", at: "2030-01-01T12:01:00.000Z", pp: 1000, tg: 50, ttft: 0.4, swap_ms: 200, kv_hit_pct: 12.5 },
+	{ key: "fade.omp_orchestrate.turn.v1", turn: 2, round: 2, phase: "coding", at: "2030-01-01T12:12:00.000Z", pp: 4000, tg: 200, ttft: 0.6, swap_ms: 14200 },
+	{ key: "fade.omp_orchestrate.turn.v1", turn: 3, round: 2, phase: "coding", at: "2030-01-01T12:14:00.000Z", pp: 4200, tg: 100, ttft: 0.5, swap_ms: 0, kv_hit_pct: 88 },
 ];
 
 const withMoe = (value, fn) => {
@@ -111,7 +106,7 @@ test("sparkline: scaled to the row's own maximum; one value draws nothing", () =
 });
 
 test("clockOf: a real stamp prints the clock; an unparseable one prints itself, never a fake time", () => {
-	assert.match(clockOf("2026-11-15T12:19:00.000Z"), /^\d\d:\d\d:\d\d$/);
+	assert.match(clockOf("2030-01-01T12:19:00.000Z"), /^\d\d:\d\d:\d\d$/);
 	assert.equal(clockOf("not-a-time"), "not-a-time");
 });
 
@@ -165,12 +160,12 @@ test("swapRows: the measured cost of each swap, newest first, with the ramp clas
 
 test("gateRows: RED names the failing count and every red command; a green gate says GREEN; no gate is named", () => {
 	const red = gateRows(run().gate_last);
-	assert.equal(red[0].value, `RED 2/3 failing · ${clockOf("2026-11-15T12:19:00.000Z")}`);
+	assert.equal(red[0].value, `RED 2/3 failing · ${clockOf("2030-01-01T12:19:00.000Z")}`);
 	assert.equal(red[0].tone, "bad");
 	assert.ok(red[1].value.includes("npm test → exit 0"), JSON.stringify(red[1]));
 	assert.ok(red[2].value.includes("node test/pty_rig.mjs → PASS"), JSON.stringify(red[2]));
 	assert.ok(!red.some((r) => r.value.includes("npm run test:gate")), "the green check is not a red row");
-	const green = gateRows({ at: "2026-11-15T12:19:00.000Z", passed: true, results: [{ cmd: "npm test", expected: "exit 0", observed: "exit 0", ok: true }] });
+	const green = gateRows({ at: "2030-01-01T12:19:00.000Z", passed: true, results: [{ cmd: "npm test", expected: "exit 0", observed: "exit 0", ok: true }] });
 	assert.equal(green[0].value.split(" ")[0], "GREEN");
 	assert.equal(green[0].tone, "ok");
 	assert.deepEqual(gateRows(undefined), [{ label: "gate", value: "no gate run this round", tone: "dim" }]);
@@ -189,7 +184,7 @@ test("collectScreen: the whole screen from injected sources — tiers, lanes, co
 				names,
 				context: { tokens: 41234, contextWindow: 1048576, percent: 3.9 },
 				metrics,
-				now: () => new Date("2026-11-15T12:14:02.000Z"),
+				now: () => new Date("2030-01-01T12:14:02.000Z"),
 			}),
 		);
 		const tiers = new Map(d.tiers.map((t) => [t.label, t.value]));
@@ -198,7 +193,7 @@ test("collectScreen: the whole screen from injected sources — tiers, lanes, co
 		// tok/s is rounded by design (a compact column); the live state is the router's own word.
 		assert.equal(tiers.get("decode now"), "131 tok/s (queue 0, decoding)");
 		assert.ok(String(tiers.get("expert slots")).includes("2200"), String(tiers.get("expert slots")));
-		// the row grew the pcie/ssd shares as NAMED columns (2026-11-15); this fixture carries no pcie_share.
+		// the row grew the pcie/ssd shares as NAMED columns; this fixture carries no pcie_share.
 		assert.equal(tiers.get("prefix cache"), "82.3% hit over 1 req · last 82.3% (900 tok reused) · pcie not reported · ssd 0.0%");
 		assert.deepEqual(
 			d.lanes.map((l) => l.model),
@@ -230,7 +225,7 @@ test("collectScreen: a run state with NO `phases` renders as no critique — the
 				lanes: { think: "deepseek", code: "flash-next" },
 				names,
 				metrics,
-				now: () => new Date("2026-11-15T12:14:02.000Z"),
+				now: () => new Date("2030-01-01T12:14:02.000Z"),
 			}),
 		);
 		assert.equal(d.critique, undefined, "no phases means no critique, not a throw");
@@ -271,7 +266,7 @@ test("collectScreen: an unreachable router prints its own name, and NO engine/de
 	writeFileSync(
 		script,
 		`import { collectScreen } from ${JSON.stringify(bundle)};
-const run = { lane: "deepseek", round: 1, max_rounds: 6, state: "coding", tasks: [], repair_tasks: [], phases: [], rejection_history: [], started_utc: "2026-11-15T12:00:00.000Z" };
+const run = { lane: "deepseek", round: 1, max_rounds: 6, state: "coding", tasks: [], repair_tasks: [], phases: [], rejection_history: [], started_utc: "2030-01-01T12:00:00.000Z" };
 process.env.FADE_ORCHESTRATE_MOE_CONFIG = "/nonexistent/moe.json";
 const d = await collectScreen({ run, runDir: ${JSON.stringify(dir)}, lanes: { think: "deepseek", code: "flash-next" } });
 process.stdout.write(JSON.stringify({ tiers: d.tiers, moe: d.moe, missing: d.missing }));
@@ -290,12 +285,12 @@ process.stdout.write(JSON.stringify({ tiers: d.tiers, moe: d.moe, missing: d.mis
 	}
 });
 
-// ── the CAPTURED live shapes, measured 2026-11-15 on this desk ───────────────────────────────────
+// ── the CAPTURED live shapes ───────────────────────────────────────────────────────────────────
 // The spill reading is ABSENT (0.4.0 /metrics has no spill-use key — null, NOT a zero), the slots
 // read 2200/15360, hit_rate 0.79-0.80 with ~200k tokens reused, ssd_share null on every request,
 // pcie_share ~0.54. Each row below is composed the way the screen composes it.
 const liveSnapshot = {
-	at_utc: "2026-11-15T13:40:00Z",
+	at_utc: "2030-01-01T13:40:00Z",
 	quant: "IQ1_M",
 	slots: 2200,
 	spill_experts: undefined,

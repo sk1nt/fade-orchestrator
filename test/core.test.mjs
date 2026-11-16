@@ -2,8 +2,8 @@
  * core v2 unit tests: adaptive round budget, v1→v2 migration, rejection history (append + cap),
  * the repair briefing carrying prior rejections, the pre-swap gate judging on exit code, and
  * the gate briefing naming the failing commands.
- * The Tier-1 protocol gate (Y1/Y2/Y5/Y16): the nudge→synthesize→stall ladder costing no round,
- * the git-synthesized coding_done, the crash-safe state write, the checkpoint tags, and the
+ * The Tier-1 protocol gate: the nudge→synthesize→stall ladder costing no round, the
+ * git-synthesized coding_done, the crash-safe state write, the checkpoint tags, and the
  * nudge/stalled briefings.
  */
 import { test } from "node:test";
@@ -24,6 +24,7 @@ import {
 	diffStat,
 	expectation,
 	gateSummary,
+	gitCaveat,
 	handover,
 	handoverText,
 	isGitRepo,
@@ -46,6 +47,7 @@ import {
 	writeJson,
 } from "../.test-build/core.mjs";
 import { gateRows } from "../.test-build/screendata.mjs";
+import { commitAll, initRepo } from "./fixture.mjs";
 
 const mkRun = (over = {}) =>
 	normalizeRun({
@@ -123,7 +125,7 @@ test("the gate briefing names each failing command and its expected text", () =>
 	const run = mkRun({
 		state: "coding",
 		gate_last: {
-			at: "2026-11-15T00:00:00Z",
+			at: "2030-01-01T00:00:00Z",
 			passed: false,
 			results: [
 				{ cmd: "cargo test --release -p x", expected: "0 failures", ok: false, tail: "test result: FAILED. 3 failed" },
@@ -160,10 +162,9 @@ test("handover carries the gate failure tail", () => {
 test("diffStat names the working-tree change or the clean state", () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-diff-"));
 	try {
-		execFileSync("git", ["init", "-q"], { cwd: dir });
+		initRepo(dir);
 		writeFileSync(join(dir, "f.ts"), "x");
-		execFileSync("git", ["add", "f.ts"], { cwd: dir });
-		execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "c"], { cwd: dir });
+		commitAll(dir);
 		assert.match(diffStat(dir), /working tree clean/);
 		writeFileSync(join(dir, "f.ts"), "y");
 		assert.match(diffStat(dir), /f\.ts/);
@@ -173,8 +174,8 @@ test("diffStat names the working-tree change or the clean state", () => {
 });
 
 test("refreshChecks: the gate honors an on-disk repair of the plan's checks, keyed by run_id", () => {
-	// The livelock measured 2026-11-15 (run 20261115T091232Z-rqtj): two checks were fixed in
-	// state.json and the gate kept re-judging the session's in-memory pair, every round.
+	// The livelock this pins: two checks fixed in state.json while the gate keeps re-judging the
+	// session's in-memory pair, every round.
 	const broken = [["bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?", "PASS 0"], ["cargo run --release --bin lineage_check -- --only pattern_scan_driver", "claims pass"]];
 	const run = mkRun({ checks: broken });
 	const repaired = [["bash scripts/ops/scan_resident_parity_selftest.sh", "both legs PASS"], ["src/fade_store_guard/target/release/lineage_check --only pattern_scan_driver", "2 pass, 0 fail"]];
@@ -195,9 +196,9 @@ test("refreshChecks: the gate honors an on-disk repair of the plan's checks, key
 });
 
 test("a non-repo run root degrades by name: git's --no-index usage page never reaches a briefing", () => {
-	// Measured 2026-11-15: a run whose root was a rig dir under /tmp. Outside a working tree
-	// `git diff` does not fail — it switches to --no-index mode and prints ~60 lines of usage,
-	// which rode into the briefing as the `Working tree:` line and into the TUI as a warning.
+	// The defect: a run root that is not a working tree. Outside a tree `git diff` does not fail —
+	// it switches to --no-index mode and prints ~60 lines of usage, which rides into the briefing as
+	// the `Working tree:` line and into the TUI as a warning.
 	const dir = mkdtempSync(join(tmpdir(), "orch-norepo-"));
 	try {
 		assert.equal(isGitRepo(dir), false, "a bare temp dir is not a working tree");
@@ -223,10 +224,6 @@ test("a non-repo run root degrades by name: git's --no-index usage page never re
 });
 
 const mkTask = (id, files) => ({ id, objective: `do ${id}`, files, acceptance: "npm test", dependencies: [], round: 0 });
-const gitCommitAll = (dir) => {
-	execFileSync("git", ["add", "-A"], { cwd: dir });
-	execFileSync("git", ["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "c"], { cwd: dir });
-};
 
 test("classifyTurnEnd: a phase-less turn is protocol debt, never a coding round — 1 nudge, 2 synthesize, 3 stall", () => {
 	const run = mkRun({ state: "coding", round: 4, max_rounds: 5 });
@@ -272,11 +269,11 @@ test("countRejections separates schema refusals from verification bounces; the r
 test("synthesizeCodingDone reads real git: passed for the task whose file moved, blocked for the one that did not", () => {
 	const dir = mkdtempSync(join(tmpdir(), "orch-synth-"));
 	try {
-		execFileSync("git", ["init", "-q"], { cwd: dir });
+		initRepo(dir);
 		mkdirSync(join(dir, "src"), { recursive: true });
 		writeFileSync(join(dir, "src", "a.ts"), "base");
 		writeFileSync(join(dir, "src", "b.ts"), "base");
-		gitCommitAll(dir);
+		commitAll(dir);
 		writeFileSync(join(dir, "src", "a.ts"), "worked on it");
 		const run = mkRun({
 			repo: dir,
@@ -284,7 +281,7 @@ test("synthesizeCodingDone reads real git: passed for the task whose file moved,
 			round: 2,
 			tasks: [mkTask("T1", ["src/a.ts"]), mkTask("T2", ["src/b.ts"])],
 			repair_tasks: [],
-			gate_last: { at: "2026-11-15T00:00:00Z", passed: false, results: [{ cmd: "npm test", expected: "0 failures", ok: false, tail: "1 failed" }] },
+			gate_last: { at: "2030-01-01T00:00:00Z", passed: false, results: [{ cmd: "npm test", expected: "0 failures", ok: false, tail: "1 failed" }] },
 		});
 		const s = synthesizeCodingDone(run, dir);
 		const byId = Object.fromEntries(s.done.map((d) => [d.id, d]));
@@ -319,9 +316,9 @@ test("checkpointName is run-namespaced and tagCheckpoint writes the tag, records
 	assert.equal(checkpointName(run, "T3"), "omp-ckpt/R/T3-passed");
 	const dir = mkdtempSync(join(tmpdir(), "orch-ckpt-"));
 	try {
-		execFileSync("git", ["init", "-q"], { cwd: dir });
+		initRepo(dir);
 		writeFileSync(join(dir, "f.ts"), "x");
-		gitCommitAll(dir);
+		commitAll(dir);
 		const first = tagCheckpoint(dir, run, "T1");
 		assert.equal(first.ok, true, first.error);
 		assert.equal(first.tag, "omp-ckpt/R/T1-passed");
@@ -375,7 +372,7 @@ test("the stalled briefing is the Tier-3 diagnostic: halted state, RED gate tail
 		paused: true,
 		operator_note: "reviewing by hand",
 		phases: [{ phase: "coding_done", lane: "flash-next", accepted: true, round: 1, at: "x", notes: "gate was red" }],
-		synthesized: { phase: "coding_done", round: 2, at: "2026-11-15T00:00:00Z" },
+		synthesized: { phase: "coding_done", round: 2, at: "2030-01-01T00:00:00Z" },
 		gate_last: { at: "x", passed: false, results: [{ cmd: "npm test", expected: "0 failures", ok: false, tail: "2 failed" }] },
 	});
 	pushRejection(run, "schema", "payload is not JSON", "T1");
@@ -399,7 +396,7 @@ test("the stalled briefing is the Tier-3 diagnostic: halted state, RED gate tail
 test("gateSummary states the verdict and every deterministic tail (the synthesizer's third source)", () => {
 	const run = mkRun({
 		gate_last: {
-			at: "2026-11-15T09:00:00Z",
+			at: "2030-01-01T09:00:00Z",
 			passed: false,
 			results: [
 				{ cmd: "cargo check", expected: "0", ok: true, tail: "" },
@@ -408,13 +405,13 @@ test("gateSummary states the verdict and every deterministic tail (the synthesiz
 		},
 	});
 	const text = gateSummary(run);
-	assert.match(text, /^gate 2026-11-15T09:00:00Z RED:/);
+	assert.match(text, /^gate 2030-01-01T09:00:00Z RED:/);
 	assert.match(text, /ok cargo check/);
 	assert.match(text, /FAIL npm test -> 3 failed/);
 	assert.equal(gateSummary(mkRun()), "(no pre-swap gate recorded)");
 });
 
-// ---- Y7: multi-task residency batching (one coder window, one coding_done) ----
+// ---- multi-task residency batching (one coder window, one coding_done) ----
 
 const winTask = (id, dependencies = [], objective = `${id}: make ${id} green`, files = [`src/${id.toLowerCase()}.ts`]) => ({
 	id,
@@ -522,7 +519,7 @@ test("an all-blocked window says so and blocks the report it cannot make", () =>
 	assert.equal(validateDone(run, [{ id: "T1", status: "passed", result: "x" }]).error, undefined, "with no window there is no window to skip");
 });
 
-// ---- the gate's plan-defect class (run 20261115T091232Z-rqtj) -------------------------------
+// ---- the gate's plan-defect class -------------------------------------------------------------
 // The plan declared `bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?`.
 // `<pinned` is an input redirect and `dir>` an output redirect whose required word is the `;`
 // operator, so bash dies at PARSE time: the row is red for every tree the run can build, and the
@@ -531,7 +528,7 @@ test("an all-blocked window says so and blocks the report it cannot make", () =>
 const NOT_A_COMMAND = "bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?";
 
 test("checkParses separates a command from a string bash cannot parse", () => {
-	assert.equal(checkParses("cd deploy/omp && npm test").ok, true);
+	assert.equal(checkParses("cd ci && npm test").ok, true);
 	assert.equal(checkParses("true").ok, true);
 	const bad = checkParses(NOT_A_COMMAND);
 	assert.equal(bad.ok, false);
@@ -542,7 +539,7 @@ test("validateChecks refuses an unparseable check at the plan's authoring edge",
 	const bad = validateChecks([[NOT_A_COMMAND, "PASS 0 on the pinned nightly"]]);
 	assert.match(bad.error, /is not a command/);
 	assert.match(bad.error, /--ref/, "the refusal names the runnable form, not just the failure");
-	const good = validateChecks([["bash scripts/ops/scan_resident_parity.sh --ref reports/evaluation/pattern_scan_20261115 --lanes grid", "byte rc 0"]]);
+	const good = validateChecks([["bash tools/parity_scan.sh --ref reports/parity/latest --lanes grid", "byte rc 0"]]);
 	assert.equal(good.error, undefined, good.error ?? "the runnable form is accepted");
 	assert.equal(good.checks.length, 1);
 });
@@ -582,7 +579,7 @@ test("sameTaskPlan: a plan act re-declares the checks, never the plan", () => {
 	assert.equal(sameTaskPlan(plan, [plan[0]]), false, "dropping a task is not a plan act");
 });
 
-// ---- T2: Y8 plan-declared round caps, Y4 per-task negative memory, Y14 compact repair prompt ----
+// ---- plan-declared round caps, per-task negative memory, the compact repair prompt ------------
 
 const tierTask = (id, complexity) => ({
 	id,
@@ -593,9 +590,9 @@ const tierTask = (id, complexity) => ({
 	round: 1,
 	...(complexity ? { complexity } : {}),
 });
-const rej = (round, kind, task_id, reason) => ({ round, at: `2026-11-15T0${round}:00:00.000Z`, kind, task_id, reason });
+const rej = (round, kind, task_id, reason) => ({ round, at: `2030-01-01T0${round}:00:00.000Z`, kind, task_id, reason });
 
-test("Y8: the plan declares the cap — trivial 2, standard 4, deep 6, the max over the plan, --rounds the ceiling", () => {
+test("the plan declares the cap — trivial 2, standard 4, deep 6, the max over the plan, --rounds the ceiling", () => {
 	assert.equal(roundsForTasks([tierTask("T1", "trivial"), tierTask("T2", "trivial")], 6), 2, "a plan of trivial edits reserves TWO rounds");
 	assert.equal(roundsForTasks([tierTask("T1", "standard")], 6), 4, "standard is four");
 	assert.equal(roundsForTasks([tierTask("T1", "deep")], 6), 6, "deep is six");
@@ -605,7 +602,7 @@ test("Y8: the plan declares the cap — trivial 2, standard 4, deep 6, the max o
 	assert.equal(roundsForTasks([tierTask("T1"), tierTask("T2"), tierTask("T3"), tierTask("T4"), tierTask("T5"), tierTask("T6")], 6), 5);
 });
 
-test("Y8: validateTasks carries a declared complexity and refuses a non-name by name", () => {
+test("validateTasks carries a declared complexity and refuses a non-name by name", () => {
 	const ok = validateTasks([{ id: "T1", objective: "o", files: ["a.ts"], acceptance: "a", dependencies: [], complexity: "trivial" }]);
 	assert.equal(ok.error, undefined, ok.error ?? "");
 	assert.equal(ok.tasks?.[0].complexity, "trivial");
@@ -613,13 +610,13 @@ test("Y8: validateTasks carries a declared complexity and refuses a non-name by 
 	assert.match(bad.error ?? "", /complexity must be trivial\|standard\|deep/, "the refusal names the allowed set");
 });
 
-test("Y8: the loop reads the plan's cap — the window header and the nudge both say R/2", () => {
+test("the loop reads the plan's cap — the window header and the nudge both say R/2", () => {
 	const run = mkRun({ max_rounds: roundsForTasks([tierTask("T1", "trivial")], 6), round: 2, state: "coding", repair_tasks: [], tasks: [winTask("T1")] });
 	assert.match(briefings.window(run), /round 2\/2/, "the coder sees the plan's budget, not the flat 6");
 	assert.match(briefings.nudge(run), /round 2\/2/, "and so does the protocol nudge");
 });
 
-test("Y4: a task rejected twice is briefed with ITS OWN critique, counted, and told the diff was tried", () => {
+test("a task rejected twice is briefed with ITS OWN critique, counted, and told the diff was tried", () => {
 	const run = mkRun({
 		round: 3,
 		state: "repair",
@@ -642,12 +639,12 @@ test("Y4: a task rejected twice is briefed with ITS OWN critique, counted, and t
 	assert.ok(p.includes("T2: no acceptance output in the report"));
 });
 
-test("Y4: a task with no history earns no critique line (the block is data, not boilerplate)", () => {
+test("a task with no history earns no critique line (the block is data, not boilerplate)", () => {
 	const p = briefings.repair(mkRun({ round: 2, rejection_history: [] }));
 	assert.ok(!p.includes("BY TASK:"), "no rejections, no critique block");
 });
 
-test("Y4: the coding window carries the critique of the tasks IN the window, on the round that re-briefs them", () => {
+test("the coding window carries the critique of the tasks IN the window, on the round that re-briefs them", () => {
 	const run = winRun([winTask("T1"), winTask("T2")], { round: 2, rejection_history: [rej(1, "verification", "T1", "T1: the cache key is stale")] });
 	const w = briefings.window(run);
 	assert.match(w, /Rejected before — the verifier's critique/, "round 2 names the rejections the window inherits");
@@ -656,7 +653,7 @@ test("Y4: the coding window carries the critique of the tasks IN the window, on 
 	assert.ok(!briefings.window(first).includes("Rejected before"), "the FIRST window of a round has nothing to inherit");
 });
 
-test("Y4: critiquesFor reads the history BY TASK ID, newest last, and ignores schema/gate refusals", () => {
+test("critiquesFor reads the history BY TASK ID, newest last, and ignores schema/gate refusals", () => {
 	const lines = critiquesFor(
 		mkRun({
 			rejection_history: [
@@ -672,7 +669,7 @@ test("Y4: critiquesFor reads the history BY TASK ID, newest last, and ignores sc
 	assert.ok(lines[0].includes("T1: gate red again, same diff"), "the newest critique is the one quoted");
 });
 
-test("Y14: the repair prompt is the compact set — diff stat, checklist, last rejections, no prior-round tool logs", () => {
+test("the repair prompt is the compact set — diff stat, checklist, last rejections, no prior-round tool logs", () => {
 	const run = mkRun({
 		round: 3,
 		repair_tasks: [{ id: "T1", objective: "fix", files: ["w.ts"], acceptance: "npm test -- w", dependencies: [], round: 3 }],
@@ -689,7 +686,7 @@ test("Y14: the repair prompt is the compact set — diff stat, checklist, last r
 	assert.ok(h.volatile.join("\n").includes("Working tree:"), "the volatile tail goes last");
 });
 
-test("Y7: a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and the prompt names all 3 ids", () => {
+test("a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, and the prompt names all 3 ids", () => {
 	const run = winRun([winTask("T1"), winTask("T2"), winTask("T3")]);
 	assert.equal(ids(roundWindow(run).readyNow), "T1,T2,T3", "three tasks, one window, zero cuts");
 	const v = validateDone(run, [
@@ -708,11 +705,10 @@ test("Y7: a 3-task plan is ONE window — 3 ready, ONE coding_done marks all 3, 
 });
 
 // ── declared-failure checks: a plan can name a NON-zero exit as the accepted state ──────────────
-// Measured 2026-11-15, run 20261115T142431Z-r73i (repo fade-fabric): the plan declared
-// `git -C . rev-parse --git-dir` → "fails: the tree is not a git repo yet" and
-// `grep -rln "burnin\." probes benches` → "no output: no probe or bench emits burnin.* metrics".
-// Both were the accepted state and both rendered RED, so the operator saw a red screen on a run
-// whose expectations were met. The declared forms are the head words; everything else keeps exit-0.
+// The defect: a plan declaring `git -C . rev-parse --git-dir` → "fails: the tree is not a git repo
+// yet" and `grep -rln "burnin\." probes benches` → "no output: no probe or bench emits burnin.*
+// metrics". Both ARE the accepted state, and a gate that reads exit-0-only paints a red run whose
+// expectations were met. The declared forms are the head words; everything else keeps exit-0.
 test("expectation: the plan's head words declare the accepted exit state", () => {
 	assert.equal(expectation("exit 0, no failures"), "exit0");
 	assert.equal(expectation("fails: the tree is not a git repo yet"), "nonzero");
@@ -765,4 +761,28 @@ test("gateRows: the as-expected rows are labelled and counted, and the gate read
 	assert.match(rows[0].value, /GREEN 0\/2 failing · 1 as expected/);
 	assert.ok(rows.some((r) => r.label === "  ok*" && /not a git repo/.test(r.value)), "the as-expected row is named");
 	assert.ok(!rows.some((r) => r.label === "  red"), "no red row is rendered for a declared state");
+});
+
+// ── the non-git run root: named at the first keystroke, not as a wall of red rows two rounds later ─
+// Measured 2026-11-15, run 20261115T193201Z-vsuq in fade-fabric (no git): the T2 synthesizer reads
+// `git status --porcelain`, so all six tasks landed `blocked` with the sentinel tail.
+test("gitCaveat and the briefings name a non-git run root, and stay silent in a working tree", () => {
+	const plain = mkdtempSync(join(tmpdir(), "orch-nogit-"));
+	const tree = mkdtempSync(join(tmpdir(), "orch-git-"));
+	try {
+		execFileSync("git", ["-C", tree, "init", "-q"], { stdio: "pipe" });
+		assert.match(gitCaveat(plain), /NOT a git repo/);
+		assert.ok(gitCaveat(plain).includes("git init " + plain), "the act is the literal command");
+		assert.equal(gitCaveat(tree), "", "a working tree gets no caveat");
+		const r = (repo) => mkRun({ repo });
+					const pairs = [["plan", briefings.plan(r(plain))], ["code", briefings.code(r(plain))], ["window", briefings.window(r(plain))], ["repair", briefings.repair(r(plain))]];
+			for (const [name, text] of pairs) {
+			assert.match(text, /NOT a git repo/, `${name} briefing names the root state`);
+			assert.match(text, /git init/, `${name} briefing names the act`);
+		}
+		assert.doesNotMatch(briefings.plan(r(tree)), /NOT a git repo/, "the same briefing in a repo says nothing");
+	} finally {
+		rmSync(plain, { recursive: true, force: true });
+		rmSync(tree, { recursive: true, force: true });
+	}
 });

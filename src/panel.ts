@@ -3,16 +3,13 @@
  * own agents panel uses — a header, a selectable list, a metrics column, a key bar.
  *
  * The chord is `alt+f`, claimed at the RAW-INPUT layer: the host's own table binds `alt+f`
- * (`tui.editor.cursorWordRight`), so `registerShortcut` is refused and `onTerminalInput` consumes the
- * two bytes (`ESC f`) ahead of the host's binding — proved against the real binary by
+ * (`tui.editor.cursorWordRight`), so `registerShortcut` is refused and `onTerminalInput` consumes
+ * the two bytes (`ESC f`) ahead of the host's binding — proved against the real binary by
  * `test/pty_rig.mjs`. `/orchestrate overlay` and `FADE_ORCHESTRATE_FALLBACK_KEY` (default
- * `alt+shift+i`) stay the fallbacks, and a configured CONTROL chord (`ctrl+o`) stays the host's: the
- * raw listener's family is ESC + a byte, never a control code.
+ * `alt+shift+i`) stay the fallbacks, and a configured CONTROL chord (`ctrl+o`) stays the host's:
+ * the raw listener's family is ESC + a byte, never a control code.
  *
- * Closing is a parse, not a byte: the host hands this component RAW bytes, and its own escape matcher
- * accepts the legacy `\x1b`, the Kitty CSI-u sequence and xterm's `modifyOtherKeys`, so `isEscape()`
- * below matches all three (and ignores the Kitty release form). Comparing only `\x1b` left ESC dead on
- * kitty/wezterm/ghostty/foot — the operator's report, 2026-11-15.
+ * Closing is a parse, not a byte: the accepted ESC encodings are listed on `isEscape` below.
  *
  * Live by construction: the panel is given a `provider` and a bounded refresh tick, re-reads the
  * screen and calls `tui.requestRender()` — the numbers move while you watch, which is the whole
@@ -23,7 +20,7 @@
  * `width` (colors are ANSI, so the fit function strips them), and the panel scrolls to keep the
  * selected task in view at any terminal size between 60 and 220 columns.
  *
- * Every line passes the redactor, so a screenshot of the screen is safe (`FADE_ORCHESTRATE_REDACT=1`).
+ * Every rendered line passes `redact` (ui.ts), so a screenshot of the screen is safe.
  */
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { OVERLAY_WIDGET_KEY, redact, redactOn, shortState } from "./ui.ts";
@@ -87,10 +84,9 @@ function pad(s: string, width: number): string {
 export const KEY_BAR = ["[↑↓/j-k] select", "[PgUp/PgDn] scroll", "[s] skip selected", "[v] verify", "[r] reset", "[p] pause", "[c] code", "[h] halt", "[esc] close"];
 
 /**
- * The key bar, packed per line. Wrapping the bar as PROSE cut it mid-key — at the 110-column
- * default surface the old single line lost the tail, and a word wrap split `[esc] close` across
- * two rows, so the key the operator needs most was unreadable (both measured). Each item stays
- * whole; an item wider than the panel is clipped, never split.
+ * The key bar, packed per line. Each item stays whole: prose-wrapping cuts a key mid-token and a
+ * single long line loses the tail of the bar, so an item wider than the panel is clipped, never
+ * split.
  */
 export function keyBarLines(width: number): string[] {
 	if (width <= 1) return [""];
@@ -117,8 +113,8 @@ function label(theme: PanelTheme | undefined, text: string, color = "accent"): s
  * One `label  value` row per metric, the label column padded so the values line up.
  *
  * `maxLabel` is per block, not global: the metric rows carry ≤12-character labels, while a swap
- * row's label is a lane PAIR ("deepseek → flash-next", 21 columns). The old global 18-column cap
- * silently cut that label to "deepseek → flash…", so the panel lost the lane the swap went TO.
+ * row's label is a lane PAIR ("deepseek → flash-next", 21 columns). A cap sized for metric labels
+ * clips that pair and loses the lane the swap went TO.
  */
 function metricLines(rows: MetricRow[], theme: PanelTheme | undefined, width: number, maxLabel = 18): string[] {
 	const labelW = Math.min(maxLabel, Math.max(6, Math.max(...rows.map((r) => visibleWidth(r.label)), 1) + 1));
@@ -130,22 +126,21 @@ function metricLines(rows: MetricRow[], theme: PanelTheme | undefined, width: nu
 }
 
 /**
- * A run state arrives from disk, and a JSON file can be MISSING an array the type declares: a state
- * written mid-plan has no `phases`, a hand-seeded state can have no `repair_tasks`, a planning run
- * has no `tasks`. `RunState` types them required, so TypeScript cannot see the gap, and the screen
- * died on it twice in one night — `src.run.phases.length` and `run.repair_tasks.length` each threw
- * `undefined is not an object`, and the panel arrived as an error notify (both measured in the rpc
- * rig, 2026-11-15). The screen reads an absent array as empty: a screen must never die on a shape it
- * did not predict.
+ * A run state arrives from disk, and a JSON file can be MISSING an array the type declares: a
+ * state written mid-plan has no `phases`, a hand-seeded state can have no `repair_tasks`, a
+ * planning run has no `tasks`. `RunState` types them required, so TypeScript cannot see the gap,
+ * and `run.phases.length` / `run.repair_tasks.length` each throw `undefined is not an object` on
+ * such a state — the panel arrives as an error notify. The screen reads an absent array as empty:
+ * a screen must never die on a shape it did not predict.
  */
 const arr = <T>(v: T[] | undefined): T[] => (Array.isArray(v) ? v : []);
 
 /** The task rows: a selectable line per task, plus the detail lines of the SELECTED one. */
 function taskBlock(d: ScreenData, view: PanelView, theme: PanelTheme | undefined, width: number): { lines: string[]; taskRows: number[] } {
 	const run = d.run;
-	// The repair queue is a QUEUE, so it is only named when it has entries. The old fallback of
-	// `pool = repair_tasks.length ? repair_tasks : tasks` made EVERY row read "(repair)" on a
-	// normal round — a label that said the round was in repair when it was not (measured).
+	// The repair queue is a QUEUE, so it is only named when it has entries. A pool of
+	// `repair_tasks.length ? repair_tasks : tasks` makes EVERY row read "(repair)" on a normal
+	// round — a label that says the round is in repair when it is not.
 	const tasks = arr(run.tasks);
 	const repair = arr(run.repair_tasks);
 	const repairing = repair.length > 0;
@@ -262,9 +257,9 @@ export function panelLines(d: ScreenData, width: number, view: PanelView = { sel
 
 	const left = [...tasks.lines, "", ...phases];
 	const lines: string[] = [];
-	// Every content row is PADDED to the inner width: an unpadded row left the right border
-	// ragged (measured in the tmux capture: the header's `│` sat right behind the text while the
-	// rows below it reached the full width), which reads as a broken box in a real terminal.
+	// Every content row is PADDED to the inner width: an unpadded row leaves the right border
+	// ragged — the header's `│` sits right behind the text while the rows below reach the full
+	// width — which reads as a broken box in a real terminal.
 	const row = (text: string) => `│ ${pad(fit(text, inner), inner)} │`;
 	lines.push(`┌${"─".repeat(w - 2)}┐`);
 	for (const h of header) lines.push(row(h));
@@ -302,15 +297,14 @@ export function panelLines(d: ScreenData, width: number, view: PanelView = { sel
 export type PanelAction = { key: string; taskId?: string };
 
 /**
- * ESC, in EVERY encoding the host's own parser recognizes. The focused component gets RAW bytes
- * (`pi-tui` tui.js:420-425 → `focusedComponent.handleInput(data)`), and the host's escape matcher
- * (keys.js:648-654) accepts three forms: the legacy byte, the Kitty keyboard-protocol CSI-u
- * sequence (`\x1b[27u`, `\x1b[27;<mod>u`), and xterm's modifyOtherKeys (`\x1b[27;<mod>;27~`).
- * Comparing only "\x1b" is therefore dead on any terminal that enables the Kitty protocol (kitty,
- * wezterm, ghostty, foot) — the operator's report: ESC did nothing, `q` closed. The pty rig never
- * caught it because tmux's `screen` terminal does not enable the protocol, so `send-keys Escape`
- * writes the legacy byte. The Kitty RELEASE form (`...:3u`) is excluded so one press is exactly
- * one close; the host filters releases (tui.js:414-419) unless a component asks for them.
+ * ESC, in EVERY encoding the host's own parser recognizes — the single place the ESC-encoding
+ * list lives. The focused component gets RAW bytes, and the host's escape matcher accepts three
+ * forms: the legacy byte, the Kitty keyboard-protocol CSI-u sequence (`\x1b[27u`, `\x1b[27;<mod>u`),
+ * and xterm's modifyOtherKeys (`\x1b[27;<mod>;27~`). Comparing only "\x1b" is dead on any terminal
+ * that enables the Kitty protocol (kitty, wezterm, ghostty, foot), where the ESC key sends the
+ * CSI-u form; a legacy-byte terminal (tmux's `screen`) hides that miss from a pty rig. The Kitty
+ * RELEASE form (`...:3u`) is excluded so one press is exactly one close, matching the host, which
+ * filters releases unless a component asks for them.
  */
 const KITTY_CSI_U = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
 const MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
@@ -362,9 +356,8 @@ export class PanelComponent {
 		this.theme = theme;
 		this.tui = tui;
 		this.done = done;
-		// unref: the poll must never hold the process open. An open overlay's timer kept the host
-		// (and `node --test`, which is how the panel is proved) alive after every test finished —
-		// the measured cause of the suite's 420 s timeout.
+		// unref: the poll must never hold the process open. An open overlay's timer keeps the host
+		// (and `node --test`, which is how the panel is proved) alive after every test finishes.
 		this.timer = setInterval(() => void this.refresh(), refreshMs);
 		this.timer.unref?.();
 	}
@@ -400,8 +393,8 @@ export class PanelComponent {
 		const h = this.getHeight();
 		// The scroll follows the SELECTION, and only the selection: j/k and a refresh ask the view
 		// to bring the selected task on screen, while g/G/PgUp/PgDn are the operator moving the
-		// view themselves. Scrolling to the selection on every frame made `g` (jump to top)
-		// unreachable — the render snapped back to the selected row (measured in the test).
+		// view themselves. Scrolling to the selection on every frame makes `g` (jump to top)
+		// unreachable — the render snaps back to the selected row.
 		const row = this.taskRows[this.sel];
 		if (this.follow && row !== undefined) {
 			if (row < this.offset) this.offset = row;
@@ -445,9 +438,9 @@ export class PanelComponent {
 }
 
 /**
- * Open the screen. In interactive mode it is a near-full-screen overlay with keyboard focus — the
- * agents-panel shape the operator asked for; in RPC/print mode the SAME lines go to the widget,
- * which is what the headless rigs assert. The component is built from the host's TUI and Theme:
+ * Open the screen. In interactive mode it is a near-full-screen overlay with keyboard focus, in
+ * the host's agents-panel shape; in RPC/print mode the SAME lines go to the widget, which is what
+ * the headless rigs assert. The component is built from the host's TUI and Theme:
  * `PanelTui`/`PanelTheme` are the two members the panel actually uses, so the tests drive it
  * without a terminal.
  */

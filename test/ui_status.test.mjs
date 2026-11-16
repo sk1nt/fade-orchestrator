@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// ui_status.test.mjs — the status row's contract, in the operator's own words (2026-11-15:
-// "if it can't go on that line, then leave it on top, but use a nerdfont or something and just say
-// Orchestrator: plan R1/6 T0/0 etc..."). One line, docked above the editor, carrying the state, the
+// ui_status.test.mjs — the status row's contract, in the user's words: "if it can't go on that
+// line, then leave it on top, but use a nerdfont or something and just say Orchestrator: plan
+// R1/6 T0/0 etc...". One line, docked above the editor, carrying the state, the
 // round budget, the task tally and the panel key; the host's own model segment carries the model.
 // The row is the ONLY surface the loop paints, and `chordBytes` is what makes the panel's chord
 // deliverable: the listener consumes the keystroke, so the row and the key can never disagree.
@@ -96,8 +96,7 @@ test("statusLines: a run not in use answers undefined — no run, terminal, and 
 //    code): a ctrl+shift+t keystroke arrived as ctrl+t and ran the host's ctrl+t action (the pty rig,
 //    pane printed "Thinking blocks: visible").
 //  - `alt+f` LOOKS free in the strings-extracted default table and is NOT: the host's own
-//    `getShortcutConflict` answers `keybinding tui.editor.cursorWordRight` for it (rpc probe,
-//    2026-11-15), and the pty rig is what proves which layer wins the byte.
+//    `getShortcutConflict` answers `keybinding tui.editor.cursorWordRight` for it (rpc probe).
 //  - `alt+f` (ESC + `f`) is the panel's key, claimed at the RAW-INPUT layer; `alt+shift+i` is the
 //    registered fallback, and `alt+shift+f` (ESC + `F`) stays a free chord an operator can pick.
 test("chordBytes: the byte the listener consumes, and the family that has none", () => {
@@ -156,8 +155,8 @@ test("laneTag: the 2-character form for a compact row", () => {
 	assert.equal(laneTag("phi"), "phi");
 });
 
-test("modelLabel: the registry names compact to the operator's abbreviated form", () => {
-	// The exact form the operator ordered 2026-11-15: quant + GPU count, nothing else.
+test("modelLabel: the registry names compact to the abbreviated form", () => {
+	// The exact ordered form: quant + GPU count, nothing else.
 	assert.equal(modelLabel("deepseek (DeepSeek-V4.1-Flash IQ1_M, dual RTX 5090, RAM+SSD expert tier)"), "deepseek (IQ1_M, dual)");
 	assert.equal(modelLabel("deepseek (Basalt DeepSeek-V4.1-Flash UD-IQ1_M, dual RTX 5090, 122 GiB RAM SSD tier)"), "deepseek (IQ1_M, dual)");
 	assert.equal(modelLabel("flash-next (Swift Flash Next IQ3_S, dual RTX 5090)"), "flash-next (IQ3_S, dual)");
@@ -198,7 +197,7 @@ test("the surface keys: the top dock and the opt-in status-bar key", () => {
 
 // ---- redaction: the row is screenshot-safe ----
 
-// Y19 `--demo-redact`: a screenshot of the bar must show no username, no home path, no hostname
+// `--demo-redact`: a screenshot of the bar must show no username, no home path, no hostname
 // and no repo path. FADE_ORCHESTRATE_REDACT=1 is a DISPLAY concern, applied only at the render
 // boundary; the durable record — state.json, metrics.jsonl, swap_history.json — is written by other
 // modules and stays verbatim, which is why the flag-off case below demands byte-identical output.
@@ -206,7 +205,7 @@ test("the surface keys: the top dock and the opt-in status-bar key", () => {
 // these tests red on GitHub Actions (the runner's account is not the developer's).
 const USER = process.env.USER && process.env.USER.length > 1 ? process.env.USER : safeUsername();
 const HOME = `/home/${USER}`; // the shape of the HOME_PATH rule (`/home/<account>`), any OS
-const REPO = `${HOME}/projects/fadetheworld`;
+const REPO = `${HOME}/projects/sample-project`;
 const HOST = os.hostname();
 
 function safeUsername() {

@@ -1,16 +1,16 @@
 /**
  * Optimal MoE loading across turns: the engine's "last known placement" support.
  *
- * Measured basis (basalt 0.4.0, docs/configuration/index.md:108-110, 2026-11):
+ * Engine facts (basalt 0.4.0):
  * - `expert-profile-save` — **Flash-Next only**: the learned expert placement is written on exit
  *   and every `expert-profile-save-every` minutes; a later start places from it instead of
  *   relearning. Needs the adaptive tier. This is the warm start the 91 -> 130 tok/s cold ramp
  *   exists without.
  * - `expert-profile` (read side) — Flash-Next default: `data/profiles/<arch>-<layers>x<experts>.prof`.
  * - The verifier pack (DeepSeek-V4.1) has NO save path in this engine release: the only profile
- *   is the pack's own static one (`m_.tiers().expert_profile`, src/models/deepseek41/tier.cpp:499);
+ *   is the pack's own static one (`m_.tiers().expert_profile`, src/models/deepseek41/tier.cpp);
  *   `write_expert_profile` is wired only by the qwen4exp `--expert-profile-save` path
- *   (src/models/qwen4exp/serve/tier_profile.cpp:17). So DeepSeek rehearses placement every swap;
+ *   (src/models/qwen4exp/serve/tier_profile.cpp). So DeepSeek rehearses placement every swap;
  *   it cannot be made warm by configuration until the engine grows the counterpart.
  *
  * Three states must stay states, never greens:
@@ -19,11 +19,11 @@
  *   configured_live_no_profile — the flag is live, no profile file yet (nothing learned yet);
  *   engine_unsupported — the pack's model class has no save path (the verifier lane).
  *
- * Measured 2026-11-15: on this desk the knobs reach the engine through the CONFIG, not argv — the
- * router is `python -m serve.server --config <file>` and the engine's argv carries none of the
- * model aliases' keys, so an argv-only liveness test reports a working lane as "NOT live". The
- * running router's own `--config` path is therefore the liveness test, and the profile's mtime
- * against the engine process start is the write-side proof.
+ * The knobs reach the engine through the CONFIG, not argv: the router is
+ * `python -m serve.server --config <file>` and the engine's argv carries none of the model
+ * aliases' keys, so an argv-only liveness test reports a working lane as "NOT live". The running
+ * router's own `--config` path is therefore the liveness test, and the profile's mtime against
+ * the engine process start is the write-side proof.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -60,12 +60,6 @@ export function readServeConfig(path: string | undefined): { models: Record<stri
 	} catch {
 		return undefined;
 	}
-}
-
-/** The engine's own command line, preferring the basalt binary over the python router that starts it. */
-export function runningEngineArgs(): string | undefined {
-	const proof = engineProof();
-	return proof.engineCmdline ?? proof.routerCmdline;
 }
 
 export interface EngineProof {
@@ -147,8 +141,8 @@ export function laneMoe(lane: string, opts: { configPath?: string; modelsDir?: s
 	}
 	const proof = opts.proof ?? engineProof();
 	// Liveness: the caller may hand us a cmdline (the rigs' argv form, the engine's direct-launch
-	// form). On this desk the knobs reach the engine through the CONFIG the router names, so the
-	// running router's `--config` path is the test; the argv scan is the fallback for a direct launch.
+	// form). The knobs reach the engine through the CONFIG the router names, so the running
+	// router's `--config` path is the test; the argv scan is the fallback for a direct launch.
 	const argvLive = opts.liveCmdline !== undefined && opts.liveCmdline.includes("--expert-profile-save") && opts.liveCmdline.includes(savePath);
 	const configIsRunning = opts.configPath !== undefined && proof.routerConfigPath !== undefined && sameFile(proof.routerConfigPath, opts.configPath);
 	const isLive = opts.liveCmdline !== undefined ? argvLive : argvLive || configIsRunning;
@@ -180,7 +174,7 @@ export function laneMoe(lane: string, opts: { configPath?: string; modelsDir?: s
 	};
 }
 
-/** One overlay row per lane: the "load last known MoE configuration" state, measured. */
+/** One overlay row per lane: the "load last known MoE configuration" state. */
 export function moeRows(lanes: string[], opts: { configPath?: string; liveCmdline?: string; proof?: EngineProof } = {}): { label: string; value: string }[] {
 	const proof = opts.proof ?? engineProof();
 	return lanes.map((lane) => {
@@ -197,12 +191,3 @@ export function moeRows(lanes: string[], opts: { configPath?: string; liveCmdlin
 		return { label: `MoE ${lane}`, value };
 	});
 }
-
-export const MOE_ACT_DOC = `Optimal MoE loading (operator act, per lane):
-  1. in the basalt serve config's model entry add
-       "expert-profile-save": "<repo>/var/basalt-profiles/<alias>.prof",
-       "expert-profile-save-every": 10
-  2. reload that lane (POST /v1/load on the alias at a quiet moment).
-Flash-Next saves the learned adaptive-tier placement and starts from it (warm start, no 91 tok/s
-ramp). DeepSeek-V4.1 has no save path in engine 0.4.0: its placement is relearned every swap and
-cannot be made warm by configuration.`;

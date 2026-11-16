@@ -1,12 +1,11 @@
 /**
  * fade_orchestrate: one OMP session, two basalt lanes. (Wiring; the router client is
- * ./router.ts, the schema/validators/briefings are ./core.ts. The 2026-11-15 split from the
- * 601-line monolith is behavior-freeze: every string, rule and ordering is carried over.)
+ * ./router.ts, the schema/validators/briefings are ./core.ts.)
  *
  * The loop is a phase contract, not tool sandboxing: the thinking lane answers with
  * `fade_phase`, and the tool validates, records the phase and ends the turn. `agent_end` is the
- * only `setModel`/load site (the host defers model switches while streaming, and a load issued
- * into a turn's queued requests flips the lane back — the 2026-11-14 ping-pong).
+ * only `setModel`/load site: the host defers model switches while streaming, and a load issued
+ * into a turn's queued requests flips the lane back.
  *
  *   /orchestrate [--rounds N] <goal>   start a run (default 6 rounds, max 6)
  *   /orchestrate status                state, lane, round, tasks, phase log, path
@@ -40,6 +39,8 @@ import {
 	type PhaseLog,
 	type RunState,
 	type Task,
+	gitCaveat,
+	isGitRepo,
 } from "./core.ts";
 import { chordBytes, keyLabel, modelLabel, ORCH_STATUS_KEY, OVERLAY_WIDGET_KEY, statusLines, TOP_WIDGET_KEY, type FlipBadge, type SwapPill } from "./ui.ts";
 import { actCode, actHalt, actPause, actReset, actSkip, actVerify } from "./keymap.ts";
@@ -50,58 +51,56 @@ import { laneMoe } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
 import { collectScreen, type ScreenData } from "./screendata.ts";
 
-// The panel key, by measurement. The operator asked for Ctrl+O first; the host binds `ctrl+o` to
-// `app.tools.expand` and ACTS on its own bindings, so the screen cannot live there. The operator's
-// second ask (2026-11-15) is **Alt+F**, and Alt+F is the key. The host's key table binds `alt+f`
-// (`getShortcutConflict("alt+f")` → `keybinding tui.editor.cursorWordRight`), so the SHORTCUT
-// registration for it is refused — the chord is taken at the RAW-INPUT layer, where this extension
-// consumes `ESC f` (0x1b 0x66) and the host binding never runs. The registration is still
-// attempted and its refusal tolerated: the byte is the delivery, and no host binding is moved.
+// The panel key. The default is `alt+f`, not `ctrl+o`: the host binds `ctrl+o` to
+// `app.tools.expand` and ACTS on its own bindings, so the screen cannot live there. The host's
+// key table binds `alt+f` too (`getShortcutConflict("alt+f")` → `keybinding
+// tui.editor.cursorWordRight`), so the SHORTCUT registration for it is refused — the chord is
+// claimed at the RAW-INPUT layer, where this extension consumes `ESC f` (0x1b 0x66) and the host
+// binding never runs. The registration is still attempted and its refusal tolerated: the byte is
+// the delivery, and no host binding is moved.
 // Which layer wins a chord the host's table binds is a terminal fact, not an assumption, so
-// `test/pty_rig.mjs` drives the real `omp` binary and asserts `ESC f` opens the panel; if the host
-// ever steals the byte the rig names the steal and the fallback chord is what opens.
+// `test/pty_rig.mjs` drives the real `omp` binary and asserts `ESC f` opens the panel; if the
+// host ever steals the byte, the rig names the steal and the fallback chord is what opens.
 // `FADE_ORCHESTRATE_KEY` moves the chord (`ctrl+<a-z>`, `alt+<a-z>` and `alt+shift+<a-z>` have
-// byte forms; `ctrl+shift+<a-z>` does not — shift is invisible inside a control code, measured).
-// The chords the host's 38-action table leaves FREE in the single-alt family are
-// `alt+c e j q s t u v w x z`; `FADE_ORCHESTRATE_FALLBACK_KEY` (default `alt+shift+i`, probe
-// reported FREE, ESC + `I`) is the registered companion chord.
+// byte forms; `ctrl+shift+<a-z>` does not — shift is invisible inside a control code).
+// The chords the host's action table leaves FREE in the single-alt family are
+// `alt+c e j q s t u v w x z`; `FADE_ORCHESTRATE_FALLBACK_KEY` (default `alt+shift+i`, ESC +
+// `I`) is the registered companion chord.
 
-// Y10 pre-unload health gate: `POST /v1/load` unloads the RESIDENT lane, and a request queued at
-// that instant is answered by the router's own log line `swap flash-next -> deepseek (1 waiting)` —
-// 15-20 s and 52-130 GiB paid into a lane that is serving. The gate reads the router's busy surface
+// The pre-unload health gate: `POST /v1/load` unloads the RESIDENT lane, and a request queued
+// at that instant is answered by the router's own swap log line (`swap <a> -> <b> (1 waiting)`) —
+// a full pack load paid into a lane that is serving. The gate reads the router's busy surface
 // (`routerBusy`) and DEFERS the load: one poll every GATE_POLL_MS (default 3 s) for up to
-// GATE_BUDGET_MS (default 60 s) — 20 polls. Both are configuration so a rig can run a whole budget
-// in milliseconds; the documented interval/budget is what the box runs.
+// GATE_BUDGET_MS (default 60 s). Both are configuration so a rig can run a whole budget in
+// milliseconds; the documented interval/budget is what a live box runs.
 const GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3000);
 const GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 60_000);
 const FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+f";
-// Y19 `--demo-redact`: the display switch starts OFF; `/orchestrate --demo-redact` flips it for
+// `--demo-redact`: the display switch starts OFF; `/orchestrate --demo-redact` flips it for
 // the session, and `FADE_ORCHESTRATE_REDACT=1` sets the same switch from the environment.
-// Y9 fast-path threshold: the verifier swap is 13-25 s and 52-130 GiB, and the pre-swap gate has
-// already run the plan's deterministic checks on the code lane. A single-file edit under this many
-// changed lines, with the gate green on the FIRST try, completes on the code lane: the swap buys
-// nothing the exit codes did not already prove.
+// The fast-path threshold: the verifier swap is 13-25 s and 52-130 GiB, and the pre-swap gate
+// has already run the plan's deterministic checks on the code lane. A single-file edit under
+// this many changed lines, with the gate green on the FIRST try, completes on the code lane:
+// the swap buys nothing the exit codes did not already prove.
 const FASTPATH_LINES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_LINES ?? 15);
 const FASTPATH_FILES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_FILES ?? 1);
 // The status row's surface. `widget` (the default) docks it above the editor; `status` writes the
 // same text to the host's status bar, which is the right choice only for a `statusLine` config that
 // placed the `status` segment after the model — the host puts the text wherever the config says, and
-// an extension cannot move a segment (measured on this box: `status` sits on the right).
+// an extension cannot move a segment.
 const SURFACE = process.env.FADE_ORCHESTRATE_SURFACE === "status" ? "status" : "widget";
 
-// Y15: the WRITING tools, by NAME. The verifier sandbox is a denylist, not an allowlist, so a host
-// tool this file has never seen cannot slip a write past it. Delegation is NOT on the list: `task`
-// writes nothing itself, and the sessions it spawns are inert by `isDelegatedSession` — blocking it
-// here only ever blocked the operator's own coding session (measured: a `task` call from the
-// operator returned "the verifier lane is read-only — task is refused" while the on-disk run sat on
-// the thinking lane).
+// The WRITING tools, by NAME. The verifier sandbox is a denylist, not an allowlist, so a host
+// tool this file has never seen cannot slip a write past it. Delegation is NOT on the list:
+// `task` writes nothing itself, and the sessions it spawns are inert by `isDelegatedSession` —
+// blocking it here only blocks the coding session that owns the run.
 const MUTATING_TOOLS: Record<string, true> = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
 
 /**
  * Delegated (subagent) session detector. A subagent loads this extension in the SAME cwd, so an
- * unguarded `session_start` adopts the operator's run into the worker's session and drives the
+ * unguarded `session_start` adopts the owner's run into the worker's session and drives the
  * router from a session that does not own it. `PI_SESSION_FILE` separates the two shapes with no
- * configuration: the operator's jsonl sits directly under the project dir; a delegated one is
+ * configuration: the owner's jsonl sits directly under the project dir; a delegated one is
  * nested inside a parent-session dir named by the timestamp stamp and filed by agent id.
  */
 const MAIN_SESSION_DIR = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_/;
@@ -116,8 +115,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let run: RunState | undefined;
 	let runDir: string | undefined;
 	let pending: { lane: string; phase: string } | undefined;
-	/** Y10: the lane switch currently open. A pre-unload deferral keeps it open for the whole gate
-	 *  budget, and two overlapping `POST /v1/load` calls are exactly the measured ping-pong. */
+	/** The lane switch currently open. A pre-unload deferral keeps it open for the whole gate
+	 *  budget, and overlapping `POST /v1/load` calls are the ping-pong the gate prevents. */
 	let switching: string | undefined;
 	let settledNotified = false;
 	let metrics: MetricsSnapshot | undefined;
@@ -128,25 +127,23 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let panelOpen = false;
 	let conflictReported = false;
 	/** The chord is settled only when a LIVE probe says so; `probeHasAnswered` distinguishes a real
-	 *  "free" from the loading-phase probe that threw (measured: the host dispatches `session_start`
-	 *  during extension loading, where the probe throws). */
+	 *  "free" from the loading-phase probe that threw — the host dispatches `session_start` during
+	 *  extension loading, where the probe throws. */
 	let chordResolved = false;
 	let probeHasAnswered = false;
-	/** True once the disclosure's probe (or the measured chord table) says the host's own table
+	/** True once the disclosure's probe (or the fallback chord table) says the host's own table
 	 *  BINDS the configured chord. That binds the SHORTCUT registration only: the panel's chord is
 	 *  claimed at the raw-input layer, so the row keeps naming the configured chord whenever a byte
 	 *  form exists (`DELIVERED_KEY`). The flag drives the disclosure's wording — a row that
-	 *  advertises a chord the extension never claims is a row that advertises a dead key
-	 *  (verifier review 2026-11-15: the HELD rig state showed `[Ctrl+O]` while its own assertion
-	 *  read "ctrl+o opens nothing"). */
+	 *  advertises a chord the extension never claims is a row that advertises a dead key. */
 	let chordHeld = false;
 	let turnSeq = 0;
 	let turnPhase: string | undefined;
 	let turnSwapMs = 0;
 	/** The active-tool set captured when the verifier sandbox closed; restored when the code lane loads. */
 	let verifierTools: string[] | undefined;
-	/** Y21: the lane churn the flip guard observed, as the surfaces render it. `undefined` when
-	 *  the window is quiet, so a healthy run never advertises a flip. */
+	/** The lane churn the flip guard observed, as the surfaces render it. `undefined` when the
+	 *  window is quiet, so a healthy run never advertises a flip. */
 	let flipBadge: FlipBadge | undefined;
 	/** The lane the router is loading RIGHT NOW, as the status row renders it. Set by `switchLane`
 	 *  for the loop's own swap and refreshed from the swap watch's /health samples, so the row is
@@ -170,7 +167,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		}
 	};
 	// The metrics tick is also the flip watcher's poll, so its cadence is configuration: the host
-	// default is 30 s, the rigs drive 2 s to watch a whole guard window in seconds.
+	// default is 30 s; the rigs drive 2 s to watch a whole guard window in seconds.
 	const METRICS_INTERVAL_MS = Math.max(250, Number(process.env.FADE_ORCHESTRATE_METRICS_INTERVAL_MS ?? 30_000));
 	const startMetricsTimer = (): void => {
 		stopMetricsTimer();
@@ -182,7 +179,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		void watchFlips();
 	};
 	/**
-	 * Y21: read the router's swap line, then answer the guard question for the lane THIS RUN
+	 * Read the router's swap line, then answer the guard question for the lane THIS RUN
 	 * holds — not the router's transient resident entry, which mid-swap names the lane being
 	 * unloaded and would read the loop's own swap as a flip. The watch is read-only: the churn
 	 * belongs to another client, so the loop pays nothing for it and only names it.
@@ -194,8 +191,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if ((next?.flips ?? 0) === (flipBadge?.flips ?? 0)) return;
 		flipBadge = next;
 	};
-	// Pill suffix: the measured ramp reads cold (deepseek ~91 against a ~130 steady = 0.70), a
-	// loaded lane reads hot; idle reads as nothing.
+	// The ramp reads cold (a fresh pack decodes well under its steady rate), a loaded lane reads
+	// hot; idle reads as nothing.
 	const pillSuffix = (): string | undefined => {
 		if (!metrics) return undefined;
 		const ch = coldHot(metrics.tok_s, laneBest);
@@ -203,7 +200,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		return `${ch.label} ${Math.round(ch.rate)}t/s`;
 	};
 
-	// Y18: one durable JSONL line per turn, built ONLY from numbers the router reported —
+	// One durable JSONL line per turn, built ONLY from numbers the router reported —
 	// `turnRecordOrNull` returns undefined without a numeric pp AND tg, so a closed router appends
 	// nothing and the ledger never carries a fabricated zero.
 	const recordTurn = async (outcome: string): Promise<void> => {
@@ -222,9 +219,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (rec) appendTurn(runDir, rec);
 	};
 
-	// Y15: the thinking lane plans, inspects and runs; it never edits. setActiveTools removes the
-	// mutating tools on entry to the verifier lane and restores the captured set when the code lane
-	// loads; `tool_call` below is the enforcement layer for anything that still tries.
+	// The thinking lane's tool set: setActiveTools removes the mutating tools on entry to the
+	// verifier lane and restores the captured set when the code lane loads; the `tool_call` hook
+	// is the enforcement layer for anything that still tries.
 	const applyToolPolicy = async (lane: string): Promise<void> => {
 		const active = pi.getActiveTools();
 		if (lane === THINK_LANE) {
@@ -241,13 +238,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Measured on this host: registerTool() puts fade_phase in the registry (/tools lists it) but
+	 * registerTool() puts fade_phase in the registry (/tools lists it) but
 	 * NOT in the active set the model is offered, so every phase briefing must activate it first.
 	 *
 	 * The action methods are GUARDED during extension loading — omp 18.20.2 throws
 	 * "Extension runtime not initialized. Action methods cannot be called during extension
 	 * loading." — and the host can dispatch `session_start` before it installs the runtime. That
-	 * throw disabled the WHOLE extension (measured 2026-11-15 in both live rigs: every assertion
+	 * throw disables the WHOLE extension (every hook, command and tool behind
 	 * failed behind `Warning: Failed to load extension …/fade_orchestrate.ts`). So this call is
 	 * defensive and answers a boolean; `agent_start` runs it again, and by the first turn the
 	 * runtime is live — the only moment the tool has to exist.
@@ -270,8 +267,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 
 	/** The gate's checks are DATA: read the file, so an on-disk repair reaches the run object.
 	 *  Without this the gate is unrepairable in a live session — `state.json` can carry fixed
-	 *  commands while the session re-judges the plan's original broken pair (run
-	 *  20261115T091232Z-rqtj, two checks, every round). The refresh is announced, never silent. */
+	 *  commands while the session re-judges the plan's original broken checks, every round. The
+	 *  refresh is announced, never silent. */
 	const gateChecks = (ctx: ExtensionContext): void => {
 		if (!run) return;
 		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
@@ -279,9 +276,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (r.changed) ctx.ui.notify(`orchestrate: the pre-swap gate re-read the checks from ${statePath()} — ${r.removed.length} replaced, ${r.added.length} added, ${r.to} total`, "info");
 	};
 
-	/** Y9: the diff the fast path prices — changed paths and changed lines in the working tree vs
-	 *  HEAD, with untracked files counted as paths. `files: -1` names a tree git cannot speak for,
-	 *  which is never fast-path eligible. */
+	/** The diff the fast path prices — changed paths and changed lines in the working tree vs
+	 *  HEAD, with untracked files counted as paths. `files: -1` names a tree git cannot speak
+	 *  for, which is never fast-path eligible. */
 	const fastPathDiff = (repo: string): { files: number; lines: number } => {
 		try {
 			const numstat = execFileSync("git", ["-C", repo, "diff", "--numstat", "HEAD"], { encoding: "utf8" });
@@ -302,8 +299,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	/** True once THIS process has written the status-bar row (the opt-in surface). The widget
-	 *  surface never touches `setStatus` at all — proved by `test/rpc_rig.mjs`: the default surface
-	 *  is the top widget, and a clear-only call there is an API touch the contract forbids. */
+	 *  surface never touches `setStatus` at all — proved by `test/rpc_rig.mjs`: the default
+	 *  surface is the top widget, and a clear-only call there is an API touch the contract
+	 *  forbids. */
 	let statusWritten = false;
 	/**
 	 * Clear BOTH surfaces. A run not in use leaves nothing on screen, and the surface that is
@@ -324,17 +322,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			ctx.ui.setWidget(OVERLAY_WIDGET_KEY, undefined);
 			return;
 		}
-		// ONE status row, and ONLY while a run is in use (operator order 2026-11-15: the status must
-		// "exist at the top … only when in use … no footer for now", then "use a nerdfont … and just
-		// say Orchestrator: plan R1/6 T0/0"). `statusLines` answers `undefined` for no run, for a
-		// terminal run (including a run adopted from disk at session_start) and for a run this
-		// session does not own, and every one of those CLEARS the surface. The default surface is the
-		// top widget: the host prints `setStatus` text in the `status` segment wherever the USER's
-		// `statusLine` config placed it, and an extension cannot add or move a status-line segment,
-		// so the row — not the bar — is what the loop can own (ui.ts: "Placement").
+		// ONE status row, and ONLY while a run is in use. `statusLines` answers `undefined` for no
+		// run, for a terminal run (including a run adopted from disk at session_start) and for a
+		// run this session does not own, and every one of those CLEARS the surface. The default
+		// surface is the top widget: the host prints `setStatus` text in the `status` segment
+		// wherever the USER's `statusLine` config placed it, and an extension cannot add or move
+		// a status-line segment, so the row — not the bar — is what the loop can own.
 		// `FADE_ORCHESTRATE_SURFACE=status` opts into the status bar for a config that placed the
-		// `status` segment right after the model. The detail view stays the panel, and the row's key
-		// hint is the configured chord's label, so the row never advertises a key it does not honor.
+		// `status` segment right after the model. The detail view stays the panel, and the row's
+		// key hint is the configured chord's label, so the row never advertises a key it does not
+		// honor.
 		const lines = statusLines(run, { suffix: pillSuffix(), flip: flipBadge, owned: !isDelegatedSession(), swap: swapPill, key: keyLabel(DELIVERED_KEY) });
 		if (!lines) {
 			clearSurface(ctx);
@@ -357,14 +354,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Y10: hold the lane load while the router is SERVING, and say so out loud. `laneSwap` calls this
-	 * BEFORE `setModel`/`loadLane`: a model switch issued into a lane that is still serving queues the
-	 * request the router answers by swapping BACK. The gate is bounded (GATE_POLL_MS/GATE_BUDGET_MS)
-	 * and visible — the first busy poll notifies, every poll refreshes the working message with the
-	 * elapsed budget and the counters the router reported. It is a DEFERRAL, not a refusal: the caller
-	 * keeps `pending` set, so the owed lane survives the whole wait. `over_budget` (busy for the full
-	 * budget) pays the load anyway — a loop that never lands its lane is a stalled run — and the
-	 * call site records that decision in `rejection_history`.
+	 * Hold the lane load while the router is SERVING, and say so out loud. `switchLane` calls
+	 * this BEFORE `setModel`/`loadLane`: a model switch issued into a lane that is still serving
+	 * queues the request the router answers by swapping BACK. The gate is bounded
+	 * (GATE_POLL_MS/GATE_BUDGET_MS) and visible — the first busy poll notifies, every poll
+	 * refreshes the working message with the elapsed budget and the counters the router reported.
+	 * It is a DEFERRAL, not a refusal: the caller keeps `pending` set, so the owed lane survives
+	 * the whole wait. `over_budget` (busy for the full budget) pays the load anyway — a loop
+	 * that never lands its lane is a stalled run — and the call site records that decision in
+	 * `rejection_history`.
 	 */
 	const gateRouterIdle = async (lane: string, ctx: ExtensionContext): Promise<{ waited_ms: number; polls: number; over_budget: boolean; last: RouterBusy }> => {
 		const t0 = Date.now();
@@ -384,10 +382,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
 	};
 
-	// The lane switch as one callable unit: `agent_end` (the phase contract's single load site)
-	// and the overlay's v/c keys run the SAME sequence — setModel, setThinkingLevel, the
-	// settle-then-load router call, persist, paint, briefing. No queued-request window exists
-	// while a slash command runs, so calling it from a command is the same boundary discipline.
+	// The lane switch as one callable unit: `agent_end` (the single load site) and the overlay's
+	// v/c keys run the SAME sequence — setModel, setThinkingLevel, the settle-then-load router
+	// call, persist, paint, briefing. No queued-request window exists while a slash command runs,
+	// so calling it from a command is the same boundary discipline.
 	const switchLane = async (lane: string, ctx: ExtensionContext): Promise<void> => {
 		const model = ctx.modelRegistry.find(PROVIDER, lane);
 		if (!model) {
@@ -400,15 +398,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			return;
 		}
 		pi.setThinkingLevel(THINKING[lane]);
-		// Swap watch: samples /health (phase, percent) while the pack loads, then reads the
-		// first-completion and steady decode rates off /metrics and appends a history row —
-		// the durable measurement behind batch-verification-into-one-residency decisions.
+		// Swap watch: samples /health (phase, percent) while the pack loads, reads the
+		// first-completion and steady decode rates off /metrics, and appends a durable history
+		// row per swap — the measurement record behind residency decisions.
 		const from = run?.lane ?? "";
 		// The status row names the switch, multicolored, while the pack is coming in: the model name
 		// appears here exactly once (abbreviated), and the steady row names no model at all.
 		swapPill = { from, to: modelLabel(model.name ?? lane) };
 		paint(ctx);
-		// Optimal MoE loading, measured per swap (moe.ts): the Flash-Next pack saves its learned
+		// Optimal MoE loading (moe.ts): the Flash-Next pack saves its learned
 		// adaptive-tier placement and starts from it; the profile's existence + age BEFORE this
 		// swap is what decides "warm start" vs the 91 tok/s cold ramp.
 		const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
@@ -504,20 +502,20 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		try {
 			await openPanel(ctx, provider, (a) => actOnPanel(ctx, a), process.env.FADE_ORCHESTRATE_HEADLESS === "1");
 		} catch (e) {
-			// The message alone sent me hunting twice: the panel renders from six sources, and the
-			// message names the expression, not the caller. Two stack lines ride along.
+			// The panel renders from six sources and a bare message names the expression, not
+			// the caller; two stack lines ride along so the failure is locatable.
 			const where = e instanceof Error && typeof e.stack === "string" ? ` @ ${e.stack.split("\n").slice(1, 4).map((l) => l.trim()).join(" | ")}` : "";
 			ctx.ui.notify(`orchestrate: panel failed: ${String(e instanceof Error ? e.message : e)}${where}`, "error");
 		}
 	};
 
-	// The read is guarded, not just the call. omp 18.20.2's loading-phase proxy answers a property
-	// `get` of a guarded action method with the SAME throw as the call, and a throw in the factory body
-	// fails the LOAD: measured 2026-11-15 in a live operator session, the extension died behind
-	// `Warning: Failed to load extension …/fade_orchestrate.ts: Extension runtime not initialized.
-	// Action methods cannot be called during extension loading.` — which silently costs the status row,
-	// the panel, `/orchestrate` AND the `fade_phase` tool, because `registerTool`/`registerCommand`
-	// below it never run. One refused property read must never be able to take the surface down.
+	// The read is guarded, not just the call. omp 18.20.2's loading-phase proxy answers a
+	// property `get` of a guarded action method with the SAME throw as the call, and a throw in
+	// the factory body fails the LOAD: the extension dies behind `Warning: Failed to load
+	// extension …/fade_orchestrate.ts: Extension runtime not initialized. Action methods cannot
+	// be called during extension loading.` — which silently costs the status row, the panel,
+	// `/orchestrate` AND the `fade_phase` tool, because `registerTool`/`registerCommand` below it
+	// never run. One refused property read must never be able to take the surface down.
 	let conflictProbe: unknown;
 	try {
 		conflictProbe = Reflect.get(pi, "getShortcutConflict");
@@ -527,11 +525,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	/**
 	 * The host's answer about a chord, `undefined` when the chord is free: `kind` names the class
 	 * (`reserved` / `keybinding`) and `owner`/`keybindings[0]` the host action that holds it. Swallowed
-	 * for two measured reasons: the method is absent from the published types, and omp 18.20.2's
+	 * for two reasons: the method is absent from the published types, and omp 18.20.2's
 	 * loading-phase stub throws "Extension runtime not initialized. Action methods cannot be called
-	 * during extension loading." for it, which disabled the whole extension (measured 2026-11-15 in the
-	 * rpc and pty rigs, where every assertion failed behind `Warning: Failed to load extension
-	 * …/fade_orchestrate.ts`). `probeHasAnswered` separates a swallowed throw from a real "free".
+	 * during extension loading." for it. A throw here during loading disables the whole
+	 * extension. `probeHasAnswered` separates a swallowed throw from a real "free".
 	 */
 	const hostConflict = (key: string): { kind: string; owner?: string; keybindings?: string[] } | undefined => {
 		if (typeof conflictProbe !== "function") return undefined;
@@ -545,21 +542,21 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 
-	// The chord, claimed at the raw-input layer. `registerShortcut` is refused for a chord the host's
-	// table binds ("Extension shortcut conflicts with built-in shortcut" in getShortcuts, measured for
-	// ctrl+o, and the probe says the same for alt+f), and the refusal is tolerated; the RAW byte is the
-	// delivery, so `ESC f` opens the panel and the host's `tui.editor.cursorWordRight` never runs.
+	// The chord, claimed at the raw-input layer. `registerShortcut` is refused for a chord the
+	// host's table binds ("Extension shortcut conflicts with built-in shortcut" in getShortcuts
+	// for ctrl+o, and the probe says the same for alt+f), and the refusal is tolerated; the RAW
+	// byte is the delivery, so `ESC f` opens the panel and the host's `tui.editor.cursorWordRight`
+	// never runs.
 	// While the panel is open the byte is NOT consumed: the overlay keeps its own keys (esc closes).
 	const CHORD = chordBytes(FADE_KEY);
 	const FALLBACK_KEY = process.env.FADE_ORCHESTRATE_FALLBACK_KEY ?? "alt+shift+i";
 	/** The listener's family is ESC + a byte: `alt+<letter>` and `alt+shift+<letter>` are the chords
 	 *  whose keystroke the extension can claim ahead of the host — `onTerminalInput` sees the two
-	 *  bytes and returns `consume`. A control code is NOT in that family: the host ACTS on it
-	 *  (measured, a raw `C-o` printed `Tool output expansion: enabled` and the listener never saw
-	 *  `0x0f`), so a configured control chord stays the host's and the fallback chord is what opens.
-	 *  `DELIVERED_KEY` is the chord the keystroke actually delivers, and it is what the row names: a
-	 *  row advertising a key that opens nothing was the measured defect (the pty rig caught
-	 *  `[Ctrl+O]` painted while its own assertion read "ctrl+o opens nothing", verifier review 2026-11-15).
+	 *  bytes and returns `consume`. A control code is NOT in that family: the host acts on the
+	 *  raw byte before the listener sees it, so a configured control
+	 *  chord stays the host's and the fallback chord is what opens. `DELIVERED_KEY` is the chord
+	 *  the keystroke actually delivers, and it is what the row names: a row advertising a key
+	 *  that opens nothing is a lie; the pty rig asserts the painted key is the delivering one.
 	 */
 	const RAW_DELIVERABLE = CHORD !== undefined && CHORD.startsWith("\x1b");
 	const DELIVERED_KEY = RAW_DELIVERABLE ? FADE_KEY : FALLBACK_KEY;
@@ -574,22 +571,22 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * The host's chord table — the chords its own action table binds, read out of the 18.20.2 binary and
-	 * confirmed at runtime by the conflict probe where the probe answers (measured 2026-11-15: `alt+f`
-	 * answers `keybinding tui.editor.cursorWordRight`, so its shortcut registration is REFUSED and the
-	 * raw listener delivers the byte; `alt+shift+i` answers FREE, which is why the fallback registers).
+	 * The host's chord table — the chords its own action table binds, read out of the 18.20.2
+	 * binary and confirmed at runtime by the conflict probe where the probe answers: `alt+f`
+	 * answers `keybinding tui.editor.cursorWordRight` (its shortcut registration is REFUSED; the
+	 * raw listener delivers the byte), `alt+shift+i` answers FREE (which is why the fallback
+	 * registers).
 	 *
-	 * The table exists because the probe is **not callable when a hook can run**: `getShortcutConflict`
-	 * throws for the loading-phase proxy, `session_start` fires inside that window, and an idle TUI
-	 * session — the pty rig, and an operator reading the wall — has no `agent_start` to retry on. Measured
-	 * in every rig state: with the disclosure tied to the probe alone it never reached the screen. So the
-	 * probe decides when it answers and the table decides when it does not; the chord is always disclosed.
+	 * The table exists because the probe is NOT callable when a hook can run:
+	 * `getShortcutConflict` throws for the loading-phase proxy, `session_start` fires inside that
+	 * window, and an idle TUI session has no `agent_start` to retry on. The probe decides the
+	 * chord when it answers; the table decides when it cannot; the chord is always disclosed.
 	 *
-	 * The table's boundary is the disclosed truth: a chord NOT in it, behind a probe that never answers,
-	 * is advertised as configured (`chordHeld` stays false) — the table is the only knowledge in that
-	 * state, and claiming a chord this extension registers is held, when nothing says it is, would be a
-	 * invented conflict. The raw-input listener and `registerShortcut` both attempt it, so the disclosure
-	 * matches what the keystroke will do (verifier review 2026-11-15, residual named and accepted).
+	 * A chord NOT in the table, behind a probe that never answers, is advertised as configured
+	 * (`chordHeld` stays false): the table is the only knowledge in that state, and claiming a
+	 * registered chord is held when nothing says so would be an invented conflict. The raw-input
+	 * listener and `registerShortcut` both attempt the chord, so the disclosure matches what the
+	 * keystroke will do.
 	 */
 	const HOST_HELD_CHORDS: Record<string, true> = {
 		"ctrl+c": true, "ctrl+d": true, "ctrl+g": true, "ctrl+l": true, "ctrl+o": true, "ctrl+r": true,
@@ -620,10 +617,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			: held
 				? `orchestrate: ${keyLabel(FADE_KEY)} is held by the host (${conflict ? `${conflict.kind}${owner ? ` ${owner}` : ""}` : "the host's key table binds it"}) — the screen opens on ${keyLabel(FALLBACK_KEY)}. Point FADE_ORCHESTRATE_KEY at a chord the host's conflict probe reports FREE; the host holds alt+a/b/d/f/g/h/i/k/l/m/n/o/p/r/y, alt+shift+c/k/l/p/v and ctrl+c/d/g/l/o/r/s/t/y/z. An alt+<letter> chord is delivered by this extension's raw-input listener; a control code is the host's alone`
 				: `orchestrate: ${keyLabel(DELIVERED_KEY)} opens the orchestration screen; ${keyLabel(FALLBACK_KEY)} is the registered fallback and /orchestrate overlay is the command path`;
-		// The FIRST notify of a session is swallowed by the host's TUI attach: measured in the pty rig
-		// (2026-11-15), the disclosure fired at `session_start` never reached the scrollback while the
-		// notify ~20 lines later in the same hook rendered every time. Deferring past the attach is the
-		// remedy; the one-shot flags above are set synchronously, so the deferral can never double-print.
+		// The FIRST notify of a session is swallowed by the host's TUI attach: the disclosure
+		// fired at `session_start` never reaches the scrollback, while a notify ~20 lines later
+		// in the same hook renders every time. Deferring past the attach is the remedy; the
+		// one-shot flags above are set synchronously, so the deferral can never double-print.
 		const at = setTimeout(() => ctx.ui.notify(text, "info"), 500);
 		at.unref?.();
 	};
@@ -648,11 +645,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			st.tasks = (payload.tasks as Task[]).map((t) => ({ ...t, round: st.round }));
 			st.checks = payload.checks as [string, string][];
 			st.tier = st.tasks.length <= 2 ? "S" : st.tasks.length <= 4 ? "M" : "L";
-			// Y8: the cap is the PLAN's, not a constant. A task that declares `complexity` sets the
+			// The cap is the PLAN's, not a constant. A task that declares `complexity` sets the
 			// tier (trivial 2 / standard 4 / deep 6, the max over the plan); a plan declaring none
-			// falls back to the measured task-count curve (2 tasks reserve 3 rounds, 6 reserve 5).
-			// Swaps are the unit of cost (13-25 s per pack load), and the operator's `--rounds`
-			// budget is the ceiling in both cases.
+			// falls back to the task-count curve (2 tasks reserve 3 rounds, 6 reserve 5).
+			// Swaps are the unit of cost (13-25 s per pack load), and the `--rounds` budget is
+			// the ceiling in both cases.
 			st.max_rounds = roundsForTasks(st.tasks, st.max_rounds);
 			st.repair_tasks = [];
 			st.state = "coding";
@@ -723,10 +720,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			if (!allowed) throw new Error(`fade_phase: state ${run.state} takes no phase`);
 			// ONE exception, and only when the gate PROVED it: a check bash refuses to PARSE is a
 			// defect in the plan, and no tree state can move its exit code. Refusing the plan act
-			// from `coding` is what livelocked run 20261115T091232Z-rqtj — seven coding_done
-			// reports, seven identical refusals, zero lane loads. The exception re-declares CHECKS
-			// only, and the tasks must be the plan's own (validated below), so it cannot rewrite
-			// the plan to dodge a red gate.
+			// from `coding` livelocks the run: identical refusals, zero lane loads. The exception
+			// re-declares CHECKS only, and the tasks must be the plan's own (validated below), so
+			// it cannot rewrite the plan to dodge a red gate.
 			const gatePlanDefect = (run.gate_last?.results ?? []).some((r) => r.invalid);
 			if (params.phase !== allowed) {
 				if (!(params.phase === "planning_done" && run.state === "coding" && gatePlanDefect)) {
@@ -801,18 +797,17 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				throw new Error(text);
 			}
 			// The lane is `applyPhase`'s decision, so the state machine and the load can never
-			// disagree — and the swap is NOT issued here. This turn is about to abort with its
-			// chat requests still queued at the router, and a load issued into that queue makes
-			// the router swap to the entry the QUEUED requests name (the 21:55-21:58 ping-pong).
-			// `agent_end` is the single load site, after the turn is closed.
+			// disagree — and the swap is NOT issued here: the router swaps to the entry the
+			// QUEUED requests name, and this turn is about to abort with its chat requests still
+			// queued. `agent_end` is the single load site, after the turn is closed.
 			const applied = applyPhase(params.phase, payload);
 			turnPhase = params.phase;
-			// Y1: an accepted phase is the end of the protocol streak. `round`/`max_rounds` are
+			// An accepted phase is the end of the protocol streak. `round`/`max_rounds` are
 			// untouched here — a lane that reports never owes the round budget anything.
 			classifyTurnEnd(run, true);
 			let checkpointNote = "";
 			if (params.phase === "verification_done" && applied.nextState === "complete") {
-				// Y16: tag the tree at the moment each task was accepted, namespaced per run.
+				// Tag the tree at the moment each task was accepted, namespaced per run.
 				// `run` is a mutable `let`, so the closure below loses the guard's narrowing.
 				const st: RunState = run;
 				const tags = st.tasks.filter((t) => t.status === "passed").map((t) => tagCheckpoint(st.repo, st, t.id));
@@ -821,7 +816,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				const refused = tags.filter((t) => !t.ok);
 				if (refused.length > 0) checkpointNote += `; checkpoint FAILED ${refused.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
 			}
-			// T4 pre-swap gate: on coding_done, before paying the verifier swap (13-25 s pack
+			// The pre-swap gate: on coding_done, before paying the verifier swap (13-25 s pack
 			// load), run the plan's own checks on the code lane. Red keeps the coding lane
 			// resident (loadLane on the resident entry costs 0 s), records the rejection, and
 			// sends the gate briefing with the observed tails — self-repair without a swap.
@@ -844,13 +839,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					};
 				}
 			}
-			// Y9 fast-path single-model bypass. The gate is green, every task in the window is
+			// The fast-path single-model bypass. The gate is green, every task in the window is
 			// passed, the diff is under the threshold, and this round has taken no task/verification
 			// rejection — the first try. The verifier's evidence IS the exit codes the gate just
 			// collected, so the 13-25 s / 52-130 GiB swap buys nothing: the run completes on the
 			// code lane and pays ZERO lane loads. The accepted phase is recorded by name so the
 			// phase rail and the ledger show what happened, and the checkpoints land exactly as an
-			// accepted verification would (Y16).
+			// accepted verification would.
 			if (params.phase === "coding_done" && applied.nextState === "verifying" && run.gate_last?.passed === true) {
 				const st2: RunState = run;
 				const firstTry = !(st2.rejection_history ?? []).some((r) => r.round === st2.round && (r.kind === "task" || r.kind === "verification"));
@@ -903,17 +898,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		},
 	});
 
-	// The panel's chord is registered as a shortcut, so the HOST parses the chord string: that is the
-	// robust delivery for an `alt+…` chord, whose two bytes (ESC + letter) a pty can split across
-	// reads. The host is the authority on who owns a chord — `getShortcuts()` logs
+	// The panel's chord is registered as a shortcut, so the HOST parses the chord string: that
+	// is the robust delivery for an `alt+…` chord, whose two bytes (ESC + letter) a pty can
+	// split across reads. The host is the authority on who owns a chord — `getShortcuts()` logs
 	// "Extension shortcut conflicts with built-in shortcut" and skips a chord its table holds
-	// (measured for `ctrl+o`) — and the raw-input listener bound at `session_start` stays as the
-	// byte-level path. Both routes go through `openPanelGuarded`, so a keystroke opens one panel.
+	// (it does so for `ctrl+o`) — and the raw-input listener bound at `session_start` stays as
+	// the byte-level path. Both routes go through `openPanelGuarded`, so a keystroke opens one
+	// panel.
 	//
-	// Registration runs in the factory body, i.e. at LOAD. The same rule as the probe read above: a
-	// refused chord SKIPS and never propagates, because a load-time throw costs the status row, the
-	// panel, `/orchestrate` and the `fade_phase` tool at once. The fallback chord and
-	// `/orchestrate overlay` are the paths that survive a refused chord.
+	// Registration runs in the factory body, i.e. at LOAD: a load-time throw costs the status
+	// row, the panel, `/orchestrate` and the `fade_phase` tool at once, so a refused chord SKIPS
+	// and never propagates. The fallback chord and `/orchestrate overlay` are the paths that
+	// survive a refused chord.
 	const registerChord = (key: string, description: string): void => {
 		try {
 			pi.registerShortcut(key as Parameters<typeof pi.registerShortcut>[0], {
@@ -937,7 +933,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	pi.registerCommand("orchestrate", {
 		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | skip [Tn] | verify | reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
-			// Y19 `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
+			// `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
 			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
 			// form flips the switch, and `--demo-redact=off` (or `=0`) turns it back. The durable
 			// record — state.json, metrics.jsonl, swap_history.json — is never touched.
@@ -1031,7 +1027,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return;
 			}
 			if (isDelegatedSession()) {
-				// A worker session never STARTS a run: the run is the operator's, in this same cwd.
+				// A worker session never STARTS a run: the run belongs to the session that started it.
 				ctx.ui.notify("orchestrate: this is a delegated (subagent) session — the run belongs to the session that started it, so /orchestrate <goal> is refused here", "warning");
 				return;
 			}
@@ -1069,6 +1065,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			}
 			const runId = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
 			const repo = ctx.cwd;
+			// A non-git run root is knowable at this keystroke and changes what the loop can prove; say it
+			// now, not two rounds later as a wall of red `blocked` rows (measured 2026-11-15, fade-fabric
+			// run 20261115T193201Z-vsuq: the synthesizer has no git evidence, every task landed blocked).
+			if (!isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${gitCaveat(repo)}`, "warning");
 			runDir = join(repo, "var", "omp-orchestrate");
 			run = {
 				key: STATE_KEY,
@@ -1109,12 +1109,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		// A delegated session NEVER adopts the run. The loop, its nudges, its lane loads and its
-		// ledger belong to the session that owns the run. Measured cost of the old adoption (basalt
-		// serve log 2026-11-15 04:16:13-04:20:14, two subagent spin-ups): `swap flash-next ->
-		// deepseek` (18.0 s / 19.8 s, 129.5 GiB each) followed immediately by `swap deepseek ->
-		// flash-next` (16.1 s, 52.2 GiB) with ZERO tokens served on the verifier — 70.1 s and four
-		// loads, while the read-only refusals landed on the workers' own edits.
+		// A delegated session NEVER adopts the run: the loop, its nudges, its lane loads and its
+		// ledger belong to the session that owns the run. Adoption drives the router from a
+		// session that does not own it — double lane loads with zero tokens served.
 		if (isDelegatedSession()) return;
 		await ensurePhaseTool();
 		// Bind the chord for this session. A delegated worker never binds it: the keystroke is global
@@ -1126,8 +1123,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return { consume: true };
 			});
 		}
-		// One disclosure of the chord: the probe decides when it answers, the host's chord table when
-		// it cannot (see `resolveChord`).
+		// One disclosure of the chord: the probe decides when it answers, the chord table when
+		// it cannot; the chord is always disclosed.
 		resolveChord(ctx);
 		const repo = ctx.cwd;
 		const active = readJson<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
@@ -1177,7 +1174,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				void recordTurn("paused");
 				return;
 			}
-			// Tier-1 protocol gate (Y1). A turn that ends with no accepted fade_phase is PROTOCOL
+			// Tier-1 protocol gate. A turn that ends with no accepted fade_phase is PROTOCOL
 			// debt: `round`/`max_rounds` never move, and while the offending lane is the resident
 			// one a nudge costs nothing (no swap). Three tiers, counted in `stall_count`.
 			const tier = classifyTurnEnd(run, false);
@@ -1255,22 +1252,25 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		classifyTurnEnd(run, true);
 		void recordTurn(turnPhase ?? next.phase);
 		// THE SINGLE LOAD SITE, at the turn boundary: the previous turn is closed, so nothing is
-		// queued at the router naming the lane we are leaving — that queue is what flipped the
-		// lane back 0-2 s after every swap (the 21:55-21:58 ping-pong). `loadLane` settles an
-		// in-flight swap and refuses to reload the resident entry, so a round that wants the
-		// lane already resident pays 0 s.
+		// queued at the router naming the lane we are leaving — that queue is what flips the lane
+		// back seconds after a swap. `loadLane` settles an in-flight swap and refuses to reload
+		// the resident entry, so a round that wants the lane already resident pays 0 s.
 		await switchLane(next.lane, ctx);
 	});
 
-	// Y15 enforcement: the verifier lane is read-only. An edit/write/apply_patch/task attempted
-	// while the thinking lane holds the run is refused with the rule named, so the fix is
-	// DELEGATED back to the coder instead of silently applied by the verifier.
+	// Enforcement: the verifier lane is read-only. An edit/write/apply_patch attempted while the
+	// thinking lane holds the run is refused with the rule named, so the fix is DELEGATED back
+	// to the coder instead of silently applied by the verifier. The sandbox is the denylist
+	// (`MUTATING_TOOLS`), not an allowlist: a host tool this file has never seen cannot slip a
+	// write past it. `task` is NOT refused — it writes nothing itself, its spawned sessions are
+	// inert by `isDelegatedSession`, and refusing it would only block the coding session that
+	// owns the run.
 	pi.on("tool_call", (event: { toolName?: string }) => {
-		// The guard reads the ON-DISK run, not this session's copy: a session started before a lane
-		// change would otherwise enforce a lane that no longer exists (measured: the operator's own
-		// edits were refused by a stale in-memory `deepseek` with no way to unblock the session).
-		// Enforcement is the VERIFIER'S TURN only — `state: verifying` is the state the row names —
-		// and never inside a delegated session, which is inert by `isDelegatedSession`.
+		// The guard reads the ON-DISK run, not this session's copy: a session started before a
+		// lane change would otherwise enforce a lane that no longer exists, with no way to
+		// unblock the session. Enforcement is the VERIFIER'S TURN only — `state: verifying` is
+		// the state the row names — and never inside a delegated session, which is inert by
+		// `isDelegatedSession`.
 		if (!run || isDelegatedSession()) return undefined;
 		const live = runDir ? readJson<RunState>(join(runDir, STATE_FILENAME)) : undefined;
 		if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return undefined;

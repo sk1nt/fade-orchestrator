@@ -6,14 +6,13 @@ entries carried **byte-identical settings** (`kv fp8`, `max-context 1048576`, `d
 `spec 3`, `pool-workers 8`, `ram-reserve-mib 8192`, `vram-reserve-mib 2048`, `gpu 0,1`) — only the
 pack path differs, so the numbers below are the pack's effect, not a config's.
 
-**These are our tuned settings, not basalt's defaults** — the default engine would run `spec 6`,
-an auto CPU pool (~23 workers on this host), `ram-reserve-mib 2048`, `vram-reserve-mib 700` and
-`max-context 8192`. The tuning, its rationale and its measured effect live with the host project
-(`docs/ops/BASALT_SETTINGS_AUDIT_20261115.md`); the short version: `spec 3` + 32 draft experts is
-the pack's own measured optimum, the pinned 8-worker pool keeps the host's trading plane off the
+**These are tuned settings, not basalt's defaults** — the default engine would run `spec 6`,
+an auto CPU pool (~23 workers), `ram-reserve-mib 2048`, `vram-reserve-mib 700` and
+`max-context 8192`. The short version of the tuning: `spec 3` + 32 draft experts is
+the pack's own measured optimum, the pinned 8-worker pool keeps host load off the
 expert pool, and the reserve is sized so IQ2's expert tier fits as much of the pack as RAM allows.
 
-Measured on one host: 48-core, **122 GiB RAM**, 2 × 32.6 GiB VRAM, engine basalt 0.4.0, NVMe
+Measured on a reference host: 48-core, **122 GiB RAM**, 2 × 32.6 GiB VRAM, engine basalt 0.4.0, NVMe
 storage, router `:18014`, temperature 0, one warm-up request then two passes.
 
 ## The finding: IQ2_XXS spills experts and loses ~2.8× decode
@@ -71,7 +70,7 @@ KLD base file, which is a separate download.
 ## The rule the plugin encodes
 
 1. **Look at `engine.spill` before choosing a pack.** `spill.experts > 0` means part of the expert
-   set is served from disk; on this host that cost 2.8× decode. The overlay's **expert slots** row
+   set is served from disk; on the reference host that cost 2.8× decode. The overlay's **expert slots** row
    prints exactly these numbers, so the choice is visible in the UI, not folklore.
 2. **Pin the fast pack for the thinking lane; keep the accurate pack as a second alias.** The
    plugin swaps by `POST /v1/load {"model":"<alias>"}` and times each swap; a swap is one request
@@ -99,12 +98,12 @@ curl -s -XPOST -H 'content-type: application/json' \
   localhost:18014/v1/chat/completions | jq '{tok_s: .timings.predicted_per_second, prompt_tok_s: .timings.prompt_per_second, wall: .timings}'
 ```
 
-Measured receipts and the longer write-ups live with the host project that produced them; the numbers
-above are the ones this package's README and overlay quote.
+The measured receipts live with the host that produced them; the numbers above are the ones this
+package's README and overlay quote.
 
-## Outcome on the measuring host
+## Outcome on the reference host
 
 The decision was taken from the numbers above: the second alias was **dropped** and the lane serves
 the pinned IQ1_M pack under `deepseek` alone. What is kept is the verification (sha256 + a working
-load), this method and the benchmark receipts — a re-measure is `deepseek-q1`-style alias work, not a
-re-download, and the pack still sits on disk if the accuracy/throughput tradeoff ever changes.
+load), this method and the benchmark receipts — a re-measure is `deepseek-q1`-style alias work, not
+a re-download; the pack stays on disk in case the accuracy/throughput tradeoff ever changes.

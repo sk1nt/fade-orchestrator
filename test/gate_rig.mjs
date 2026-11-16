@@ -22,7 +22,7 @@
 //      when the router reports no pp/tg (never a fabricated zero),
 //  11. the verifier lane's active set carries no writers and a verifier edit/task is BLOCKED,
 //  12. an accepted verification tags `omp-ckpt/<run>/T<n>-passed` in the repo,
-//  13. Y21 the FLIP GUARD: swaps the router reports AWAY from the resident lane are counted as a
+//  13. the FLIP GUARD: swaps the router reports AWAY from the resident lane are counted as a
 //      flip and named, a quiet lane reports none, and a reload of the resident lane inside the
 //      guard window issues ZERO `POST /v1/load` and says why.
 //
@@ -38,16 +38,15 @@ import { buildTestBundle } from "./build.mjs";
 // `test/pty_rig.mjs` already carry, and the same trap: `isDelegatedSession` (src/index.ts:94) reads
 // a session file nested inside a dated parent dir as a delegated subagent, which is the shape of a
 // `task` agent's `PI_SESSION_FILE`. Inherited, the rig's seeded run is never adopted and every
-// `fade_phase` is refused — measured 2026-11-15 by the verifier lane: `npm run test:gate` exited 1
-// with `fade_phase: no orchestrated run is active` in an agent shell and 0 with the two variables
-// unset. CI is green only because CI has no such environment, which makes the gate non-hermetic in
-// exactly the lane that runs the plan's checks.
+// `fade_phase` is refused with `fade_phase: no orchestrated run is active` — and a gate that is
+// green only in an environment without those two variables is non-hermetic in exactly the lane
+// that runs the plan's checks.
 delete process.env.PI_SESSION_FILE;
 delete process.env.PI_SESSION_ID;
 
 // The rig IS the acceptance command (`node test/gate_rig.mjs`), so it builds the bundle it imports
-// instead of trusting whatever `.test-build/` some earlier run left behind — the 2026-11-15 pre-swap
-// gate died on `ERR_MODULE_NOT_FOUND .test-build/router.mjs` for exactly that reason.
+// instead of trusting whatever `.test-build/` some earlier run left behind: a stale build dies on
+// `ERR_MODULE_NOT_FOUND .test-build/router.mjs`, and the gate's acceptance command must not.
 buildTestBundle();
 
 const repo = join(tmpdir(), "orch-gate-rig");
@@ -58,7 +57,7 @@ mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
 const reqLog = [];
 let resident = "flash-next";
 let metricsOn = true;
-/** Y21: the swap the router is mid-way through, as its own `/health` line reports it. `null`
+/** The swap the router is mid-way through, as its own `/health` line reports it. `null`
  *  between swaps, exactly as the real router clears `swap` when a swap lands. */
 let swapLine = null;
 const server = http.createServer(async (req, res) => {
@@ -69,7 +68,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(obj));
   };
-  // The MEASURED basalt 0.4.0 `/health` shape (curl '…/health?phase=display', 2026-11-15):
+  // The basalt 0.4.0 `/health` shape, as the real router answers it:
   // `loaded` is a BOOLEAN — "is a pack resident" — and the resident lane rides under `model`;
   // `percent` is null at rest. The invented shape (`loaded: <lane key>`) is what let the panel crash
   // on the live router: the reader took `true` for a name and the renderer threw
@@ -100,7 +99,7 @@ const server = http.createServer(async (req, res) => {
     return send(200, { ok: true, model });
   }
   if (req.url === "/metrics")
-    // The MEASURED basalt 0.4.0 payload, captured from :18014 on 2026-11-15 and trimmed to the
+    // The basalt 0.4.0 `/metrics` payload, as the real router answers it, trimmed to the
     // fields the panel reads. The load-bearing details, each of which an invented fixture missed:
     //  - the tier fields are NESTED under `engine`;
     //  - `engine.quant` carries the LANE NAME, so the engine row must print no quant at all;
@@ -143,8 +142,8 @@ const statusRows = new Map();
 const inputHandlers = [];
 let activeTools = ["read", "bash", "edit", "write", "grep", "task"];
 /** The host's chord table, as the rig models it: `registerShortcut` REFUSES a chord the host's own
- *  table binds — measured on the live host as "Extension shortcut conflicts with built-in shortcut"
- *  for `ctrl+o`, and the same probe answers `keybinding tui.editor.cursorWordRight` for `alt+f`.
+ *  table binds — it refuses "Extension shortcut conflicts with built-in shortcut" for `ctrl+o`,
+ *  and its own keybinding table answers `tui.editor.cursorWordRight` for `alt+f`.
  *  The rig must refuse exactly where the host refuses, or the panel's raw-layer claim is never
  *  exercised: a fake host that accepts every chord proves the registration, not the delivery. */
 const HOST_TABLE = new Set(["ctrl+c", "ctrl+d", "ctrl+g", "ctrl+l", "ctrl+o", "ctrl+r", "ctrl+s", "ctrl+t", "ctrl+y", "ctrl+z", "ctrl+.", "alt+a", "alt+b", "alt+d", "alt+f", "alt+g", "alt+h", "alt+i", "alt+k", "alt+l", "alt+m", "alt+n", "alt+o", "alt+p", "alt+r", "alt+y", "alt+shift+c", "alt+shift+k", "alt+shift+l", "alt+shift+p", "alt+shift+v"]);
@@ -206,9 +205,9 @@ const seedState = (state, checks) => ({
   state,
   checks,
   tasks: state === "coding" ? [task("T1"), task("T2")] : [],
-  phases: [{ phase: "planning_done", lane: "deepseek", accepted: true, round: 1, at: "2026-11-15T00:00:00.000Z" }],
+  phases: [{ phase: "planning_done", lane: "deepseek", accepted: true, round: 1, at: "2030-01-01T00:00:00.000Z" }],
   repair_tasks: [],
-  started_utc: "2026-11-15T00:00:00.000Z",
+  started_utc: "2030-01-01T00:00:00.000Z",
   repo,
 });
 const writeState = (s) => {
@@ -321,7 +320,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	delete process.env.FADE_ORCHESTRATE_AUTO_RESUME;
 }
 
-// 9. Tier-1 protocol gate (Y1): a turn that ends with no `fade_phase` is protocol debt. The
+// 9. Tier-1 protocol gate: a turn that ends with no `fade_phase` is protocol debt. The
 //    round budget and the lane swap are the two currencies here, so the gate must touch NEITHER.
 {
 	const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
@@ -388,11 +387,15 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("[c] resumes a stalled run onto the code lane", s.state === "coding" && s.paused === false, `${s.state}/${s.paused}`);
 }
 
-// 12. Y18 turn ledger: one line per turn from the router's numbers, and NO line without them.
+// 12. The turn ledger: one line per turn from the router's numbers, and NO line without them.
 {
 	const jsonl = join(repo, "var", "omp-orchestrate", "metrics.jsonl");
 	const lines = () => (existsSync(jsonl) ? readFileSync(jsonl, "utf8").trim().split("\n").filter(Boolean) : []);
 	metricsOn = true;
+	// The tree carries a diff ABOVE the fast-path threshold on purpose: a first-try green round
+	// of a 1-file/2-line diff completes on the code lane, and this block needs the verifier's
+	// turn (the run must reach `verifying` and stay live for the blocks that follow).
+	writeFileSync(join(repo, "a.ts"), "pad\n".repeat(20));
 	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
 	await hooks.agent_end({}, ctx);
 	await new Promise((r) => setTimeout(r, 60));
@@ -409,7 +412,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("a router reporting no pp/tg appends NO line (never a fabricated zero)", lines().length === before, `${before} → ${lines().length}`);
 }
 
-// 13. Y15 verifier sandbox: the thinking lane has no writers, and the guard enforces it.
+// 13. The verifier sandbox: the thinking lane has no writers, and the guard enforces it.
 {
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
 	await commands.orchestrate.handler("verify", ctx);
@@ -421,7 +424,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("delegation is NOT blocked (a subagent writes nothing; its session is inert by block 15)", spawn === undefined, JSON.stringify(spawn));
 	const allowed = await hooks.tool_call({ type: "tool_call", toolName: "read", toolCallId: "z", input: {} }, ctx);
 	ok("a verifier read is NOT blocked", allowed === undefined, JSON.stringify(allowed));
-	// The measured self-lockout: a session that adopted the thinking lane at start must not keep
+	// The self-lockout to guard: a session that adopted the thinking lane at start must not keep
 	// refusing the operator's editor once the run is no longer the verifier's turn. The guard reads
 	// the ON-DISK state for exactly this reason.
 	const s13 = readState();
@@ -431,7 +434,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("outside the verifier's turn the operator's edit is NOT blocked", after === undefined, JSON.stringify(after));
 }
 
-// 14. Y16: every task accepted by the verifier leaves a checkpoint tag the tree rolls back to.
+// 14. Every task accepted by the verifier leaves a checkpoint tag the tree rolls back to.
 {
 	await exec("verification_done", { verdict: "accepted", checks: [["true", "green"]], notes: "rig accepted" });
 	const s = readState();
@@ -442,10 +445,10 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 }
 
 // 15. A delegated (subagent) session NEVER drives the loop. It shares the cwd, so an unguarded
-//     session_start adopted the operator's run and paid a verifier swap per spin-up (measured:
-//     70.1 s of pack swap and 181.7 GiB loaded across two spin-ups, zero tokens served).
+//     session_start adopts the operator's run and pays a full verifier pack swap per spin-up while
+//     serving zero tokens.
 {
-	const nested = join(repo, "sessions", "2026-11-15T09-11-28-519Z_01a1de79-d407-740b-a74e-ce2c57a1c556", "Worker.jsonl");
+	const nested = join(repo, "sessions", "2030-01-01T09-11-28-519Z_01a1de79-d407-740b-a74e-ce2c57a1c556", "Worker.jsonl");
 	mkdirSync(dirname(nested), { recursive: true });
 	writeFileSync(nested, "");
 	const jsonl = join(repo, "var", "omp-orchestrate", "metrics.jsonl");
@@ -488,8 +491,8 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 
 // 17. The plan-defect class: a check bash cannot parse is INVALID and is NEVER spawned, and the
 //     only way out is a plan act — a `planning_done` from `coding` that keeps EVERY task and
-//     re-declares the checks. Run 20261115T091232Z-rqtj livelocked for seven identical refusals
-//     over `… --artifacts <pinned dir>`, because the gate read "not a command" as "the tree fails".
+//     re-declares the checks. A gate that reads "not a command" as "the tree fails" livelocks on
+//     identical refusals, round after round.
 {
 	resident = "flash-next";
 	const BAD = "bash scripts/ops/scan_resident_parity.sh --artifacts <pinned dir>; echo $?";
@@ -562,10 +565,9 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 }
 
 // 18. The gate's checks are DATA: a plan repaired in state.json must reach the gate. The unit
-// test can only call refreshChecks; this is the end-to-end shape the live run showed (run
-// 20261115T091232Z-rqtj, eight coding_done rows in round 1, every one refused by the SAME two
-// commands after those commands had already been fixed on disk): the session adopts the file at
-// session_start, the gate judges the in-memory copy, and nothing re-reads the file.
+// test can only call refreshChecks; this is the end-to-end shape: the session adopts the file at
+// session_start and the gate judges the in-memory copy, so a check repaired on disk is seen only
+// after a re-read. A gate that never re-reads livelocks the round on commands that already pass.
 {
 	resident = "flash-next";
 	const broken = [["false", "unrunnable by design"], ["bash -c 'exit 3'", "red by design"]];
@@ -592,13 +594,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	ok("the verifier swap is paid once for the refreshed green tree", loads() - l1 === 1, `loads=${loads() - l1}`);
 }
 
-// 19. Y21: the FLIP GUARD. The churn this guards is NOT the loop's: the 2026-11-15 measurement
-// (docs/ops/OMP_FLIP_DIAGNOSIS_20261115.md) is ~40 alternating swaps in 94 minutes, every one of
-// them issued by an OMP auxiliary client (title generator, Mnemopi memory completion) that resolved
-// onto `flash-next` after the cloud `@smol` leg hit a usage limit. The router answers a queued
-// request by swapping to the entry that request names, so the orchestrator cannot prevent it — it
-// can NAME it, and it must never pay a reload of a lane that is already resident while the churn
-// runs. The router module is imported fresh here so its swap log is this block's own.
+// 19. The FLIP GUARD. The churn this guards is NOT the loop's: clients outside the orchestrator
+// (the host's title generator, a memory completion) resolve onto another lane, and the router
+// answers a queued request by swapping to the entry that request names. The orchestrator cannot
+// prevent that — it can NAME it, and it must never pay a reload of a lane that is already resident
+// while the churn runs. The router module is imported fresh here so its swap log is this block's
+// own.
 {
   const rt = await import("../.test-build/router.mjs");
   const l19 = loads();
@@ -653,12 +654,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("a quiet lane carries no guard clause", quietNote === "", JSON.stringify(quietNote));
 }
 
-// 20. The Alt+F screen and the status row. The row is the one line the operator sees all day,
-//     and it says what the loop is doing in the operator's own words (2026-11-15: "use a nerdfont …
-//     and just say Orchestrator: plan R1/6 T0/0"); the panel is the detail view, opened on
-//     `alt+f` — claimed at the RAW-INPUT layer, because the host's table binds that byte
-//     (`tui.editor.cursorWordRight`; `ctrl+o` is `app.tools.expand`) and refuses its registration.
-//     The default surface writes no status-bar row, and a terminal run clears the row.
+// 20. The Alt+F screen and the status row. The row is the one line the operator sees all day, and
+//     it says what the loop is doing in plain words: glyph, Orchestrator, state, round, tally, key.
+//     The panel is the detail view, opened on `alt+f` — claimed at the RAW-INPUT layer, because the
+//     host's table binds that byte (`tui.editor.cursorWordRight`; `ctrl+o` is `app.tools.expand`)
+//     and refuses its registration. The default surface writes no status-bar row, and a terminal
+//     run clears the row.
 {
   resident = "flash-next";
   writeState(seedState("coding", [["true", "green"]]));
@@ -685,18 +686,18 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the panel ends with the key bar", panel.includes("[esc] close") && panel.includes("[s] skip selected"));
   await commands.orchestrate.handler("halt", ctx);
   ok("a terminal run clears the status row", !widgets.has("fade-top"), JSON.stringify([...widgets.keys()]));
-  process.env.PI_SESSION_FILE = join(repo, "sessions", "2026-11-15T00-00-00-000Z_parent", "agent.jsonl");
+  process.env.PI_SESSION_FILE = join(repo, "sessions", "2030-01-01T00-00-00-000Z_parent", "agent.jsonl");
   await hooks.session_start({}, ctx);
   ok("a delegated session binds no extra listener on the chord", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
   delete process.env.PI_SESSION_FILE;
 }
 
 
-// 21. Alt+F is the panel's chord, claimed at the RAW-INPUT layer (the operator's ask, 2026-11-15).
-//     The host's own table binds `alt+f` (`tui.editor.cursorWordRight`), so its SHORTCUT
-//     registration is refused and the byte is the delivery: `ESC f` (0x1b 0x66) opens the panel.
-//     The row names the chord it honors, and Y19 `--demo-redact` masks identity for screenshots.
-//     The real-terminal half of this proof is `test/pty_rig.mjs`.
+// 21. Alt+F is the panel's chord, claimed at the RAW-INPUT layer. The host's own table binds
+//     `alt+f` (`tui.editor.cursorWordRight`), so its SHORTCUT registration is refused and the byte
+//     is the delivery: `ESC f` (0x1b 0x66) opens the panel. The row names the chord it honors, and
+//     `--demo-redact` masks identity for screenshots. The real-terminal half of this proof is
+//     `test/pty_rig.mjs`.
 {
   resident = "flash-next";
   const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
@@ -727,18 +728,20 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("--demo-redact=off turns the switch back", process.env.FADE_ORCHESTRATE_REDACT === undefined, JSON.stringify(process.env.FADE_ORCHESTRATE_REDACT));
 }
 
-// 22. Y9 fast-path single-model bypass. The pre-swap gate has already produced the verifier's
+// 22. Fast-path single-model bypass. The pre-swap gate has already produced the verifier's
 //     evidence (the plan's own exit codes) on the code lane, so a single-file diff under the
 //     15-line threshold, green on the FIRST try, completes with ZERO lane loads. The counterfactual
 //     in the same block: over the threshold, the verifier swap is paid exactly once.
 {
   const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
   // The run's own state plane is not part of the coder's diff: `var/` is gitignored in the real
-  // repo (.gitignore:27). The rig's seed commit tracked it before the ignore existed, so it is
-  // untracked here — otherwise the fast path prices its own ledger (4 files, 93 lines) as the
-  // coder's change and the fast path never fires.
+  // repo. The rig's seed commit tracked it before the ignore existed, so it is untracked here —
+  // otherwise the fast path prices its own ledger as the coder's change and the fast path never
+  // fires.
   writeFileSync(join(repo, ".gitignore"), "var/\nsessions/\n");
   git("rm", "-r", "-q", "--cached", "var");
+  // The committed base is normalized to ONE line so the sub-case below measures a 2-line diff (1 insertion, 1 deletion) and the fast path applies; the over-threshold sub-case is then 21 lines against that same base.
+  writeFileSync(join(repo, "a.ts"), "base\n");
   git("add", "-A");
   git("commit", "-q", "-m", "rig: ignore the run plane");
   resident = "flash-next";
@@ -750,11 +753,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await hooks.agent_end({}, ctx);
   await new Promise((r) => setTimeout(r, 60));
   const s22 = readState();
-  ok("Y9: a green first try on a 1-file/2-line diff completes on the code lane", s22.state === "complete" && s22.lane === "flash-next", `${s22.state}/${s22.lane}`);
-  ok("Y9: the fast path pays ZERO lane loads (one transition for the round, not two)", loads() === base22, `${loads() - base22}`);
-  ok("Y9: the payload reports the fast path and no next lane", res22?.details?.fast_path === true && res22?.details?.next_lane === null, JSON.stringify(res22?.details));
-  ok("Y9: the accepted phase is recorded by name for the rail", `${s22.phases.at(-1)?.notes}`.includes("fast path"), JSON.stringify(s22.phases.at(-1)?.notes));
-  ok("Y9: the fast path tags the checkpoints an accepted verification would tag", Object.keys(s22.checkpoints ?? {}).length === 2, JSON.stringify(s22.checkpoints));
+  ok("a green first try on a 1-file/2-line diff completes on the code lane", s22.state === "complete" && s22.lane === "flash-next", `${s22.state}/${s22.lane}`);
+  ok("the fast path pays ZERO lane loads (one transition for the round, not two)", loads() === base22, `${loads() - base22}`);
+  ok("the payload reports the fast path and no next lane", res22?.details?.fast_path === true && res22?.details?.next_lane === null, JSON.stringify(res22?.details));
+  ok("the accepted phase is recorded by name for the rail", `${s22.phases.at(-1)?.notes}`.includes("fast path"), JSON.stringify(s22.phases.at(-1)?.notes));
+  ok("the fast path tags the checkpoints an accepted verification would tag", Object.keys(s22.checkpoints ?? {}).length === 2, JSON.stringify(s22.checkpoints));
   // Counterfactual: the same report with a 20-line diff is over the threshold, so the verifier
   // swap is paid — exactly once.
   resident = "flash-next"; // the case below pays a swap, so start it on the coder lane
@@ -765,22 +768,22 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const res23 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
   await new Promise((r) => setTimeout(r, 60));
-  ok("Y9: over the threshold the verifier swap is paid EXACTLY once", loads() - base23 === 1, `${loads() - base23}`);
-  ok("Y9: over the threshold the run reaches verifying, not complete", readState().state === "verifying" && res23?.details?.fast_path === undefined, `${readState().state}/${JSON.stringify(res23?.details)}`);
+  ok("over the threshold the verifier swap is paid EXACTLY once", loads() - base23 === 1, `${loads() - base23}`);
+  ok("over the threshold the run reaches verifying, not complete", readState().state === "verifying" && res23?.details?.fast_path === undefined, `${readState().state}/${JSON.stringify(res23?.details)}`);
   resident = "flash-next"; // as above: a resident verifier lane pays no load (the flip guard)
   // A round that already took a rejection is not a first try, however small its diff.
   writeFileSync(join(repo, "a.ts"), "tiny again\n");
   writeState({
     ...seedState("coding", [["true", "green"]]),
     schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, checkpoints: {},
-    rejection_history: [{ round: 1, at: "2026-11-15T00:00:00.000Z", kind: "task", reason: "pre-swap gate red: false", task_id: "T1" }],
+    rejection_history: [{ round: 1, at: "2030-01-01T00:00:00.000Z", kind: "task", reason: "pre-swap gate red: false", task_id: "T1" }],
   });
   await hooks.session_start({}, ctx);
   const base24 = loads();
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
   await new Promise((r) => setTimeout(r, 60));
-  ok("Y9: a round with a rejection is not a FIRST TRY, so the swap is paid", loads() - base24 === 1 && readState().state === "verifying", `${loads() - base24}/${readState().state}`);
+  ok("a round with a rejection is not a FIRST TRY, so the swap is paid", loads() - base24 === 1 && readState().state === "verifying", `${loads() - base24}/${readState().state}`);
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

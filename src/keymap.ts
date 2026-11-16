@@ -36,10 +36,10 @@ export function actVerify(run: RunState): ActionDirective {
 }
 
 /**
- * r — reset the round counter and add rounds to the budget (Y13: "[r] +3 rounds without
- * restarting"). The round goes to 1 and the cap grows by 3 up to the hard `MAX_ROUNDS`, so the
- * key covers both readings of "reset the round budget": a stalled run gets a fresh round AND a
- * deeper reserve, and a run at the cap gets the named no-op.
+ * r — reset the round counter and add rounds to the budget ("[r] +3 rounds without restarting").
+ * The round goes to 1 and the cap grows by 3 up to the hard `MAX_ROUNDS`, so the key covers both
+ * readings of "reset the round budget": a stalled run gets a fresh round AND a deeper reserve, and
+ * a run at the cap gets the named no-op.
  */
 export function actReset(run: RunState): ActionDirective {
 	run.round = 1;
@@ -52,7 +52,7 @@ export function actReset(run: RunState): ActionDirective {
 /**
  * p — pause/resume the loop for a manual edit. Pause is a flag, never a state: the run keeps its
  * state, its tasks and its lane, so resuming lands exactly where it stopped. The note is the
- * operator's reason and lands in `state.json` (Y13: "writes the operator note to state.json").
+ * operator's reason and lands in `state.json`.
  */
 export function actPause(run: RunState, note?: string): ActionDirective {
 	run.paused = !(run.paused === true);

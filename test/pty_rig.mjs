@@ -21,6 +21,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { initRepo } from "./fixture.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const has = (bin) => {
@@ -41,16 +42,16 @@ if (!has("tmux") || !has("omp")) {
 	process.exit(0);
 }
 
-// A PRIVATE tmux server per rig, not the desk's shared one. Measured 2026-11-15: two rigs running
-// against `/tmp/tmux-1000/default` killed each other — one rig's cleanup took the server out from
-// under the other, whose session died at `send-keys` mid-run and whose log opened with
-// `no server running`. The session name alone does not isolate: the SERVER is shared.
+// A PRIVATE tmux server per rig, not the shared one. Two rigs against `/tmp/tmux-1000/default`
+// kill each other: one rig's cleanup takes the server out from under the other, whose session dies
+// at `send-keys` mid-run with `no server running`. The session name alone does not isolate: the
+// SERVER is shared.
 const SOCK = `fade-pty-${process.pid}`;
 const SESSION = `fade-pty-${process.pid}`;
 const repo = mkdtempSync(join(tmpdir(), "fade-pty-rig-"));
 mkdirSync(join(repo, "var", "omp-orchestrate"), { recursive: true });
 writeFileSync(join(repo, ".gitignore"), "*\n");
-execFileSync("git", ["-C", repo, "init", "-q"], { stdio: "pipe" });
+initRepo(repo);
 
 const task = (id) => ({ id, objective: `the panel must show ${id} with its acceptance and result`, files: ["src/panel.ts"], acceptance: "node --test test/panel.test.mjs passes", dependencies: [], round: 1, status: "pending" });
 const seedState = (state) => ({
@@ -114,12 +115,11 @@ const alive = () => {
 };
 const send = (...keys) => tmux("send-keys", "-t", SESSION, ...keys, "Enter");
 const launch = async (env, deadlineMs = 120_000) => {
-	// `-u PI_SESSION_FILE -u PI_SESSION_ID` is load-bearing, not hygiene. The extension treats a
-	// session whose file is nested inside a dated parent dir as a DELEGATED subagent session, and the
-	// rig's own shell often IS one: run from a `task` agent, tmux inherited that agent's
-	// `PI_SESSION_FILE`, every omp session was classified delegated, the row was suppressed by the
-	// `owned` rule and `/orchestrate` refused (measured 2026-11-15: 17 checks failed on a bare TUI
-	// frame, the only visible extension line `orchestrate: no run active`). The launched omp must set
+	// `-u PI_SESSION_FILE -u PI_SESSION_ID` is load-bearing, not hygiene (the same rule
+	// `fixture.mjs` applies to the in-process rigs). The extension treats a session whose file is
+	// nested inside a dated parent dir as a DELEGATED subagent session, and the rig's own shell
+	// often IS one: inherited, every omp session is classified delegated, the row is suppressed by
+	// the `owned` rule, and `/orchestrate` refuses with `no run active`. The launched omp must set
 	// its own session identity, which `--no-session` does.
 	tmux("new-session", "-d", "-x", "150", "-y", "45", "-s", SESSION, "-c", repo, "env", "-u", "PI_SESSION_FILE", "-u", "PI_SESSION_ID", ...Object.entries(env).flatMap(([k, v]) => [`${k}=${v}`]), "omp", "--no-session", "--no-tools", "--no-lsp", "--offline", "--no-judge", "--no-spotlight");
 	const t0 = Date.now();
@@ -146,7 +146,7 @@ const until = async (needle, ms = 45_000) => {
 
 /**
  * A bounded wait on the SCROLLBACK surface. The chord disclosure is deferred 500 ms past the host's
- * TUI attach (the first notify of a session is swallowed — measured 2026-11-15), so it lands AFTER
+ * TUI attach (the first notify of a session is swallowed), so it lands AFTER
  * the status row paints: reading one snapshot at the row is reading before the disclosure exists.
  */
 const untilText = async (needle, ms = 20_000) => {
@@ -176,9 +176,9 @@ try {
 	ok("the status row shows in the terminal: glyph, Orchestrator, state, round, tally, key", ROW.test(strip(withRow)), strip(withRow).slice(0, 380));
 
 
-	// The key, as raw bytes (ESC + `f`) to a real terminal. Measured with a chunk-logging reader in
-	// tmux: `send-keys -H 1b 66` lands as ONE read of two bytes (`1b66`) — the same two bytes tmux
-	// delivers for `M-f`. The extension's raw-input listener consumes them, so the host's
+	// The key, as raw bytes (ESC + `f`) to a real terminal: `send-keys -H 1b 66` lands as ONE read
+	// of two bytes (`1b66`) — the same two bytes tmux delivers for `M-f`. The extension's raw-input
+	// listener consumes them, so the host's
 	// `tui.editor.cursorWordRight` — what its own table binds for `alt+f` — does NOT run, which is
 	// the check below and not an assumption. `ctrl+o` stays the host's (`app.tools.expand`) and run
 	// 3 proves the extension never takes it.
@@ -212,7 +212,7 @@ try {
 	const closed = await until("Orchestrator:", 15_000);
 	ok("Escape closes the screen", !closed.includes("ENGINE / ROUTER"), strip(closed).slice(0, 300));
 	ok("the status row survives the close", ROW.test(strip(closed)), strip(closed).slice(0, 300));
-	// The operator's ESC report, proved at the byte level. tmux's `screen` terminal has NO Kitty
+	// ESC, proved at the byte level. tmux's `screen` terminal has NO Kitty
 	// keyboard protocol, so `send-keys Escape` writes the legacy `\x1b` — the ONLY form the panel
 	// used to compare, which is exactly why this rig passed while ESC was dead on a Kitty-protocol
 	// terminal (kitty, wezterm, ghostty, foot), where ESC arrives as CSI-u. tmux cannot enable the
@@ -253,10 +253,9 @@ try {
 
 // ---- run 3: the chord, in BOTH host states ----
 // The chord is `alt+f` (ESC + `f`), claimed at the RAW-INPUT layer: the host's table binds `alt+f`
-// to `tui.editor.cursorWordRight` (the pty rig watched ESC f move the word, 2026-11-15), so
-// `registerShortcut` is refused and the extension's `onTerminalInput` listener consumes the two
-// bytes before the host's binding acts. Two states, each in an isolated agent dir so the desk's own
-// config cannot leak into either:
+// to `tui.editor.cursorWordRight` (ESC f moves the word there), so `registerShortcut` is refused
+// and the extension's `onTerminalInput` listener consumes the two bytes before the host's binding
+// acts. Two states, each in an isolated agent dir so the host's own config cannot leak into either:
 //   DEFAULT — nothing configured: the disclosure names the refusal, says Alt+F opens the screen at
 //             the byte level, and names the fallback chord; ESC f opens the panel; ctrl+o opens
 //             NOTHING (the extension never takes the host's chord — which action the host runs
@@ -266,11 +265,10 @@ try {
 //             screen, and ESC I (alt+shift+i) opens the panel. This is the state the extension has to
 //             degrade honestly in.
 // The disclosure is read from the SCROLLBACK with a bounded wait: the extension defers it 500 ms,
-// because the FIRST notify of a session is swallowed by the host's TUI attach (measured 2026-11-15 —
-// the disclosure fired at `session_start` and never rendered, while the next notify in the same hook
-// always did).
+// because the FIRST notify of a session is swallowed by the host's TUI attach — a notify fired at
+// `session_start` never renders, while the next one in the same hook always does.
 // The chord family matters: `ctrl+shift+<letter>` is NOT distinct on a TTY — shift is invisible inside
-// a control code, measured: a ctrl+shift+t keystroke delivered ctrl+t and the pane answered
+// a control code: a ctrl+shift+t keystroke delivers ctrl+t and the pane answers
 // "Thinking blocks: visible", the host's ctrl+t action. `alt+…` (ESC + letter) is the byte-distinct
 // family, which is why the key and the fallback are both alt chords.
 const agentDir = mkdtempSync(join(tmpdir(), "fade-pty-agent-"));
@@ -279,7 +277,7 @@ const seedAgentDir = () => {
 	rmSync(agentDir, { recursive: true, force: true });
 	mkdirSync(agentDir, { recursive: true });
 	for (const entry of readdirSync(realAgentDir)) {
-		// A keybindings file on the desk must not decide what the rig observes.
+		// The host's own keybindings file must not decide what the rig observes.
 		if (/^keybindings\.(yml|yaml|json)$/i.test(entry)) continue;
 		symlinkSync(join(realAgentDir, entry), join(agentDir, entry));
 	}
@@ -315,9 +313,9 @@ for (const state of ["DEFAULT", "HELD"]) {
 		} else {
 			const disclosed = strip(await untilText("is held by the host", 20_000));
 			ok(`[${tag}] the disclosure names the conflict, the fallback and the way to move the key`, /Ctrl\+O is held by the host/.test(disclosed) && disclosed.includes("Alt+Shift+I") && disclosed.includes("FADE_ORCHESTRATE_KEY"), disclosed.slice(-380));
-			// The row's key hint follows the chord that is HONORED. The first version of this feature
-			// painted `[Ctrl+O]` in this state while its own assertion read "ctrl+o opens nothing" —
-			// a row advertising a dead key (verifier review 2026-11-15). The row must name the fallback.
+			// The row's key hint follows the chord that is HONORED. The defect this pins: a row
+			// painting `[Ctrl+O]` in a state whose own assertion reads "ctrl+o opens nothing" — a row
+			// advertising a dead key. The row must name the fallback.
 			const shown = strip(scrollback());
 			ok(`[${tag}] the row advertises the fallback, not the host's chord`, /T\d+\/\d+ · \[Alt\+Shift\+I\]/.test(shown) && !/T\d+\/\d+ · \[Ctrl\+O\]/.test(shown), shown.slice(-300));
 			// Same proof as the DEFAULT state: the extension opened nothing on the host's chord.

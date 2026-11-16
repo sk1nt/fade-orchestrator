@@ -11,14 +11,10 @@ import { hostname } from "node:os";
 import test from "node:test";
 import { isEscape, openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
 
-// The bundle in `.test-build/` is built by the ENTRY POINT (`npm run test:build` /
-// `node test/build.mjs`), never from inside a test file: `node --test` runs files in parallel and
-// the build empties the directory, so an in-file build wipes a sibling's imports mid-run.
-
 const task = (id, status, over = {}) => ({ id, objective: `${id} objective: ${"long ".repeat(12)}text`, files: [`${id}.ts`], acceptance: `${id} acceptance: run the rig and read the frame`, dependencies: id === "T2" ? ["T1"] : [], round: 1, status, ...over });
 
 const run = (over = {}) => ({
-	run_id: "20261115T113829Z-gbut",
+	run_id: "20300101T113829Z-gbut",
 	goal: "complete the plugin work: Ctrl+O opens the orchestration screen with metrics",
 	lane: "deepseek",
 	round: 2,
@@ -27,16 +23,16 @@ const run = (over = {}) => ({
 	state: "coding",
 	tasks: [task("T1", "passed"), task("T2", "passed"), task("T3", "failed")],
 	repair_tasks: [],
-	phases: [{ phase: "planning_done", at: "2026-11-15T12:00:00.000Z", lane: "deepseek", round: 1, accepted: true, payload: {} }, { phase: "coding", at: "2026-11-15T12:12:00.000Z", lane: "flash-next", round: 2, accepted: false, payload: {} }],
-	rejection_history: [{ at: "2026-11-15T12:11:00.000Z", round: 1, kind: "gate", reason: "npm test failed: 2/3 checks red" }],
-	started_utc: "2026-11-15T12:00:00.000Z",
-	gate_last: { at: "2026-11-15T12:19:00.000Z", passed: false, results: [{ cmd: "npm test", expected: "exit 0", observed: "exit 1", ok: false }, { cmd: "npm run test:gate", expected: "PASS", observed: "PASS", ok: true }] },
+	phases: [{ phase: "planning_done", at: "2030-01-01T12:00:00.000Z", lane: "deepseek", round: 1, accepted: true, payload: {} }, { phase: "coding", at: "2030-01-01T12:12:00.000Z", lane: "flash-next", round: 2, accepted: false, payload: {} }],
+	rejection_history: [{ at: "2030-01-01T12:11:00.000Z", round: 1, kind: "gate", reason: "npm test failed: 2/3 checks red" }],
+	started_utc: "2030-01-01T12:00:00.000Z",
+	gate_last: { at: "2030-01-01T12:19:00.000Z", passed: false, results: [{ cmd: "npm test", expected: "exit 0", observed: "exit 1", ok: false }, { cmd: "npm run test:gate", expected: "PASS", observed: "PASS", ok: true }] },
 	...over,
 });
 
 const data = (over = {}) => ({
 	run: run(),
-	refreshed_utc: "2026-11-15T12:14:02.000Z",
+	refreshed_utc: "2030-01-01T12:14:02.000Z",
 	elapsed_s: 842,
 	lanes: [
 		{ lane: "deepseek", role: "think", model: "deepseek (4.1 flash IQ1_M)", resident: true },
@@ -49,7 +45,7 @@ const data = (over = {}) => ({
 	],
 	moe: [{ label: "MoE deepseek", value: "live · warm (4 slots)", tone: "ok" }],
 	turns: [],
-	swaps: [{ key: "fade.omp_orchestrate.swap.v1", at: "2026-11-15T12:10:00.000Z", from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "cold_ramp", load_percent: 100 }],
+	swaps: [{ key: "fade.omp_orchestrate.swap.v1", at: "2030-01-01T12:10:00.000Z", from: "deepseek", to: "flash-next", elapsed_s: 14.2, first_tg: 91, steady_tg: 130, ramp: "cold_ramp", load_percent: 100 }],
 	context: { tokens: 41234, window: 1048576, percent: 3.9 },
 	gate: run().gate_last,
 	critique: "T3 died: the rig asserts a line that never renders",
@@ -98,7 +94,7 @@ test("the screen fits 120 columns and carries every section in one view", () => 
 	const r = panelLines(data(), 120, { sel: 0 });
 	for (const l of r.lines) assert.ok(visibleWidth(l) <= 120, `over-long at 120: ${visibleWidth(l)} ${JSON.stringify(l)}`);
 	const s = joined(r);
-	assert.ok(s.includes("fade-orchestrator 20261115T113829Z-gbut"), s.slice(0, 200));
+	assert.ok(s.includes("fade-orchestrator 20300101T113829Z-gbut"), s.slice(0, 200));
 	assert.ok(s.includes("round 2/6"), "the round budget rides");
 	assert.ok(s.includes("14m02s"), "the run's age rides");
 	assert.ok(s.includes("tier hot"), "the VRAM tier rides");
@@ -173,9 +169,9 @@ test("the selected task carries its details; every other task stays one line", (
 });
 
 test("the selected task's checkpoint tag and result ride, so a resume point is on screen", () => {
-	const d = data({ run: run({ tasks: [task("T1", "passed", { result: "wired the panel and proved it" })], checkpoints: { T1: "omp-ckpt/20261115T113829Z-gbut/T1-passed" } }) });
+	const d = data({ run: run({ tasks: [task("T1", "passed", { result: "wired the panel and proved it" })], checkpoints: { T1: "omp-ckpt/20300101T113829Z-gbut/T1-passed" } }) });
 	const s = joined(panelLines(d, 120, { sel: 0 }));
-	assert.ok(s.includes("tag: omp-ckpt/20261115T113829Z-gbut/T1-passed"), s);
+	assert.ok(s.includes("tag: omp-ckpt/20300101T113829Z-gbut/T1-passed"), s);
 	assert.ok(s.includes("result: wired the panel and proved it"));
 });
 
@@ -197,7 +193,7 @@ test("a protocol stall and a paused run are stated in words on the screen", () =
 
 test("redaction: a screenshot of the screen carries no account, home, repo path or host", () => {
 	const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
-	const repo = `/home/${user}/projects/fadetheworld`;
+	const repo = `/home/${user}/projects/sample-project`;
 	// The redactor knows the facts a screenshot LEAKS: this machine's hostname, this account, this
 	// repo. A made-up host string is not one of them, so the fixture uses the real one.
 	const host = hostname();
@@ -208,16 +204,16 @@ test("redaction: a screenshot of the screen carries no account, home, repo path 
 	assert.ok(!s.includes(host), "the hostname must not survive");
 	assert.ok(!s.includes(user), "the account must not survive");
 	const off = joined(panelLines(d, 120, { sel: 0 }));
-	assert.ok(off.includes(repo), "the flag is off by default: the operator's own truth stays on screen");
+	assert.ok(off.includes(repo), "the flag is off by default: the user's own truth stays on screen");
 });
 
-test("Y19 --demo-redact: every printed field is masked with markers, and OFF is byte-identical truth", () => {
+test("--demo-redact: every printed field is masked with markers, and OFF is byte-identical truth", () => {
 	// The row's flag is the panel's flag: one display switch for every surface a screenshot can
 	// capture. The identity rides in THREE fields on purpose (goal, reason, operator note) — a
 	// redactor that only patches the header fails here, and the markers must REPLACE the text so
 	// the screen stays readable (a screenshot with the fields deleted proves nothing to a viewer).
 	const user = process.env.USER && process.env.USER.length > 1 ? process.env.USER : "someone";
-	const repo = `/home/${user}/projects/fadetheworld`;
+	const repo = `/home/${user}/projects/sample-project`;
 	const host = hostname();
 	const d = data({
 		run: run({
@@ -236,7 +232,7 @@ test("Y19 --demo-redact: every printed field is masked with markers, and OFF is 
 
 test("the headless widget path renders the SAME screen the TUI draws", () => {
 	const lines = panelLines(data(), WIDGET_WIDTH, { sel: 0 }).lines;
-	assert.ok(lines.some((l) => l.includes("fade-orchestrator 20261115T113829Z-gbut")));
+	assert.ok(lines.some((l) => l.includes("fade-orchestrator 20300101T113829Z-gbut")));
 	assert.ok(lines.some((l) => l.includes("ENGINE / ROUTER")));
 	for (const l of lines) assert.ok(visibleWidth(l) <= WIDGET_WIDTH);
 });
@@ -319,7 +315,7 @@ test("the component is LIVE: the provider's new screen lands on the tick, and di
 	let calls = 0;
 	const provider = async () => {
 		calls += 1;
-		return data({ refreshed_utc: `2026-11-15T12:14:${String(calls).padStart(2, "0")}Z` });
+		return data({ refreshed_utc: `2030-01-01T12:14:${String(calls).padStart(2, "0")}Z` });
 	};
 	const { c, t } = component(data(), provider, 40, 20);
 	await sleep(90);
@@ -338,7 +334,7 @@ test("the component keeps its own selection and scroll across a refresh", async 
 	let n = 0;
 	const provider = async () => {
 		n += 1;
-		return data({ run: run({ tasks: Array.from({ length: 30 }, (_, i) => task(`T${i + 1}`, "pending")) }), refreshed_utc: `2026-11-15T12:14:${String(n).padStart(2, "0")}Z` });
+		return data({ run: run({ tasks: Array.from({ length: 30 }, (_, i) => task(`T${i + 1}`, "pending")) }), refreshed_utc: `2030-01-01T12:14:${String(n).padStart(2, "0")}Z` });
 	};
 	const many = data({ run: run({ tasks: Array.from({ length: 30 }, (_, i) => task(`T${i + 1}`, "pending")) }) });
 	const { c } = component(many, provider, 20, 20);
@@ -363,7 +359,7 @@ test("a provider failure keeps the last screen: a dead router never blanks the p
 	const { c, t } = component(data(), provider, 40, 20);
 	await sleep(90);
 	const shown = c.render(120).join("\n");
-	assert.ok(shown.includes("fade-orchestrator 20261115T113829Z-gbut"), "the screen is still the run's screen");
+	assert.ok(shown.includes("fade-orchestrator 20300101T113829Z-gbut"), "the screen is still the run's screen");
 	assert.ok(shown.includes("ENGINE / ROUTER"), "the metrics column is still there");
 	c.dispose();
 });
@@ -376,7 +372,7 @@ test("openPanel: RPC/print mode puts the same screen in the widget and takes no 
 	await openPanel(ctx, async () => data(), undefined, true);
 	assert.equal(calls.length, 1);
 	assert.equal(calls[0].key, "fade-overlay");
-	assert.ok(calls[0].lines.some((l) => l.includes("fade-orchestrator 20261115T113829Z-gbut")));
+	assert.ok(calls[0].lines.some((l) => l.includes("fade-orchestrator 20300101T113829Z-gbut")));
 	assert.ok(calls[0].lines.some((l) => l.includes("ENGINE / ROUTER")));
 });
 
@@ -427,9 +423,9 @@ test("openPanel: closing the overlay touches no loop control", async () => {
 });
 
 test("a run state MISSING its arrays renders — the panel must never die on a shape it did not predict", () => {
-	// Measured in the rpc rig (2026-11-15): a seeded `state.json` carried `tasks`/`checks` but no
+	// Observed in the rpc rig: a seeded `state.json` carried `tasks`/`checks` but no
 	// `repair_tasks`, and `run.repair_tasks.length` threw inside `taskBlock` — `/orchestrate overlay`
-	// produced an error notify and ZERO widget frames. The night's earlier defect was the same class:
+	// produced an error notify and ZERO widget frames. An earlier defect was the same class:
 	// a state written mid-plan with no `phases`. A JSON file is not the type; the screen reads an
 	// absent array as empty and says so in words.
 	const bare = data({ run: { ...run(), tasks: undefined, phases: undefined, repair_tasks: undefined } });
@@ -439,13 +435,13 @@ test("a run state MISSING its arrays renders — the panel must never die on a s
 	assert.ok(s.includes("none accepted yet"), "the phase rail says none accepted");
 });
 
-// ── ESC closes the screen in EVERY encoding the host delivers (the operator's report) ────────────
-// The focused component receives RAW bytes (pi-tui tui.js:420-425), and the host's own escape
-// matcher (keys.js:648-654) accepts THREE forms: the legacy byte, the Kitty keyboard-protocol CSI-u
-// sequence, and xterm modifyOtherKeys. A terminal that enables the Kitty protocol (kitty, wezterm,
-// ghostty, foot) delivers ESC as `\x1b[27u`, so the panel's byte-equal compare against "\x1b" left
-// ESC dead while `q` closed. tmux's `screen` terminal never enables the protocol, which is why the
-// pty rig — `send-keys Escape` → the legacy byte — never caught it.
+// ── ESC closes the screen in EVERY encoding the host delivers ─────────────────────────────────
+// The focused component receives RAW bytes, and the host's own escape matcher accepts THREE forms:
+// the legacy byte, the Kitty keyboard-protocol CSI-u sequence, and xterm modifyOtherKeys. A terminal
+// that enables the Kitty protocol (kitty, wezterm, ghostty, foot) delivers ESC as `\x1b[27u`, so a
+// byte-equal compare against "\x1b" leaves ESC dead while `q` closes. tmux's `screen` terminal never
+// enables the protocol, which is why the pty rig — `send-keys Escape` → the legacy byte — never
+// catches it.
 const closeProbe = () => {
 	const closed = [];
 	const c = new PanelComponent(data(), async () => data(), undefined, tui(24), (r) => closed.push(JSON.parse(r)), 60000);
