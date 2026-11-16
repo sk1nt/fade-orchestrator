@@ -877,6 +877,24 @@ test("gitCaveat and the briefings name a non-git run root, and stay silent in a 
 	}
 });
 
+// ── the role contract each lane is handed, in that lane's own words ────────────────────────────
+// Two classes each cost a round-trip when the briefing is silent about them: a plan whose check
+// rows bash cannot parse (the gate stays red on a tree that is fine), and a verifier that accepts
+// on the GATE's output instead of running the checks itself. Both rules belong where the lane
+// reads them, not in a doc the lane never sees.
+test("the planning briefing states the check-parsing rule, and the verifier's states its rubric", async () => {
+	const plan = await briefings.plan(mkRun({}));
+	assert.match(plan, /PLAN DEFECT/, "the plan briefing names the class before the plan is written");
+	assert.match(plan, /bash refuses/, "and says who refuses the row");
+	assert.ok(plan.includes("<the command that proves the goal>"), "a plan with no checks yet gets a literal example row");
+	const v = briefings.verify(mkRun({ checks: [["npm test", "exit 0"]], round: 2 }));
+	assert.match(v, /re-run BY YOU in this turn/, "the verifier is told whose run counts as evidence");
+	assert.match(v, /copied from the gate/, "and that the gate's green row is not its evidence");
+	assert.match(v, /\["cmd","observed"\]/, "the row shape is spelled inside the rubric");
+	assert.match(v, /"needs_repair"[\s\S]*"dependencies":\[\]/, "a repair card's full shape rides the briefing that must write it");
+	assert.match(v, /round 3/, "the next round's number is named, not implied");
+});
+
 // ── the single-instance lock: one run owns the router, a live holder is refused, a corpse is reclaimed ─
 const lockDir = () => mkdtempSync(join(tmpdir(), "orch-lock-"));
 const foreignLock = (pid) => JSON.stringify({ pid, run_id: "other", repo: "/other", started: "2000-01-01T00:00:00.000Z", host: "other" }) + "\n";

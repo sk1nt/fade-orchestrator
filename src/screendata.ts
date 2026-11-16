@@ -12,6 +12,7 @@
  * `swaps`/`turns` are injectable so the rig can drive a whole screen without a router.
  */
 import type { GateResult, RunState } from "./core.ts";
+import type { InstanceLock } from "./core.ts";
 import { readTurns, readSwaps, type SwapRow, type TurnRecord } from "./history.ts";
 import { fetchMetrics, tiersFromMetrics, type MetricsSnapshot } from "./livedata.ts";
 import { moeBalanceRows, moeRows } from "./moe.ts";
@@ -62,6 +63,9 @@ export interface ScreenData {
 	/** The last verifier critique, verbatim. */
 	critique?: string;
 	flip?: FlipBadge;
+	/** Who holds the router's lane-switching right now. The screen is where an operator looks after
+	 *  a start is refused, so the holder is named, not summarized. */
+	claim?: InstanceLock | null;
 	/** The named gaps behind every absent number, so the screen never reads as a zero. */
 	missing: string[];
 }
@@ -81,6 +85,9 @@ export interface ScreenSource {
 	turns?: TurnRecord[];
 	/** The flip guard's badge, as the wiring layer renders it. */
 	flip?: FlipBadge;
+	/** The router claim as the wiring layer reads it: the holder, `null` for a free router, and
+	 *  `undefined` when the caller never looked — the row says so instead of guessing free. */
+	claim?: InstanceLock | null;
 	now?: () => Date;
 }
 
@@ -232,7 +239,7 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 			healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {},
 		}),
 	];
-	const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
+	const tiers = [...nameResidentRow(tiersFromMetrics(metrics), metrics, src.names), claimRow(src)];
 	const missing: string[] = [];
 	if (!metrics) missing.push(`router ${ROUTER} unreachable — engine, decode and queue are not measured`);
 	if (swaps.length === 0) missing.push("no swaps recorded");
@@ -272,6 +279,18 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 		gate: src.run.gate_last,
 		critique,
 		flip: src.flip,
+			claim: src.claim ?? null,
 		missing,
 	};
+}
+
+/** The router's claim in the operator's terms: this run, a NAMED foreign holder, free, or not
+ *  measured. A refused start names the same fields in its notify, and this is the row the operator
+ *  reads next, so it carries pid, run, repo and host — never a bare "locked". */
+export function claimRow(src: ScreenSource): TierRow {
+	if (src.claim === undefined) return { label: "router claim", value: "not measured" };
+	if (src.claim === null) return { label: "router claim", value: "free — no run holds this router" };
+	return src.claim.run_id === src.run.run_id
+		? { label: "router claim", value: `this run (pid ${src.claim.pid})` }
+		: { label: "router claim", value: `HELD BY pid ${src.claim.pid}: run ${src.claim.run_id} in ${src.claim.repo} on ${src.claim.host}` };
 }

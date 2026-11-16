@@ -975,6 +975,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const s26 = readState();
   ok("a free router is claimed at the start, naming this pid, run and repo", claim.pid === process.pid && claim.run_id !== "FOREIGN1" && claim.repo === repo, JSON.stringify(claim));
   ok("the run that claimed is the run on disk", s26.run_id === claim.run_id && s26.max_rounds === 3, `${s26.run_id} rounds ${s26.max_rounds}`);
+  // The screen names the holder: the same fields a refused start's notify carries, because the panel
+  // is where the operator looks after that refusal.
+  inputHandlers[0]("\x1bf");
+  await new Promise((r) => setTimeout(r, 300));
+  const panel26 = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
+  ok("the screen names the claim THIS process holds, with its pid", hasRow(panel26, `router claim this run (pid ${process.pid})`), panel26.split("\n").filter((l) => /claim|engine|resident/.test(l)).join("\n").slice(0, 400));
   await commands.orchestrate.handler("status", ctx);
   ok("status names the claim as this process's", notes.join("\n").includes(`router claim this run (pid ${process.pid})`), notes.join("\n").slice(0, 240));
   await commands.orchestrate.handler("stop --clear", ctx);

@@ -1087,6 +1087,7 @@ export const briefings = {
 			`Phase 0 (planning), round ${run.round} of orchestrated run ${run.run_id}.`,
 			`Goal: ${run.goal}`,
 			`Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
+			`Checks are DATA the pre-swap gate runs through bash: ${JSON.stringify(run.checks.length ? run.checks : [["<the command that proves the goal>","<the observation that counts as green>"]])}. Each row is ONE command bash can parse. A row with a <placeholder>, an ellipsis or prose is a PLAN DEFECT: bash refuses it, it is never executed, and the gate stays red no matter what the tree does — so name commands this repo actually has, with real flags.`,
 			`Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
 			await gitCaveat(run.repo),
 			`Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`,
@@ -1148,7 +1149,8 @@ export const briefings = {
 			`Goal: ${run.goal}`,
 			`Task results: ${JSON.stringify(run.tasks.map((t) => ({ id: t.id, status: t.status, result: t.result, files: t.files, acceptance: t.acceptance })))}`,
 			`Read the diff (run "git diff" in ${run.repo} yourself) and re-run every check: ${JSON.stringify(run.checks)}.`,
-			`Then call the fade_phase tool: phase="verification_done", payload={"verdict":"accepted"|"needs_repair","checks":[["cmd","observed"]],"notes":"...","tasks":[...]}; accepted ends the run, needs_repair must name the tasks for round ${run.round + 1}.`,
+			`Verdict rule: "accepted" needs EVERY check re-run BY YOU in this turn, each row reported as ["cmd","observed"] with what THAT run printed. The pre-swap gate already ran them green on the coding lane and its row is in the state file; a row copied from the gate's result is not a re-run, and a check you did not run cannot be accepted.`,
+			`"needs_repair" ends the round and must name the tasks for round ${run.round + 1} as full cards: {"id":"R<n>","objective":"the CAUSE, not the same attempt","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}. A task rejected twice has had this exact diff tried: name the cause the next round can act on.`,
 		].join("\n"),
 	repair: async (run: RunState): Promise<string> => {
 		const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);

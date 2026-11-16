@@ -44,6 +44,13 @@ carries no host-specific code.
   120 s and the whole gate at a total budget. The running row is named on the working message
   (`gate 2/5: npm test`), the verdict prints with its cost, and a row the budget skipped prints
   `NOT RUN … unmeasured`.
+- **The role contract rides the briefing.** The planning briefing states the rule the gate enforces:
+  each check row is one command bash can parse, and a `<placeholder>` is a plan defect that keeps the
+  gate red on a tree that is fine. The verifier's briefing states its own rubric: "accepted" needs
+  every check re-run **by the verifier in its turn**, each row reported as `["cmd","observed"]` with
+  what that run printed — the pre-swap gate's green row is not its evidence. A `needs_repair` names
+  the next round's tasks as full cards, cause first: a task rejected twice has had this exact diff
+  tried (`test/core.test.mjs`).
 
 - **Protocol gate, three tiers.** A turn that ends with no `fade_phase` call is a protocol miss and
   consumes no coding round. **T1** nudge in place (`pi.sendUserMessage`, counters

@@ -732,6 +732,7 @@ var briefings = {
     `Phase 0 (planning), round ${run.round} of orchestrated run ${run.run_id}.`,
     `Goal: ${run.goal}`,
     `Produce a plan as a SINGLE object {"tasks":[...],"checks":[...]} with at most ${MAX_TASKS} tasks. Each task: {"id":"T<n>","objective":"...","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}.`,
+    `Checks are DATA the pre-swap gate runs through bash: ${JSON.stringify(run.checks.length ? run.checks : [["<the command that proves the goal>", "<the observation that counts as green>"]])}. Each row is ONE command bash can parse. A row with a <placeholder>, an ellipsis or prose is a PLAN DEFECT: bash refuses it, it is never executed, and the gate stays red no matter what the tree does \u2014 so name commands this repo actually has, with real flags.`,
     `Give dependent tasks earlier ids first. Files are repo-relative and disjoint. Plan only: no edits, no writes.`,
     await gitCaveat(run.repo),
     `Then call the fade_phase tool: phase="planning_done", payload=<that JSON as a string>.`
@@ -785,7 +786,8 @@ var briefings = {
     `Goal: ${run.goal}`,
     `Task results: ${JSON.stringify(run.tasks.map((t) => ({ id: t.id, status: t.status, result: t.result, files: t.files, acceptance: t.acceptance })))}`,
     `Read the diff (run "git diff" in ${run.repo} yourself) and re-run every check: ${JSON.stringify(run.checks)}.`,
-    `Then call the fade_phase tool: phase="verification_done", payload={"verdict":"accepted"|"needs_repair","checks":[["cmd","observed"]],"notes":"...","tasks":[...]}; accepted ends the run, needs_repair must name the tasks for round ${run.round + 1}.`
+    `Verdict rule: "accepted" needs EVERY check re-run BY YOU in this turn, each row reported as ["cmd","observed"] with what THAT run printed. The pre-swap gate already ran them green on the coding lane and its row is in the state file; a row copied from the gate's result is not a re-run, and a check you did not run cannot be accepted.`,
+    `"needs_repair" ends the round and must name the tasks for round ${run.round + 1} as full cards: {"id":"R<n>","objective":"the CAUSE, not the same attempt","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}. A task rejected twice has had this exact diff tried: name the cause the next round can act on.`
   ].join("\n"),
   repair: async (run) => {
     const prior = (run.rejection_history ?? []).slice(-5).map((r) => `round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
@@ -1632,7 +1634,7 @@ async function collectScreen(src) {
       healthByLane: metrics?.loaded ? { [metrics.loaded]: { spill_experts: metrics.spill_experts, spill_total: metrics.spill_total, spill_bytes_gb: metrics.spill_bytes_gb, slots: metrics.slots } } : {}
     })
   ];
-  const tiers = nameResidentRow(tiersFromMetrics(metrics), metrics, src.names);
+  const tiers = [...nameResidentRow(tiersFromMetrics(metrics), metrics, src.names), claimRow(src)];
   const missing = [];
   if (!metrics) missing.push(`router ${ROUTER} unreachable \u2014 engine, decode and queue are not measured`);
   if (swaps.length === 0) missing.push("no swaps recorded");
@@ -1663,8 +1665,14 @@ async function collectScreen(src) {
     gate: src.run.gate_last,
     critique,
     flip: src.flip,
+    claim: src.claim ?? null,
     missing
   };
+}
+function claimRow(src) {
+  if (src.claim === void 0) return { label: "router claim", value: "not measured" };
+  if (src.claim === null) return { label: "router claim", value: "free \u2014 no run holds this router" };
+  return src.claim.run_id === src.run.run_id ? { label: "router claim", value: `this run (pid ${src.claim.pid})` } : { label: "router claim", value: `HELD BY pid ${src.claim.pid}: run ${src.claim.run_id} in ${src.claim.repo} on ${src.claim.host}` };
 }
 
 // src/panel.ts
@@ -2310,6 +2318,9 @@ function fadeOrchestrate(pi) {
         context: ctx.getContextUsage(),
         metrics,
         flip: flipBadge,
+        // The panel names who holds the router. `readInstanceLock` is a 400-byte read of the
+        // claim file, and `null` (absent/parsable-free) is a real answer, not a missing row.
+        claim: readInstanceLock(instanceLockDir(ROUTER)) ?? null,
         ...process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}
       });
     };

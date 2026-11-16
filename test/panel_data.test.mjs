@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { clockOf, collectScreen, compactNumber, formatElapsed, gateRows, laneRows, nameResidentRow, sparkline, swapRows, turnRows } from "../.test-build/screendata.mjs";
+import { claimRow, clockOf, collectScreen, compactNumber, formatElapsed, gateRows, laneRows, nameResidentRow, sparkline, swapRows, turnRows } from "../.test-build/screendata.mjs";
 import { moeCacheRow, tiersFromMetrics } from "../.test-build/livedata.mjs";
 import { moeRows } from "../.test-build/moe.mjs";
 
@@ -277,7 +277,11 @@ process.stdout.write(JSON.stringify({ tiers: d.tiers, moe: d.moe, missing: d.mis
 		const d = JSON.parse(out);
 		assert.equal(d.tiers[0].label, "router");
 		assert.match(d.tiers[0].value, /unreachable/);
-		assert.equal(d.tiers.length, 1, `a dead router fabricates no tiers: ${JSON.stringify(d.tiers)}`);
+		// The dead router adds exactly TWO rows: its own `router …unreachable`, and the claim row the
+		// caller never read — the named-absent form, not a guessed "free". No engine/decode/resident row
+		// is fabricated.
+		assert.deepEqual(d.tiers.map((t) => t.label), ["router", "router claim"], `a dead router fabricates no measured tier: ${JSON.stringify(d.tiers)}`);
+		assert.equal(d.tiers[1].value, "not measured", "an unread claim is named unread, never reported free");
 		assert.ok(d.missing.some((m) => m.includes("unreachable")), JSON.stringify(d.missing));
 		assert.ok(d.moe.every((m) => m.value !== "0"), JSON.stringify(d.moe));
 	} finally {
@@ -348,6 +352,27 @@ test("live config, stale profile: the reload act renders instead of a green", ()
 		const mtime_s = statSync(prof).mtimeMs / 1000;
 		const rows = liveRows({ configPath: cfg, proof: { routerConfigPath: cfg, engineStartEpoch: mtime_s + 3600 } });
 		assert.match(liveRow(rows, "MoE flash-next").value, /earlier engine's file · warm on reload/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ── the router claim row: the screen names WHO holds the router ────────────────────────────────
+// A refused start names the holder in its notify, and the panel is where the operator looks next, so
+// the same fields ride the screen. "free" is a MEASURED answer; a caller that never read the claim is
+// reported as not measured, never guessed free.
+test("the claim row names this run, a foreign holder, free, and not measured", async () => {
+	const foreign = { pid: 4242, run_id: "OTHER9", repo: "/home/elsewhere/checkout", started: "2030-01-01T00:00:00.000Z", host: "other-box" };
+	const src = (over) => ({ run: { run_id: "MINE1" }, runDir: "/none", lanes: { think: "deepseek", code: "flash-next" }, ...over });
+	assert.equal(claimRow(src({ claim: foreign })).value, "HELD BY pid 4242: run OTHER9 in /home/elsewhere/checkout on other-box", "the fields a refused start names");
+	assert.equal(claimRow(src({ claim: { ...foreign, run_id: "MINE1" } })).value, "this run (pid 4242)", "the run reading its own claim says so, with the pid");
+	assert.equal(claimRow(src({ claim: null })).value, "free — no run holds this router", "free is a real reading");
+	assert.equal(claimRow(src({})).value, "not measured", "a caller that never read the claim does not report a free router");
+	const dir = mkdtempSync(join(tmpdir(), "fade-panel-claim-"));
+	try {
+		const d = await withMoe(undefined, () => collectScreen({ run: { ...run(), run_id: "MINE1" }, runDir: dir, lanes: { think: "deepseek", code: "flash-next" }, metrics, claim: foreign }));
+		assert.ok(d.tiers.some((t) => t.label === "router claim" && t.value.includes("HELD BY pid 4242")), JSON.stringify(d.tiers.map((t) => t.label)));
+		assert.equal(d.claim.run_id, "OTHER9", "the structured claim rides the screen data, not only its rendering");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

@@ -611,6 +611,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				context: ctx.getContextUsage(),
 				metrics,
 				flip: flipBadge,
+				// The panel names who holds the router. `readInstanceLock` is a 400-byte read of the
+				// claim file, and `null` (absent/parsable-free) is a real answer, not a missing row.
+				claim: readInstanceLock(instanceLockDir(ROUTER)) ?? null,
 				...(process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}),
 			});
 		};
