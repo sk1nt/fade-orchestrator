@@ -5,14 +5,18 @@
  * The Tier-1 protocol gate: the nudge→synthesize→stall ladder costing no round, the
  * git-synthesized coding_done, the crash-safe state write, the checkpoint tags, and the
  * nudge/stalled briefings.
+ * The single-instance lock: the exclusive claim, the live-holder refusal (foreign pid and this
+ * pid included), and the reclaim of a corpse, an ownerless file, and corrupt JSON.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	acquireInstanceLock,
 	adaptiveRounds,
 	applyDone,
 	briefings,
@@ -28,14 +32,17 @@ import {
 	handover,
 	handoverText,
 	isGitRepo,
+	LOCK_FILENAME,
 	MAX_WINDOW_TASKS,
 	normalizeRun,
 	porcelain,
 	porcelainEntries,
 	pushRejection,
+	readInstanceLock,
 	readJson,
 	refreshChecks,
 	refreshRoot,
+	releaseInstanceLock,
 	roundWindow,
 	roundsForTasks,
 	runGate,
@@ -841,5 +848,87 @@ test("gitCaveat and the briefings name a non-git run root, and stay silent in a 
 	} finally {
 		rmSync(plain, { recursive: true, force: true });
 		rmSync(tree, { recursive: true, force: true });
+	}
+});
+
+// ── the single-instance lock: one run owns the router, a live holder is refused, a corpse is reclaimed ─
+const lockDir = () => mkdtempSync(join(tmpdir(), "orch-lock-"));
+const foreignLock = (pid) => JSON.stringify({ pid, run_id: "other", repo: "/other", started: "2000-01-01T00:00:00.000Z", host: "other" }) + "\n";
+
+test("acquireInstanceLock claims the dir exclusively: the file is the lock, and a live holder — this pid included — is refused", () => {
+	const dir = lockDir();
+	try {
+		assert.equal(acquireInstanceLock(dir, { run_id: "mine", repo: "/repo" }).ok, true, "the first claim wins");
+		const lock = readInstanceLock(dir);
+		assert.equal(lock.pid, process.pid, "the lock names the owning pid");
+		assert.equal(lock.run_id, "mine");
+		assert.equal(lock.repo, "/repo");
+		assert.equal(lock.host, hostname());
+		assert.match(lock.started, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, "started is an ISO timestamp");
+		assert.equal(readFileSync(join(dir, LOCK_FILENAME), "utf8"), JSON.stringify(lock) + "\n", "the file IS the JSON, newline-terminated");
+		const second = acquireInstanceLock(dir, { run_id: "second", repo: "/repo" });
+		assert.equal(second.ok, false, "this process's own pid is a live holder: no self-deadlock");
+		assert.equal(second.stale, false, "a live holder is never a reclaim candidate");
+		assert.equal(second.holder.run_id, "mine", "the refusal names the run that owns the router");
+		assert.equal(readInstanceLock(dir).run_id, "mine", "a refusal never touches the holder's claim");
+		const nested = join(dir, "var", "omp-orchestrate");
+		assert.equal(acquireInstanceLock(nested, { run_id: "mine", repo: "/repo" }).ok, true, "a missing lock dir is created");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a live foreign pid keeps the router; once that pid is reaped, the stale lock is reclaimed", async () => {
+	const dir = lockDir();
+	const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+	try {
+		await once(child, "spawn");
+		writeFileSync(join(dir, LOCK_FILENAME), foreignLock(child.pid));
+		const held = acquireInstanceLock(dir, { run_id: "mine", repo: "/repo" });
+		assert.equal(held.ok, false, "another session's live run owns the router");
+		assert.equal(held.stale, false, "the holder is alive, so the claim is honored");
+		assert.equal(held.holder.run_id, "other", "the refusal names the holder");
+
+		child.kill("SIGKILL");
+		await once(child, "exit");
+		const reclaimed = acquireInstanceLock(dir, { run_id: "mine", repo: "/repo" });
+		assert.equal(reclaimed.ok, true, "the corpse is reclaimed on the single retry, no sleep");
+		assert.equal(readInstanceLock(dir).run_id, "mine", "the reclaim replaced the claim, it did not unlink and leave it free");
+		assert.equal(readInstanceLock(dir).pid, process.pid);
+	} finally {
+		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("releaseInstanceLock unlinks only its own lock; a missing file is not an error", () => {
+	const dir = lockDir();
+	try {
+		acquireInstanceLock(dir, { run_id: "mine", repo: "/repo" });
+		releaseInstanceLock(dir, 999999);
+		assert.ok(existsSync(join(dir, LOCK_FILENAME)), "a release naming another pid leaves the file");
+		assert.equal(readInstanceLock(dir).run_id, "mine", "the live holder's claim is untouched");
+		releaseInstanceLock(dir);
+		assert.ok(!existsSync(join(dir, LOCK_FILENAME)), "the owning pid releases the router");
+		assert.equal(releaseInstanceLock(dir), undefined, "releasing a lock that is not there is not an error");
+		assert.equal(acquireInstanceLock(dir, { run_id: "mine", repo: "/repo" }).ok, true, "the dir is claimable again");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a lock that cannot name its owner is a corpse: corrupt JSON and a missing pid are both reclaimed", () => {
+	const corrupt = lockDir();
+	const nopid = lockDir();
+	try {
+		writeFileSync(join(corrupt, LOCK_FILENAME), "{");
+		assert.equal(readInstanceLock(corrupt), undefined, "an unparsable file reads as no lock");
+		assert.equal(acquireInstanceLock(corrupt, { run_id: "mine", repo: "/repo" }).ok, true, "the corrupt file is reclaimed");
+		assert.equal(readInstanceLock(corrupt).run_id, "mine");
+		writeFileSync(join(nopid, LOCK_FILENAME), JSON.stringify({ run_id: "ownerless", repo: "/other", started: "2000-01-01T00:00:00.000Z", host: "other" }));
+		assert.equal(acquireInstanceLock(nopid, { run_id: "mine", repo: "/repo" }).ok, true, "a lock with no finite pid can never be released, so it is stale");
+	} finally {
+		rmSync(corrupt, { recursive: true, force: true });
+		rmSync(nopid, { recursive: true, force: true });
 	}
 });
