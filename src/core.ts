@@ -196,6 +196,7 @@ export const SCHEMA_HINT = [
 	'planning_done    {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}',
 	'coding_done      {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} — ONE coding_done reports EVERY task of the window',
 	'verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}',
+	'verification_done  ·  optional "verdicts":[{"id":"V1.1","accepted":true,"notes":"…"}] — ONLY while a verification batch is open (the desk named its ids in your briefing): one row per id, and that write is what unblocks the workers parked in fade_verify',
 	"```",
 	'A planning check whose ACCEPTED state is not exit-0 says so in the expected text\'s first words — "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.',
 ].join("\n");
@@ -627,6 +628,10 @@ export interface RunState {
 	gate_last?: GateResult;
 	/** v2: plan-size tier from planning_done (S ≤2 tasks, M ≤4, L more). */
 	tier?: "S" | "M" | "L";
+	/** The verification batch the desk claimed for THIS round, and how it is being answered. Set by
+	 *  the desk dispatch (index.ts) and cleared when the verdicts land: it is what makes the
+	 *  verifier's `verdicts[]` legal, and what stops one batch being answered twice. */
+	verify_batch?: { batch: number; ids: string[]; routed: "swap" | "subagent"; at: string };
 	/** Cumulative turns that ended with NO fade_phase call; the round budget never moves. */
 	protocol_retries?: number;
 	/** Consecutive phase-less turns; 1 nudge, 2 synthesize, 3 stall. Reset by any accepted phase. */
@@ -639,6 +644,18 @@ export interface RunState {
 	synthesized?: { phase: string; round: number; at: string };
 	/** Task id -> the checkpoint tag naming the HEAD that task passed against. */
 	checkpoints?: Record<string, string>;
+}
+
+/**
+ * What the batch briefing prints: the desk's claimed batch, as plain data. `VerifyRequest`
+ * satisfies it structurally, so core.ts needs no runtime import of desk.ts (the desk reads the
+ * run state, not the other way round).
+ */
+export interface VerifyBatchBriefing {
+	batch: number;
+	ids: string[];
+	routed: "swap" | "subagent";
+	requests: Array<{ id: string; agent: string; task_id?: string; objective: string; acceptance?: string; checks: [string, string][] }>;
 }
 
 /** Parse a state/ledger record: anything unparsable is `undefined`, never a throw, never a zero. */
@@ -1220,6 +1237,50 @@ export const briefings = {
 				`"needs_repair" ends the round and must name the tasks for round ${run.round + 1} as full cards:`,
 				fence('{"id":"R1","objective":"the CAUSE, not the same attempt","files":["repo/relative/path"],"acceptance":"one command and what it proves","dependencies":[]}'),
 				"A task rejected twice has had this exact diff tried: name the cause the next round can act on.",
+			),
+		),
+	/**
+	 * The BATCH verification briefing: one lane load, every worker's request in it, judged once.
+	 *
+	 * The window is the point of the page. The lane is told the ids are the whole universe of this
+	 * pass — a verifier that wanders onto a slice another worker is still holding starts a second
+	 * pass over the same tree, which is the churn the desk batches away — and that its verdicts land
+	 * on the desk BY ID (`fade_verdicts`), because that is the only path that unblocks a worker
+	 * parked in `fade_verify`. The round's own verdict is the aggregate of the batch.
+	 */
+	verifyBatch: (run: RunState, batch: VerifyBatchBriefing): string =>
+		page(
+			`Phase 2 (verification) — ONE BATCH, batch ${batch.batch + 1} of orchestrated run ${run.run_id}, round ${run.round}/${run.max_rounds}, routed ${batch.routed}.`,
+			section("Goal", run.goal),
+			section(
+				"Batch contract",
+				`${batch.ids.length} delegated worker request${batch.ids.length === 1 ? "" : "s"} landed on the verification desk while the code lane worked. This ONE turn judges ALL of them and posts ALL of the verdicts. Do not verify anything outside these ids, and do not take a second verification turn for them — one batch, one pass, one lane swap.`,
+			),
+			section(
+				`Requests (${batch.ids.length})`,
+				...batch.requests.map((r) =>
+					[
+						`- ${r.id} — worker \`${r.agent}\`${r.task_id ? ` (task ${r.task_id})` : ""}: ${r.objective}`,
+						r.acceptance ? `    acceptance: ${r.acceptance}` : "",
+						r.checks.length > 0 ? `    run yourself:\n${r.checks.map(([cmd, expected]) => `      - \`${cmd}\` (expected ${expected})`).join("\n")}` : "    no commands named: judge from the diff and the named acceptance.",
+					]
+						.filter(Boolean)
+						.join("\n"),
+				),
+			),
+			section(
+				"Post the verdicts BY ID",
+				`Call the \`fade_verdicts\` tool ONCE with \`batch: ${batch.batch + 1}\` (the batch number in this page's heading) and one row per id. That write is what unblocks each worker parked in \`fade_verify\`; a verdict in prose alone leaves every worker waiting.`,
+				fence(`{"batch":${batch.batch + 1},"verdicts":[{"id":"${batch.ids[0] ?? "V1.1"}","accepted":true,"notes":"the command you ran and what it printed, or the cause to fix"}]}`),
+			),
+			section(
+				"Then the round's verdict",
+				`Call fade_phase phase="verification_done" with the AGGREGATE: "accepted" only when EVERY id above passed on checks YOU re-ran this turn; "needs_repair" naming the repair tasks the batch implies. Pass the per-id rows in \`verdicts\` too, so the desk record and the round record cannot diverge.`,
+				fence('{"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the batch verdict","tasks":[],"verdicts":[{"id":"V1.1","accepted":true,"notes":"…"}]}'),
+			),
+			section(
+				"Verdict rule",
+				`"accepted" needs every command above re-run BY YOU in this turn, in ${run.repo}, with what THAT run printed. A check you did not run cannot be accepted, and a request you did not judge is a defect, not a pass.`,
 			),
 		),
 	repair: async (run: RunState): Promise<string> => {

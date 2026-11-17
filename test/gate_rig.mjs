@@ -36,6 +36,15 @@
 //      pid, run, repo and host, paying ZERO lane load and writing no state; a free router is
 //      claimed at the start, naming this pid and the new run; `stop` releases the claim. The rig
 //      isolates the claim plane in `FADE_ORCHESTRATE_LOCK_DIR`, never the operator's.
+//  21. THE VERIFICATION DESK: a `task` call's census counts ONLY its verification-carrying workers;
+//      one worker's request pays ZERO `POST /v1/load` while its peers are unregistered; a closed
+//      batch pays EXACTLY ONE load for the WHOLE batch; a request arriving during a pass lands in
+//      the NEXT batch; verdicts fan out BY ID and the claimed batch closes; answering an unclaimed
+//      batch, a foreign id, or a partial id set is refused by name.
+//  22. THE CHURN ROUTE: with churn declared a closed batch pays ZERO loads, is claimed once and
+//      routed to the verification SUBAGENT on a NON-ROUTER model; the loop is handed the exact
+//      `task` call as a command; the route stays for every later batch; `/orchestrate lanes reset`
+//      releases it. Block 19b proves the thrash breaker MARKS the desk and routes the batch it halts.
 //  17. THE ON-DISK GATE REPAIR: a `state.json` that re-declares a row and re-roots the run is
 //      judged AT THE NEW ROOT, both refreshes are announced, and the taken repair is written back
 //      as the loop's own record — the live failure it guards is a run rooted at repo A whose tasks
@@ -908,12 +917,23 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 
   notes.length = 0;
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  // A worker is waiting on this lane. Halting is necessary and not sufficient: the breaker marks
+  // the desk in churn and routes the waiting batch OFF the router (the route itself is block 22).
+  const deskFile19b = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
+  rmSync(deskFile19b, { force: true });
+  sent.length = 0;
+  await hooks.tool_call({ toolName: "task", input: { tasks: [{ agent: "reviewer", task: "verify T1: run the gate and report what it printed" }] } }, ctx);
+  await tools.fade_verify.execute("w1", { objective: "T1 at the breaker", acceptance: "node --test exits 0", checks: [["node --test test/desk.test.mjs", "exit 0"]] }, null, null, ctx);
   const lTrip = loads();
   await hooks.agent_end({}, ctx); // the green tree owes the verifier swap
   await new Promise((r) => setTimeout(r, 150));
   const sBreak = readState();
   ok("the breaker pays ZERO POST /v1/load", loads() === lTrip, `extra=${loads() - lTrip}`);
   ok("the breaker HALTS the loop: paused, with the thrash named in the operator note", sBreak.paused === true && /lane thrash: 3 swaps in 60s naming deepseek/.test(sBreak.operator_note ?? ""), JSON.stringify({ paused: sBreak.paused, operator_note: sBreak.operator_note }));
+  const desk19b = JSON.parse(readFileSync(deskFile19b, "utf8"));
+  ok("the breaker MARKS the desk in churn, so every later batch answers off the router", desk19b.churn === true && typeof desk19b.churn_utc === "string", JSON.stringify({ churn: desk19b.churn, churn_utc: desk19b.churn_utc }));
+  ok("the breaker routes the waiting batch to the verification subagent, by id", (desk19b.addressed[0]?.routed ?? "") === "subagent" && (desk19b.addressed[0]?.ids ?? []).join(",") === "V1.1", JSON.stringify(desk19b.addressed));
+  ok("the verifier call is handed to the loop as a command, naming the off-router model", sent.some((s) => /task \{ "agent": "fade-verifier"/.test(s) && s.includes("ninfer-local/coder-gpu1")), sent.join("\n").slice(0, 240));
   ok("the halt is said ONCE and names the release verb", notes.filter((n) => n.includes("LANE THRASH")).length === 1 && notes.some((n) => n.includes("LANE THRASH") && n.includes("lanes reset") && n.includes("deepseek")), JSON.stringify(notes.filter((n) => n.includes("THRASH"))));
   ok("the refused load is recorded in the run's history", (sBreak.rejection_history ?? []).some((r) => r.reason.includes("LANE THRASH")), JSON.stringify((sBreak.rejection_history ?? []).slice(-1)));
   ok("the verifier lane is still OWED: the note names it and the state waits on it", sBreak.state === "verifying" && (sBreak.operator_note ?? "").includes("deepseek"), `${sBreak.state} · ${JSON.stringify(sBreak.operator_note)}`);
@@ -1185,6 +1205,175 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const moeRows17 = panel17.split("\n").filter((l) => /MoE/.test(l)).join("\n");
   ok("the screen bills the CI class's warm start", hasRow(panel17, "MoE class ci 1/1 warm"), moeRows17.slice(0, 600));
   ok("the screen names a class the ledger never ran, never a green zero", hasRow(panel17, "MoE class tests no swap ran this class"), moeRows17.slice(0, 600));
+}
+
+// 21. THE VERIFICATION DESK — the operator's batching rule, on the real hooks. One `task` call
+//     carries four workers, TWO of them verification work. A worker's request never buys a lane
+//     load: the batch closes when the launching call's own census has registered (or when the call
+//     settles), and then exactly ONE verifier load answers EVERY request of the batch. A request
+//     that arrives during the pass lands in the NEXT batch, and the claimed batch is answered once.
+{
+  resident = "flash-next";
+  swapLine = null;
+  writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  const deskFile = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
+  rmSync(deskFile, { force: true });
+  const readDeskFile = () => JSON.parse(readFileSync(deskFile, "utf8"));
+  const base21 = loads();
+  notes.length = 0;
+  sent.length = 0;
+  await hooks.tool_call({ toolName: "task", input: { tasks: [
+    { agent: "scout", task: "map the crate inventory and report the module list" },
+    { agent: "task", task: "implement T1 in src/a.ts" },
+    { agent: "reviewer", task: "verify T1: run node --test test/desk.test.mjs and report what it printed" },
+    { agent: "security-reviewer", task: "verify T2 against the acceptance line" },
+  ] } }, ctx);
+  const census21 = notes.join("\n");
+  ok("the task census counts ONLY the verification-carrying workers", hasRow(census21, "4 worker(s), 2 with verification work — the desk batch closes at 2 registration(s)"), census21.slice(0, 300));
+  ok("the census paid ZERO lane load", loads() === base21, `extra=${loads() - base21}`);
+  // Worker one registers. Its peer is unregistered, so the batch is OPEN: the boundary pays nothing.
+  const w1 = await tools.fade_verify.execute("w1", { objective: "T1: the batch closes at 2 registrations", acceptance: "node --test test/desk.test.mjs exits 0", checks: [["node --test test/desk.test.mjs", "exit 0"]] }, null, null, ctx);
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 150));
+  ok("ONE registration of two pays ZERO POST /v1/load — the batch waits for its peers", loads() === base21, `extra=${loads() - base21}`);
+  ok("the registration names its queue position and why the batch is open", /request V1.1 of batch 1/.test(w1.content[0].text) && /1\/2 of the launching task call/.test(w1.content[0].text), w1.content[0].text.slice(0, 220));
+  ok("the queue is announced once, with its reason, and the reason is NOT a swap", notes.filter((n) => n.includes("verification desk holds")).length === 1 && notes.some((n) => n.includes("no lane is loaded until the batch closes")), JSON.stringify(notes.filter((n) => n.includes("desk"))));
+  // Worker two registers: the census is complete, so ONE pass answers BOTH.
+  await tools.fade_verify.execute("w2", { objective: "T2: the acceptance line", checks: [["bash -lc 'echo ok'", "exit 0"]] }, null, null, ctx);
+  await hooks.agent_end({}, ctx);
+  const landed21 = await settleLoads(base21, 1);
+  await new Promise((r) => setTimeout(r, 200));
+  const s21 = readState();
+  const desk21 = readDeskFile();
+  ok("a closed batch pays EXACTLY ONE POST /v1/load for the WHOLE batch", landed21 === 1, `extra=${landed21}`);
+  ok("the batch is claimed with both ids, routed to the lane", desk21.addressed.length === 1 && desk21.addressed[0].routed === "swap" && desk21.addressed[0].ids.join(",") === "V1.1,V1.2", JSON.stringify(desk21.addressed));
+  ok("the desk advanced to the NEXT batch, so nothing is answered twice", desk21.epoch === 1, `epoch=${desk21.epoch}`);
+  ok("the run records the claimed batch it is answering", (s21.verify_batch?.ids ?? []).join(",") === "V1.1,V1.2" && s21.verify_batch?.routed === "swap", JSON.stringify(s21.verify_batch));
+  ok("the boundary moved the round into verification, ONCE", s21.state === "verifying", s21.state);
+  const brief21 = sent.join("\n");
+  ok("the verifier's briefing is the BATCH page: one turn, every request, by id", hasRow(brief21, "ONE BATCH, batch 1 of orchestrated run GATE1") && brief21.includes("V1.1") && brief21.includes("V1.2"), brief21.slice(0, 260));
+  ok("the briefing carries BOTH workers' check commands, so one pass sees the whole batch", brief21.includes("node --test test/desk.test.mjs") && brief21.includes("bash -lc"), brief21.slice(0, 400));
+  // A worker that registers during the pass: the NEXT batch, not a second swap.
+  const w3 = await tools.fade_verify.execute("w3", { objective: "T3: the late slice", checks: [] }, null, null, ctx);
+  ok("a request arriving during verification lands in the NEXT batch", /of batch 2/.test(w3.content[0].text), w3.content[0].text.slice(0, 200));
+  const l21b = loads();
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 150));
+  ok("the open second batch pays ZERO POST /v1/load while the first is owed its verdict", loads() === l21b, `extra=${loads() - l21b}`);
+  // The partial answer, gated while the batch is OPEN: a batch is answered by every id or not at
+  // all, because a request with no verdict leaves its worker parked in `fade_verify`.
+  let gate3 = "";
+  try {
+    await exec("verification_done", { verdict: "needs_repair", checks: [], notes: "x", tasks: [], verdicts: [{ id: "V1.1", accepted: true, notes: "ok" }] });
+  } catch (e) {
+    gate3 = e.message;
+  }
+  ok("the round's `verdicts` must cover EVERY id of the claimed batch, named", /V1\.2 has no verdict row/.test(gate3), gate3.slice(0, 300));
+  // The verifier answers the claimed batch BY ID; that write is what unblocks the workers.
+  const vd = await exec("verification_done", { verdict: "accepted", checks: [["node --test test/desk.test.mjs", "rc 0"], ["bash -lc 'echo ok'", "rc 0"]], notes: "both checks re-run this turn", tasks: [], verdicts: [{ id: "V1.1", accepted: true, notes: "node --test: 234 pass" }, { id: "V1.2", accepted: true, notes: "bash echo ok: rc 0" }] });
+  const deskAfter = readDeskFile();
+  ok("the verdicts fanned onto the requests by id, so the blocked workers return", deskAfter.requests.filter((r) => r.verdict?.accepted === true).map((r) => r.id).join(",") === "V1.1,V1.2", JSON.stringify(deskAfter.requests.map((r) => [r.id, r.verdict])));
+  ok("the phase result names the batch it answered", /desk batch 1 answered for 2 worker request\(s\) \(2 accepted\)/.test(vd.content[0].text), vd.content[0].text.slice(0, 220));
+  ok("the claimed batch is closed in the run state, so it cannot be answered again", readState().verify_batch === undefined, JSON.stringify(readState().verify_batch));
+  // The gates on the verifier's answer.
+  let gate1 = "";
+  try {
+    await tools.fade_verdicts.execute("v1", { batch: 2, verdicts: [{ id: "V2.1", accepted: true, notes: "answered an OPEN batch" }] }, null, null, ctx);
+  } catch (e) {
+    gate1 = e.message;
+  }
+  ok("answering a batch the desk has NOT claimed is refused, naming the claimed ones", /batch 2 was never claimed by the desk/.test(gate1) && /batch 1 \[V1\.1,V1\.2\]/.test(gate1), gate1.slice(0, 300));
+  let gate2 = "";
+  try {
+    await tools.fade_verdicts.execute("v2", { batch: 1, verdicts: [{ id: "V9.9", accepted: true, notes: "invented id" }] }, null, null, ctx);
+  } catch (e) {
+    gate2 = e.message;
+  }
+  ok("a verdict for an id outside the claimed batch is refused with that batch's ids", /V9\.9 is not part of batch 1 \(its ids: V1\.1, V1\.2\)/.test(gate2), gate2.slice(0, 260));
+  notes.length = 0;
+  await commands.orchestrate.handler("desk", ctx);
+  const deskNote = notes.join("\n");
+  ok("`/orchestrate desk` prints the census, the batch state and the collecting request", hasRow(deskNote, "desk batch 2: 1 open, 0 awaiting verdict, 2 answered, 1 addressed") && deskNote.includes("V2.1") && /collecting/.test(deskNote), deskNote.slice(0, 500));
+  notes.length = 0;
+  await commands.orchestrate.handler("status", ctx);
+  ok("the status row carries the desk census, so the queue is visible without a verb", hasRow(notes.join("\n"), "desk batch 2: 1 open, 0 awaiting verdict, 2 answered, 1 addressed"), notes.join("\n").slice(0, 300));
+}
+
+// 22. THE CHURN ROUTE. The rule the operator set: once lane churn begins, a verification batch is
+//     NOT answered by another 13-25 s lane load — continuing to pay loads into a churning window is
+//     the failure. The desk is marked in churn, the closed batch is claimed ONCE and handed to the
+//     verification SUBAGENT on a NON-ROUTER model (zero swaps), the loop is handed the exact `task`
+//     call as a command, and the route STAYS for every later batch until `/orchestrate lanes reset`
+//     releases it with the flip ledger. (The breaker that MARKS churn, and the halt that comes with
+//     it, are block 19b's contract.)
+{
+  resident = "flash-next";
+  swapLine = null;
+  writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  const deskFile22 = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
+  const readDesk22 = () => JSON.parse(readFileSync(deskFile22, "utf8"));
+  const now22 = new Date().toISOString();
+  // The state the churn route reads: the desk declared, one worker registered, and its launching
+  // task call censused — so the batch is CLOSED and the next boundary owes an answer.
+  writeFileSync(deskFile22, JSON.stringify({
+    schema: "fade.orchestrate.verify_desk.v1",
+    run_id: "GATE1",
+    epoch: 0,
+    open_utc: now22,
+    expected: 1,
+    agents: ["reviewer"],
+    churn: true,
+    churn_utc: now22,
+    requests: [{ id: "V1.1", batch: 0, agent: "reviewer", session: "sub-1", objective: "T1 under churn", acceptance: "node --test exits 0", checks: [["node --test test/desk.test.mjs", "exit 0"]], enqueued_utc: now22 }],
+    addressed: [],
+    updated_utc: now22,
+  }));
+  const l22 = loads();
+  notes.length = 0;
+  sent.length = 0;
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 200));
+  const d22 = readDesk22();
+  const s22 = readState();
+  const directive22 = sent.join("\n");
+  ok("a churned run's batch pays ZERO POST /v1/load — the lane is not loaded again", loads() === l22, `extra=${loads() - l22}`);
+  ok("the closed batch is claimed ONCE, routed to the subagent", d22.addressed.length === 1 && d22.addressed[0].routed === "subagent" && d22.addressed[0].ids.join(",") === "V1.1", JSON.stringify(d22.addressed));
+  ok("the desk advanced to the next epoch, so the batch cannot be answered twice", d22.epoch === 1 && d22.churn === true, `epoch=${d22.epoch} churn=${d22.churn}`);
+  ok("the loop is handed the verifier call as a command, naming the agent and the off-router model", /task \{ "agent": "fade-verifier"/.test(directive22) && directive22.includes("ninfer-local/coder-gpu1") && /will NOT pay a lane load/.test(directive22), directive22.slice(0, 340));
+  ok("the directive carries the worker's own check command, so the verifier needs no desk read", directive22.includes("node --test test/desk.test.mjs") && /Ids to judge: V1\.1/.test(directive22), directive22.slice(0, 420));
+  ok("the reason names the churn the route is escaping", /churn declared/.test(directive22), directive22.slice(0, 200));
+  ok("the route is recorded in the run's history with its zero cost", (s22.rejection_history ?? []).some((r) => r.reason.includes("addressed AT ONCE") && r.reason.includes("routed subagent")), JSON.stringify((s22.rejection_history ?? []).slice(-1)));
+  ok("the operator is told the batch and its cost", notes.some((n) => /verification batch 1 · 1 worker request/.test(n) && /zero lane loads/.test(n)), JSON.stringify(notes.slice(0, 4)));
+  ok("the run state carries the batch it handed off", (s22.verify_batch?.ids ?? []).join(",") === "V1.1" && s22.verify_batch?.routed === "subagent", JSON.stringify(s22.verify_batch));
+  // The route STAYS: a later batch of the same churning run routes off the router too.
+  // The launching call is censused, so the second batch CLOSES on its own registration: `expected`
+  // is the number the batch waits for, and with no call named it stays open to the settle window.
+  await hooks.tool_call({ toolName: "task", input: { tasks: [{ agent: "task", task: "verify T2 against its acceptance line" }] } }, ctx);
+  await tools.fade_verify.execute("w2", { objective: "T2 under churn", acceptance: "bash -lc true", checks: [["bash -lc true", "exit 0"]] }, null, null, ctx);
+  const l22b = loads();
+  notes.length = 0;
+  sent.length = 0;
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 200));
+  const d22b = readDesk22();
+  ok("a later batch of a churning run ALSO routes off the router, at zero loads", loads() === l22b && (d22b.addressed.at(-1)?.routed ?? "") === "subagent" && d22b.epoch === 2, `${loads() - l22b} · ${JSON.stringify(d22b.addressed.map((a) => a.routed))} · epoch=${d22b.epoch}`);
+  ok("the second batch's directive names the churn it is escaping", /churn/.test(sent.join("\n")) && /V2\.1/.test(sent.join("\n")), sent.join("\n").slice(0, 260));
+  notes.length = 0;
+  await commands.orchestrate.handler("desk", ctx);
+  ok("the desk census says the churn route is in force and names the release verb", hasRow(notes.join("\n"), "CHURN ROUTE (subagent verification)") && notes.join("\n").includes("lanes reset"), notes.join("\n").slice(0, 400));
+  // The release: the operator dealt with the competing client, so batches go back to the lane.
+  const lReset22 = loads();
+  notes.length = 0;
+  await commands.orchestrate.handler("lanes reset", ctx);
+  await new Promise((r) => setTimeout(r, 250));
+  const dReset = readDesk22();
+  ok("`lanes reset` releases the churn route with the flip ledger", dReset.churn === false && dReset.churn_utc === undefined, JSON.stringify({ churn: dReset.churn, churn_utc: dReset.churn_utc }));
+  ok("the release names the lane that takes batches back", notes.some((n) => n.includes("churn route cleared") && n.includes("deepseek")), JSON.stringify(notes.slice(0, 4)));
+  ok("the release pays AT MOST one lane load (only a lane the loop owes)", loads() - lReset22 <= 1, `extra=${loads() - lReset22}`);
+  swapLine = null;
+  resident = "flash-next";
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

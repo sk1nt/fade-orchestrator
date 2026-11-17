@@ -18,12 +18,34 @@
  */
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
+import {
+	DESK_DEADLINE_MS,
+	DESK_SETTLE_MS,
+	DESK_WAIT_MS,
+	attachVerdicts,
+	awaitVerdict,
+	claimBatch,
+	deskLine,
+	enqueueRequest,
+	noteTaskBatch,
+	openRequests,
+	parseDesk,
+	readDesk,
+	readyToAddress,
+	sealBatch,
+	setChurn,
+	type VerifyDesk,
+	mutateDesk,
+	deskPath,
+	type VerifyRequest,
+} from "./desk.ts";
+import { VERIFIER_AGENT, VERIFIER_MODEL, isRouterModel, routeFor, routeLine, taskBatchOf, verifierAgentMd, verifierAgentPath, verifierDirective } from "./subagent.ts";
 import {
 	ACTIVE_FILENAME,
 	DEFAULT_ROUNDS,
@@ -119,6 +141,30 @@ const isDelegatedSession = (): boolean => {
 	return MAIN_SESSION_DIR.test(parent) && !f.endsWith(`${parent}.jsonl`);
 };
 
+/**
+ * The host's own subagent identity, read defensively: `ctx.agent` is
+ * `{kind:"main"|"sub", id, name, depth, parentId}` in the running host and absent from the
+ * published peer types, so the shape is narrowed, never asserted. `kind` is the authority and
+ * `isDelegatedSession()` (the `PI_SESSION_FILE` path shape) is the fallback for a host that
+ * answers nothing: a worker is a worker under either reading.
+ */
+const hostAgent = (ctx: unknown): { kind: string; name: string } | undefined => {
+	const c = ctx !== null && typeof ctx === "object" && !Array.isArray(ctx) ? (ctx as Record<string, unknown>) : undefined;
+	const a = c?.agent;
+	const rec = a !== null && a !== undefined && typeof a === "object" && !Array.isArray(a) ? (a as Record<string, unknown>) : undefined;
+	if (!rec) return undefined;
+	return { kind: typeof rec.kind === "string" ? rec.kind : "", name: typeof rec.name === "string" ? rec.name : "" };
+};
+
+/** True when this session is a delegated worker — the host's answer first, the path shape second. */
+const isWorkerSession = (ctx: unknown): boolean => hostAgent(ctx)?.kind === "sub" || isDelegatedSession();
+
+/** The worker's own name, as the desk records it. */
+const workerName = (ctx: unknown): string => hostAgent(ctx)?.name || basename(process.env.PI_SESSION_FILE ?? "").replace(/\.jsonl$/, "") || "worker";
+
+/** The desk's shelf for a session: the run dir lives in the run root, and a worker shares the cwd. */
+const deskDirFor = (ctx: { cwd: string }): string => join(ctx.cwd, "var", "omp-orchestrate");
+
 export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let run: RunState | undefined;
 	let runDir: string | undefined;
@@ -128,6 +174,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  judging the other's working tree. */
 	let lockDir: string | undefined;
 	let pending: { lane: string; phase: string } | undefined;
+	/** The desk batch this session CLAIMED and is answering. The claim is the one-use ticket: it is
+	 *  what makes `fade_verdicts` legal for those ids, and what stops the same batch being answered
+	 *  a second time. `undefined` when no batch is in flight. */
+	let deskBatch: { batch: number; ids: string[]; routed: "swap" | "subagent" } | undefined;
+	/** The epoch the queue was already announced with: one notify per batch, not one per tick. */
+	let deskAnnounced = -1;
+	/** Set by the desk dispatch when the batch's answer is a lane load: it is what makes the NEXT
+	 *  landing on the thinking lane print the BATCH page instead of the round's own verify page. */
+	let deskBriefing = false;
 	let settledNotified = false;
 	let metrics: MetricsSnapshot | undefined;
 	let laneBest = 0;
@@ -545,6 +600,67 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		switchChain = switchChain.then(() => (gen === switchGen ? runSwitch(lane, ctx, gen) : undefined)).catch(() => undefined);
 	};
 
+	/**
+	 * The desk dispatch, at the turn boundary: is there a CLOSED batch to answer?
+	 *
+	 * This is the batching rule in force. A batch that has not closed answers `not ready` and pays
+	 * NOTHING — that is the clause that stops one arrival starting a lane load while the other two
+	 * workers of the same `task` call are still unregistered. A closed batch is claimed once, and
+	 * the claim decides the route:
+	 *
+	 * - `swap`: ONE verifier-lane load for the WHOLE batch. The round moves to `verifying`, the
+	 *   lane's briefing is the batch page (every request, by id), and its `fade_verdicts` call
+	 *   unblocks every worker at once.
+	 * - `subagent`: churn is in force, so NO lane is loaded. The batch is handed to the
+	 *   `fade-verifier` agent on a non-router model, which costs zero swaps, and the loop is told
+	 *   the exact call to make — not offered a choice, because continuing to pay loads into a
+	 *   churning window is the failure mode the operator named.
+	 *
+	 * Returns true when the batch was claimed, so the caller stops its own turn-end handling: the
+	 * batch is the work the boundary owes, ahead of a protocol nudge.
+	 */
+	const dispatchDeskBatch = async (ctx: ExtensionContext): Promise<boolean> => {
+		if (!run || !runDir || TERMINAL[run.state] === true) return false;
+		const desk = await readDesk(runDir, run.run_id);
+		if (!desk) return false;
+		const live = openRequests(desk);
+		if (live.length === 0) return false;
+		const ready = readyToAddress(desk, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+		if (!ready.ready) {
+			if (deskAnnounced !== desk.epoch) {
+				deskAnnounced = desk.epoch;
+				ctx.ui.notify(`orchestrate: the verification desk holds ${ready.open} request(s) — ${ready.reason}; no lane is loaded until the batch closes`, "info");
+			}
+			return false;
+		}
+		await observeSwaps();
+		const route = routeFor(desk, flipState(run.lane, FLIP_WINDOW_MS));
+		const claimed = claimBatch(desk, route.route);
+		const requests = desk.requests.filter((r) => claimed.ids.includes(r.id));
+		deskBatch = { batch: claimed.batch, ids: claimed.ids, routed: route.route };
+		run.verify_batch = { batch: claimed.batch, ids: claimed.ids, routed: route.route, at: new Date().toISOString() };
+		pushRejection(run, "task", `verification batch ${claimed.batch + 1} (${claimed.ids.join(", ")}) addressed AT ONCE, routed ${route.route}: ${route.reason}`);
+		if (route.route === "subagent") {
+			await writeJsonAsync(deskPath(runDir), setChurn(claimed.desk, true));
+			await persist();
+			paint(ctx);
+			ctx.ui.notify(`orchestrate: verification batch ${claimed.batch + 1} · ${claimed.ids.length} worker request(s) → ${routeLine(route)}`, "warning");
+			await ensurePhaseTool();
+			pi.sendUserMessage(verifierDirective(claimed.batch, claimed.ids, route.reason, requests));
+			return true;
+		}
+		await writeJsonAsync(deskPath(runDir), claimed.desk);
+		run.state = "verifying";
+		pending = { lane: THINK_LANE, phase: "verification_batch" };
+		deskBriefing = true;
+		settledNotified = false;
+		await persist();
+		paint(ctx);
+		ctx.ui.notify(`orchestrate: ${deskLine(desk)} — one ${THINK_LANE} load answers the whole batch`, "info");
+		requestLane(THINK_LANE, ctx);
+		return true;
+	};
+
 	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number): Promise<void> => {
 		const model = ctx.modelRegistry.find(PROVIDER, lane);
 		if (!model) {
@@ -575,6 +691,31 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				run.operator_note = `lane thrash: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; the loop is HALTED and paid no ${lane} load — /orchestrate lanes reset clears the ledger and lands it`;
 				pushRejection(run, "task", `LANE THRASH: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; ${lane} refused, loop halted, ZERO load paid`);
 				pending = { lane, phase: turnPhase ?? "lane" };
+			}
+			// THE CHURN ROUTE, and the reason the halt is not the whole remedy: the workers whose
+			// verification asked for this lane are still unanswered, and letting the run continue
+			// paying loads into a churning window is precisely what the operator ruled out. So the
+			// desk is marked in churn (every later batch routes off the router until the ledger is
+			// reset), and the requests it holds RIGHT NOW are claimed and handed to the verification
+			// SUBAGENT on a non-router model — the answer costs ZERO further swaps while the loop
+			// stays halted.
+			if (run && runDir) {
+				const d = await readDesk(runDir, run.run_id);
+				if (d) {
+					const churned = setChurn(d, true);
+					const live = openRequests(churned);
+					if (live.length > 0) {
+						const claimed = claimBatch(churned, "subagent");
+						deskBatch = { batch: claimed.batch, ids: claimed.ids, routed: "subagent" };
+						run.verify_batch = { batch: claimed.batch, ids: claimed.ids, routed: "subagent", at: new Date().toISOString() };
+						await writeJsonAsync(deskPath(runDir), claimed.desk);
+						pushRejection(run, "task", `LANE THRASH routed verification batch ${claimed.batch + 1} (${claimed.ids.join(", ")}) to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}: zero lane loads paid`);
+						await ensurePhaseTool();
+						pi.sendUserMessage(verifierDirective(claimed.batch, claimed.ids, `lane thrash: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; the loop is HALTED and pays no load, so this batch is answered off the router`, churned.requests.filter((r) => claimed.ids.includes(r.id))));
+					} else {
+						await writeJsonAsync(deskPath(runDir), churned);
+					}
+				}
 			}
 			await persist();
 			paint(ctx);
@@ -637,6 +778,27 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		setTimeout(async () => {
 			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
 			await ensurePhaseTool();
+			// A batch briefing is owed to exactly ONE landing: the switch the desk dispatch asked
+			// for. The flag is consumed here, so a later switch to the same lane re-briefs the
+			// round's own page and never repeats the batch.
+			const owed = deskBriefing && lane === THINK_LANE && run?.verify_batch;
+			deskBriefing = false;
+			if (owed && runDir && run) {
+				const st = run;
+				const ids = st.verify_batch?.ids ?? [];
+				const d = await readDesk(runDir, st.run_id);
+				if (d) {
+					pi.sendUserMessage(
+						briefings.verifyBatch(st, {
+							batch: st.verify_batch?.batch ?? d.epoch,
+							ids,
+							routed: st.verify_batch?.routed ?? "swap",
+							requests: d.requests.filter((r) => ids.includes(r.id)).map((r) => ({ id: r.id, agent: r.agent, ...(r.task_id ? { task_id: r.task_id } : {}), objective: r.objective, ...(r.acceptance ? { acceptance: r.acceptance } : {}), checks: r.checks })),
+						}),
+					);
+					return;
+				}
+			}
 			const text = await (
 				run!.state === "repair"
 					? briefings.repair(run!)
@@ -987,7 +1149,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const allowedKeys: Record<string, Set<string>> = {
 				planning_done: new Set(["tasks", "checks"]),
 				coding_done: new Set(["done"]),
-				verification_done: new Set(["verdict", "checks", "notes", "tasks"]),
+				verification_done: new Set(["verdict", "checks", "notes", "tasks", "verdicts"]),
 			};
 			for (const key of Object.keys(payload)) {
 				if (!allowedKeys[params.phase].has(key)) throw new Error(`fade_phase: ${params.phase} does not take key "${key}"`);
@@ -1020,6 +1182,24 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			}
 			if (params.phase === "verification_done") {
 				if (!["accepted", "needs_repair"].includes(String(payload.verdict))) throw new Error("fade_phase: verdict must be accepted or needs_repair");
+				// `verdicts` is the desk's fan-out, and it is legal ONLY while the desk has a batch
+				// claimed for this run: verdicts for an unclaimed batch are the double pass the desk
+				// batches away, so the key is refused with the state named. Every id of the claimed
+				// batch must carry a row — a request with no verdict leaves its worker parked.
+				if (payload.verdicts !== undefined) {
+					const open = run.verify_batch;
+					if (!open) throw new Error('fade_phase: "verdicts" is the verification DESK\'s fan-out, and no batch is claimed for this run (the desk names its ids in your briefing) — drop the key');
+					if (!Array.isArray(payload.verdicts) || payload.verdicts.length === 0) throw new Error("fade_phase: verdicts must be a non-empty array of {id, accepted, notes} — one row per id of the claimed batch");
+					const ids = new Set(open.ids);
+					const rows = payload.verdicts as Array<Record<string, unknown>>;
+					for (const row of rows) {
+						if (typeof row.id !== "string" || !ids.has(row.id)) throw new Error(`fade_phase: verdicts row ${JSON.stringify(row.id)} is not an id of claimed batch ${open.batch + 1} (${open.ids.join(", ")})`);
+						if (typeof row.accepted !== "boolean") throw new Error(`fade_phase: verdicts row ${row.id} needs a boolean "accepted"`);
+						if (typeof row.notes !== "string" || row.notes.trim() === "") throw new Error(`fade_phase: verdicts row ${row.id} needs "notes" naming the command run and what it printed, or the cause to fix`);
+					}
+					const silent = open.ids.filter((id) => !rows.some((row) => row.id === id));
+					if (silent.length > 0) throw new Error(`fade_phase: claimed batch ${open.batch + 1} is answered by EVERY id — ${silent.join(", ")} has no verdict row, and a request with no verdict leaves its worker parked in fade_verify`);
+				}
 				if (payload.checks !== undefined) {
 					const checks = validateChecks(payload.checks);
 					if (checks.error) throw new Error(`fade_phase: ${checks.error}`);
@@ -1046,6 +1226,26 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// queued. `agent_end` is the single load site, after the turn is closed.
 			const applied = applyPhase(params.phase, payload);
 			turnPhase = params.phase;
+			// The desk fan-out. The batch's verdicts land on each request BY ID — that write is the
+			// only thing that unblocks a worker parked in `fade_verify` — and the claimed batch is
+			// then closed in the run state, so no later `verification_done` can answer the same ids
+			// a second time. A verifier that reported the aggregate verdict without per-id rows gets
+			// the aggregate fanned to every id, with its own notes, rather than leaving workers
+			// parked: the aggregate IS the batch's answer in that shape.
+			let verdictNote = "";
+			const claimed = run.verify_batch;
+			if (params.phase === "verification_done" && claimed && runDir) {
+				const st3: RunState = run;
+				const rows = Array.isArray(payload.verdicts) ? (payload.verdicts as Array<Record<string, unknown>>) : [];
+				const aggregate = String(payload.verdict) === "accepted";
+				const fan = rows.length > 0
+					? rows.map((r) => ({ id: String(r.id), accepted: r.accepted === true, notes: String(r.notes) }))
+					: claimed.ids.map((id) => ({ id, accepted: aggregate, notes: typeof payload.notes === "string" ? payload.notes : `round verdict: ${String(payload.verdict)}` }));
+				await mutateDesk(runDir, st3.run_id, (d) => attachVerdicts(d, fan).desk);
+				st3.verify_batch = undefined;
+				deskBatch = undefined;
+				verdictNote = `; desk batch ${claimed.batch + 1} answered for ${fan.length} worker request(s) (${fan.filter((f) => f.accepted).length} accepted)`;
+			}
 			// An accepted phase is the end of the protocol streak. `round`/`max_rounds` are
 			// untouched here — a lane that reports never owes the round budget anything.
 			classifyTurnEnd(run, true);
@@ -1124,8 +1324,143 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			settledNotified = false;
 			ctx.abort();
 			return {
-				content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${checkpointNote}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
+					content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${checkpointNote}${verdictNote}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
 				details: { phase: params.phase, state: applied.nextState, next_lane: pending?.lane ?? null, checkpoints: run.checkpoints ?? {} },
+			};
+		},
+	});
+
+	/**
+	 * The desk's front door, for a delegated worker.
+	 *
+	 * A worker that finishes its slice wants its work verified, and the naive shape of that —
+	 * verify on arrival — is one lane load per worker: three workers, three 13-25 s swaps inside
+	 * the flip guard's window, and the guard calls the result churn and halts the run. So this tool
+	 * does not verify anything. It registers the request and, for a worker, BLOCKS on the answer:
+	 * the batch is collected until it has closed (every verification-carrying worker of the
+	 * launching `task` call registered, the call settled, the settle window aged out, or the hard
+	 * deadline), and then ONE verification pass answers the whole batch and the verdict lands on
+	 * each request by id, unblocking every worker parked here at the same instant.
+	 *
+	 * The owner session is deliberately NOT blocked: it is the thing that dispatches the batch, and
+	 * a blocked owner verifies nothing forever. It gets the queue position and moves on.
+	 */
+	pi.registerTool({
+		name: "fade_verify",
+		label: "fade verify",
+		description:
+			"Register THIS session's verification request with the run's verification desk, then wait for the batched verdict. " +
+			"The orchestrator answers every request of one batch in a SINGLE verification pass and never loads a lane per arrival, so a worker that finishes early waits for its peers by design. " +
+			"Call it ONCE per slice: a second call for the same objective returns the same request. " +
+			"params: objective (what must be judged), acceptance (the command that proves it and what it must print), checks [[cmd, expected]], task_id.",
+		parameters: Type.Object({
+			objective: Type.String({ description: "what must be judged, in one sentence" }),
+			acceptance: Type.Optional(Type.String({ description: "one command and what it must print" })),
+			checks: Type.Optional(Type.Array(Type.Any(), { description: '[["cmd","expected"]] rows the verifier must run; {"cmd","expected"} objects are accepted too' })),
+			task_id: Type.Optional(Type.String({ description: "the run task this slice belongs to, when one was named" })),
+		}),
+		// @ts-expect-error loadMode is accepted at runtime (essential = shipped in the catalog).
+		loadMode: "essential",
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const objective = String(params.objective ?? "").trim();
+			if (objective === "") throw new Error('fade_verify: "objective" is the thing to judge — name it in one sentence');
+			const dir = deskDirFor(ctx);
+			const state = await readJsonAsync<RunState>(join(dir, STATE_FILENAME));
+			const active = await readJsonAsync<{ run_id?: string }>(join(dir, ACTIVE_FILENAME));
+			const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : undefined;
+			if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against — nothing was written`);
+			const rows: unknown[] = Array.isArray(params.checks) ? params.checks : [];
+			const agent = isWorkerSession(ctx) ? workerName(ctx) : "owner";
+			let captured: { request: VerifyRequest; deduped: boolean } | undefined;
+			const after = await mutateDesk(dir, runId, (d) => {
+				const enq = enqueueRequest(d, {
+					agent,
+					session: process.env.PI_SESSION_FILE ?? "",
+					...(typeof params.task_id === "string" && params.task_id.trim() !== "" ? { task_id: params.task_id.trim() } : {}),
+					objective,
+					...(typeof params.acceptance === "string" && params.acceptance.trim() !== "" ? { acceptance: params.acceptance.trim() } : {}),
+					checks: rows as [string, string][],
+				});
+				captured = { request: enq.request, deduped: enq.deduped };
+				return enq.desk;
+			});
+			const request = captured?.request;
+			if (!request) throw new Error(`fade_verify: the desk at ${dir} did not accept the registration (concurrent writers exhausted the retry budget); nothing was queued`);
+			const ready = readyToAddress(after, Date.now());
+			const queue = `request ${request.id} of batch ${after.epoch + 1} · ${ready.open} registered, ${ready.expected > 0 ? `${ready.registered}/${ready.expected} of the launching task call` : "the launching task call named no count"}`;
+			if (agent === "owner") {
+				// The owner is the dispatcher: blocking it would park the only session that can pay
+				// the pass. It gets its queue position and the rule that closes the batch.
+				return {
+					content: [{ type: "text", text: `${queue}. Registered; NOT blocked here — this session dispatches the batch, so blocking it would stall the pass. The batch is answered at the turn boundary when it closes (${ready.reason}). Do not call fade_verify twice for this slice.` }],
+					details: { desk: { run_id: runId, id: request.id, batch: after.epoch + 1, deduped: captured?.deduped === true, ready: ready.ready, reason: ready.reason, owner: true } },
+				};
+			}
+			const wait = await awaitVerdict(dir, runId, request.id, { timeoutMs: DESK_WAIT_MS, signal });
+			if (wait.state === "answered") {
+				const v = wait.request?.verdict;
+				return {
+					content: [{ type: "text", text: `${request.id} ${v?.accepted === true ? "ACCEPTED" : "NEEDS REPAIR"} after ${Math.round(wait.waited_ms / 1000)}s in the batched pass: ${v?.notes ?? "no notes posted"}` }],
+					details: { desk: { run_id: runId, id: request.id, batch: after.epoch + 1, state: "answered", accepted: v?.accepted === true, notes: v?.notes, polls: wait.polls, waited_ms: wait.waited_ms } },
+				};
+			}
+			throw new Error(`${queue} · ${wait.state}: ${wait.note}`);
+		},
+	});
+
+	/**
+	 * The batch's answer, posted BY ID. This write is the only thing that unblocks a worker parked
+	 * in `fade_verify`: a verdict written into prose leaves every worker in the batch waiting for
+	 * its own request, and the run looks idle while nothing is answered.
+	 *
+	 * The batch number is a gate, not decoration: a payload naming a batch the desk never claimed
+	 * (an epoch still open, or an invented number) is refused with the claimed batches named. That
+	 * is what stops a second pass answering an open batch — the double verification the desk
+	 * batches away.
+	 */
+	pi.registerTool({
+		name: "fade_verdicts",
+		label: "fade verdicts",
+		description:
+			"Post the verdicts of ONE claimed verification batch, by id. Call ONCE per batch — the write unblocks every worker parked in fade_verify. " +
+			'batch is the batch number the briefing names; verdicts is [{"id","accepted","notes"}] with one row per id of that batch, and `notes` naming the command run and what it printed (or the cause to fix).',
+		parameters: Type.Object({
+			batch: Type.Number({ description: "the batch number from the briefing (the number after `batch`)" }),
+			verdicts: Type.Array(Type.Object({ id: Type.String({ description: "the request id, e.g. V2.1" }), accepted: Type.Boolean(), notes: Type.String({ description: "the command run and what it printed, or the cause to fix" }) })),
+		}),
+		// @ts-expect-error loadMode is accepted at runtime (essential = shipped in the catalog).
+		loadMode: "essential",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const dir = deskDirFor(ctx);
+			const state = await readJsonAsync<RunState>(join(dir, STATE_FILENAME));
+			const active = await readJsonAsync<{ run_id?: string }>(join(dir, ACTIVE_FILENAME));
+			const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : undefined;
+			if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
+			// The public batch number is the LABEL the briefing and the desk print (1-based); the
+			// desk's internal epoch is 0-based. One conversion at the boundary, so no reader ever
+			// meets two numbering systems for the same batch.
+			const label = Number(params.batch);
+			const epoch = label - 1;
+			const rows = Array.isArray(params.verdicts) ? (params.verdicts as Array<Record<string, unknown>>) : [];
+			if (rows.length === 0) throw new Error("fade_verdicts: verdicts[] is empty — a batch is answered by one row per id, never by silence");
+			const desk = await readDesk(dir, runId);
+			if (!desk) throw new Error(`fade_verdicts: no desk file at ${dir} yet — nothing has been claimed, so nothing can be answered`);
+			const claim = desk.addressed.find((a) => a.batch === epoch);
+			if (!claim) {
+				throw new Error(
+					`fade_verdicts: batch ${label} was never claimed by the desk${desk.addressed.length > 0 ? ` (claimed: ${desk.addressed.map((a) => `batch ${a.batch + 1} [${a.ids.join(",")}]`).join(" · ")})` : " (nothing has been claimed)"}; batch ${desk.epoch + 1} is the OPEN one, still being COLLECTED, and answering it early is the double pass this gate exists to stop`,
+				);
+			}
+			const want = new Set(claim.ids);
+			const strays = rows.map((r) => String(r.id)).filter((id) => !want.has(id));
+			if (strays.length > 0) throw new Error(`fade_verdicts: ${strays.join(", ")} ${strays.length === 1 ? "is" : "are"} not part of batch ${label} (its ids: ${claim.ids.join(", ")}) — judge only your batch`);
+			const missing = claim.ids.filter((id) => !rows.some((r) => String(r.id) === id));
+			const verdicts = rows.map((r) => ({ id: String(r.id), accepted: r.accepted === true, notes: typeof r.notes === "string" ? r.notes : "no notes" }));
+			const res = await mutateDesk(dir, runId, (d) => attachVerdicts(d, verdicts).desk);
+			const accepted = verdicts.filter((v) => v.accepted).length;
+			return {
+				content: [{ type: "text", text: `batch ${label} answered: ${accepted} accepted, ${verdicts.length - accepted} needs_repair; ${verdicts.length} worker${verdicts.length === 1 ? "" : "s"} unblocked${missing.length > 0 ? `; STILL UNANSWERED in this batch: ${missing.join(", ")} — an id you did not judge is a defect, not a pass` : ""}` }],
+				details: { desk: { run_id: runId, batch: label, attached: res.requests.filter((r) => verdicts.some((v) => v.id === r.id)).length, missing, routed: claim.routed, churn: desk.churn } },
 			};
 		},
 	});
@@ -1178,7 +1513,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
 		handler: async (args, ctx) => {
 			// `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
 			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
@@ -1213,8 +1548,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// measured zero for a thing that never happened.
 				const cost = runDir ? summarizeSwaps(await readSwaps(runDir), run.run_id) : { count: 0, total_elapsed_s: 0 };
 				const paid = cost.count > 0 ? `swaps ${cost.count} · ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
+				// The verification desk, when the run has one: the batch being collected and the route
+				// it will take. A run with no desk file prints nothing here — a bare `0` would read as
+				// a measured zero for workers that never delegated.
+				const d = runDir ? await readDesk(runDir, run.run_id) : undefined;
+				const deskPart = d ? ` · ${deskLine(d)}` : "";
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid}${deskPart} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
@@ -1256,6 +1596,55 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify(`orchestrate: ${versionLine(snap?.engine_version, await packageVersion(), await bundleHash())}`, "info");
 				return;
 			}
+			if (first === "desk") {
+				// The verification desk: the batch being COLLECTED, the ones claimed, and the route
+				// each took. This is the operator's answer to "why has no lane loaded for the
+				// workers?" — the readiness rule prints its own reason, so a batch waiting for its
+				// peers is visibly waiting, not silently idle.
+				const dir = runDir ?? join(ctx.cwd, "var", "omp-orchestrate");
+				const st = run ?? (await readJsonAsync<RunState>(join(dir, STATE_FILENAME)));
+				if (!st) {
+					ctx.ui.notify(`orchestrate: no run in ${dir}, so there is no desk`, "info");
+					return;
+				}
+				const d = await readDesk(dir, st.run_id);
+				if (!d) {
+					ctx.ui.notify(`orchestrate: no desk file at ${deskPath(dir)} — no worker has registered a verification request for ${st.run_id}`, "info");
+					return;
+				}
+				const ready = readyToAddress(d, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+				ctx.ui.notify(`orchestrate: ${deskLine(d)} · batch ${d.epoch + 1} open since ${d.open_utc}${d.sealed_utc ? ` · sealed ${d.sealed_utc}` : " · NOT sealed"} · ${ready.reason}`, "info");
+				for (const r of d.requests.slice(-8)) {
+					ctx.ui.notify(`  ${r.id} [batch ${r.batch + 1}] ${r.agent}${r.task_id ? `/${r.task_id}` : ""}: ${r.objective.slice(0, 70)} → ${r.verdict ? (r.verdict.accepted ? "ACCEPTED" : "needs_repair") : r.claimed_batch !== undefined ? "claimed, verdict owed" : "collecting"}`, "info");
+				}
+				for (const a of d.addressed.slice(-4)) ctx.ui.notify(`  batch ${a.batch + 1} addressed ${a.at} routed ${a.routed}: ${a.ids.join(", ")}`, "info");
+				if (d.churn) ctx.ui.notify(`orchestrate: CHURN ROUTE in force${d.churn_utc ? ` since ${d.churn_utc}` : ""} — batches go to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}; /orchestrate lanes reset hands them back to the lane`, "warning");
+				return;
+			}
+			if (first === "verifier") {
+				// The verification agent: the definition that makes a churn-free verification possible,
+				// because the host pins a `task` agent's model from its front matter. `install` writes
+				// the file into this repo's agent plane with the model resolved HERE, so a model change
+				// is an env var plus a re-install, not an edit of a checked-in file.
+				const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
+				const abs = join(ctx.cwd, verifierAgentPath(ctx.cwd));
+				if (sub === "install") {
+					try {
+						mkdirSync(join(ctx.cwd, ".omp", "agents"), { recursive: true });
+						writeFileSync(abs, verifierAgentMd());
+					} catch (e) {
+						ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
+						return;
+					}
+					const warn = isRouterModel(VERIFIER_MODEL) ? ` WARNING: ${VERIFIER_MODEL} is a ROUTER entry — a subagent on it pays the very swap this agent exists to avoid; point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1)` : "";
+					ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) — the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
+					return;
+				}
+				const installed = existsSync(abs);
+				ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} · model ${VERIFIER_MODEL} · ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
+				if (installed) ctx.ui.notify(`orchestrate: ${readFileSync(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
+				return;
+			}
 			if (first === "overlay") {
 				await openPanelGuarded(ctx);
 				return;
@@ -1292,6 +1681,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				pending = undefined;
 				resetFlipLedger();
 				flipBadge = undefined;
+				// The churn route is released WITH the ledger: the operator has dealt with the
+				// competing client, so batches go back to being answered by the verifier lane.
+				if (run?.run_id && runDir) {
+					const d = await readDesk(runDir, run.run_id);
+					if (d?.churn) {
+						await writeJsonAsync(deskPath(runDir), setChurn(d, false));
+						ctx.ui.notify(`orchestrate: churn route cleared — verification batches answer on the ${THINK_LANE} lane again`, "info");
+					}
+				}
 				run.paused = false;
 				run.operator_note = undefined;
 				const wanted = owed?.lane ?? run.lane;
@@ -1546,6 +1944,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				void recordTurn("paused");
 				return;
 			}
+			// The desk dispatch comes BEFORE the protocol ladder: a closed verification batch is real
+			// work this boundary owes, and nudging a lane about a missing `fade_phase` while workers
+			// sit answered-but-unclaimed is the loop arguing with itself.
+			if (await dispatchDeskBatch(ctx)) {
+				void recordTurn("verification_batch");
+				return;
+			}
 			// Tier-1 protocol gate. A turn that ends with no accepted fade_phase is PROTOCOL
 			// debt: `round`/`max_rounds` never move, and while the offending lane is the resident
 			// one a nudge costs nothing (no swap). Three tiers, counted in `stall_count`.
@@ -1639,7 +2044,22 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// write past it. `task` is NOT refused — it writes nothing itself, its spawned sessions are
 	// inert by `isDelegatedSession`, and refusing it would only block the coding session that
 	// owns the run.
-	pi.on("tool_call", async (event: { toolName?: string }) => {
+	pi.on("tool_call", async (event: { toolName?: string; input?: Record<string, unknown> }, ctx: ExtensionContext) => {
+		// The delegation census, recorded on the desk BEFORE the worker starts: how many workers this
+		// `task` call carries, and how many of them carry VERIFICATION work. That count is what the
+		// open batch waits for (`expected`), and it is the whole batching rule: a worker that
+		// registers early is told `not ready`, because its peers are named by this call and have not
+		// registered yet. A call that carries no verification work is not counted at all — nothing
+		// will register for it, and an `expected` it set would keep a batch open to the deadline.
+		if (!run || !runDir || isDelegatedSession()) return undefined;
+		if (event.toolName === "task") {
+			const batch = taskBatchOf(event.input);
+			if (batch.carriesVerification) {
+				await mutateDesk(runDir, run.run_id, (d) => noteTaskBatch(d, { count: batch.verifyAgents.length, agents: batch.verifyAgents }));
+				ctx.ui.notify(`orchestrate: task call carries ${batch.count} worker(s), ${batch.verifyAgents.length} with verification work — the desk batch closes at ${batch.verifyAgents.length} registration(s)`, "info");
+			}
+			return undefined;
+		}
 		// The guard reads the ON-DISK run, not this session's copy: a session started before a
 		// lane change would otherwise enforce a lane that no longer exists, with no way to
 		// unblock the session. Enforcement is the VERIFIER'S TURN only — `state: verifying` is
@@ -1647,7 +2067,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// `isDelegatedSession`. The read is `liveState`: this hook fires on EVERY tool call, and
 		// its whole-file `readFileSync` + parse of `state.json` was a per-keystroke stall of the
 		// host's loop; the mtime guard makes a steady run pay one `stat`.
-		if (!run || isDelegatedSession()) return undefined;
 		const live = await liveState();
 		if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return undefined;
 		const name = event.toolName ?? "";
@@ -1655,6 +2074,23 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);
 		await persist();
 		return { block: true, reason: `fade_orchestrate: the verifier lane is read-only — ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
+	});
+
+	// The `task` call SETTLED: every worker it carried has run, so every registration it was ever
+	// going to produce is on the desk. That is the seal — the batch is closed by the launching
+	// call's own lifetime, which is the strongest available proof that no peer is still to come.
+	// The seal makes the batch addressable at the next turn boundary; it never dispatches a lane
+	// load from inside a tool result, because a load issued mid-turn is the queued-request pattern
+	// the router answers by swapping BACK.
+	pi.on("tool_result", async (event: { toolName?: string; isError?: boolean }, ctx: ExtensionContext) => {
+		if (event.toolName !== "task" || !run || !runDir || isDelegatedSession()) return undefined;
+		const desk = await readDesk(runDir, run.run_id);
+		if (!desk || openRequests(desk).length === 0) return undefined;
+		const sealed = sealBatch(desk);
+		await writeJsonAsync(deskPath(runDir), sealed);
+		const ready = readyToAddress(sealed, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+		ctx.ui.notify(`orchestrate: task call settled — desk batch ${sealed.epoch + 1} sealed with ${openRequests(sealed).length} request(s): ${ready.reason}`, "info");
+		return undefined;
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

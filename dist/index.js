@@ -1,8 +1,8 @@
 // src/index.ts
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { unlinkSync as unlinkSync2 } from "node:fs";
-import { basename, dirname, join as join6 } from "node:path";
+import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { basename, dirname, join as join7 } from "node:path";
 import { readFile as readFile2, stat as stat3 } from "node:fs/promises";
 import { Type } from "typebox";
 
@@ -198,6 +198,9 @@ var flipGuarded = (f) => f.flips >= FLIP_MIN_SWAPS;
 var flipBreaker = (f) => f.flips >= FLIP_BREAKER_AT;
 var flipNote = (f) => flipGuarded(f) ? ` \u2014 FLIP GUARD: ${f.flips} swaps in ${f.window_s}s, requests naming ${f.competing.join(", ") || "the other lane"}` : "";
 
+// src/desk.ts
+import { join as join2 } from "node:path";
+
 // src/core.ts
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -291,6 +294,7 @@ var SCHEMA_HINT = [
   'planning_done    {"tasks":[{"id":"T1","objective":"...","files":["a/b.ts"],"acceptance":"one command and what it proves","dependencies":[]}],"checks":[["cmd","expected"]]}',
   'coding_done      {"done":[{"id":"T1","status":"passed|failed|blocked","result":"what the acceptance command observed"},{"id":"T2","status":"passed|failed|blocked","result":"what its acceptance command observed"}]} \u2014 ONE coding_done reports EVERY task of the window',
   'verification_done {"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the critique","tasks":[repair tasks, same shape as planning tasks]}',
+  'verification_done  \xB7  optional "verdicts":[{"id":"V1.1","accepted":true,"notes":"\u2026"}] \u2014 ONLY while a verification batch is open (the desk named its ids in your briefing): one row per id, and that write is what unblocks the workers parked in fade_verify',
   "```",
   `A planning check whose ACCEPTED state is not exit-0 says so in the expected text's first words \u2014 "fails: <why>" (a non-zero exit is the pass) or "no output: <why>" (empty stdout is the pass); anything else is judged on exit 0.`
 ].join("\n");
@@ -841,6 +845,48 @@ var briefings = {
       "A task rejected twice has had this exact diff tried: name the cause the next round can act on."
     )
   ),
+  /**
+   * The BATCH verification briefing: one lane load, every worker's request in it, judged once.
+   *
+   * The window is the point of the page. The lane is told the ids are the whole universe of this
+   * pass — a verifier that wanders onto a slice another worker is still holding starts a second
+   * pass over the same tree, which is the churn the desk batches away — and that its verdicts land
+   * on the desk BY ID (`fade_verdicts`), because that is the only path that unblocks a worker
+   * parked in `fade_verify`. The round's own verdict is the aggregate of the batch.
+   */
+  verifyBatch: (run, batch) => page(
+    `Phase 2 (verification) \u2014 ONE BATCH, batch ${batch.batch + 1} of orchestrated run ${run.run_id}, round ${run.round}/${run.max_rounds}, routed ${batch.routed}.`,
+    section("Goal", run.goal),
+    section(
+      "Batch contract",
+      `${batch.ids.length} delegated worker request${batch.ids.length === 1 ? "" : "s"} landed on the verification desk while the code lane worked. This ONE turn judges ALL of them and posts ALL of the verdicts. Do not verify anything outside these ids, and do not take a second verification turn for them \u2014 one batch, one pass, one lane swap.`
+    ),
+    section(
+      `Requests (${batch.ids.length})`,
+      ...batch.requests.map(
+        (r) => [
+          `- ${r.id} \u2014 worker \`${r.agent}\`${r.task_id ? ` (task ${r.task_id})` : ""}: ${r.objective}`,
+          r.acceptance ? `    acceptance: ${r.acceptance}` : "",
+          r.checks.length > 0 ? `    run yourself:
+${r.checks.map(([cmd, expected]) => `      - \`${cmd}\` (expected ${expected})`).join("\n")}` : "    no commands named: judge from the diff and the named acceptance."
+        ].filter(Boolean).join("\n")
+      )
+    ),
+    section(
+      "Post the verdicts BY ID",
+      `Call the \`fade_verdicts\` tool ONCE with \`batch: ${batch.batch + 1}\` (the batch number in this page's heading) and one row per id. That write is what unblocks each worker parked in \`fade_verify\`; a verdict in prose alone leaves every worker waiting.`,
+      fence(`{"batch":${batch.batch + 1},"verdicts":[{"id":"${batch.ids[0] ?? "V1.1"}","accepted":true,"notes":"the command you ran and what it printed, or the cause to fix"}]}`)
+    ),
+    section(
+      "Then the round's verdict",
+      `Call fade_phase phase="verification_done" with the AGGREGATE: "accepted" only when EVERY id above passed on checks YOU re-ran this turn; "needs_repair" naming the repair tasks the batch implies. Pass the per-id rows in \`verdicts\` too, so the desk record and the round record cannot diverge.`,
+      fence('{"verdict":"accepted|needs_repair","checks":[["cmd","observed"]],"notes":"the batch verdict","tasks":[],"verdicts":[{"id":"V1.1","accepted":true,"notes":"\u2026"}]}')
+    ),
+    section(
+      "Verdict rule",
+      `"accepted" needs every command above re-run BY YOU in this turn, in ${run.repo}, with what THAT run printed. A check you did not run cannot be accepted, and a request you did not judge is a defect, not a pass.`
+    )
+  ),
   repair: async (run) => {
     const prior = (run.rejection_history ?? []).slice(-5).map((r) => `- round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
     const ids = (run.repair_tasks ?? []).map((t) => t.id);
@@ -923,6 +969,392 @@ var briefings = {
     );
   }
 };
+
+// src/desk.ts
+var DESK_SCHEMA = "fade.orchestrate.verify_desk.v1";
+var DESK_DIRNAME = "verify";
+var DESK_FILENAME = "desk.json";
+var DESK_SETTLE_MS = Number(process.env.FADE_ORCHESTRATE_DESK_SETTLE_MS ?? 8e3);
+var DESK_DEADLINE_MS = Number(process.env.FADE_ORCHESTRATE_DESK_DEADLINE_MS ?? 12e4);
+var DESK_WAIT_MS = Number(process.env.FADE_ORCHESTRATE_DESK_WAIT_MS ?? 24e4);
+var DESK_POLL_MS = Number(process.env.FADE_ORCHESTRATE_DESK_POLL_MS ?? 1e3);
+var deskPath = (dir) => join2(dir, DESK_DIRNAME, DESK_FILENAME);
+function emptyDesk(runId, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  return {
+    schema: DESK_SCHEMA,
+    run_id: runId,
+    epoch: 0,
+    open_utc: at,
+    expected: 0,
+    agents: [],
+    churn: false,
+    requests: [],
+    addressed: [],
+    updated_utc: at
+  };
+}
+var asRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
+var num = (v, dflt) => typeof v === "number" && Number.isFinite(v) ? v : dflt;
+var str = (v, dflt = "") => typeof v === "string" ? v : dflt;
+var bool = (v) => v === true;
+var isoMs = (v, fallback) => {
+  const t = typeof v === "string" ? Date.parse(v) : Number.NaN;
+  return Number.isFinite(t) ? t : fallback;
+};
+function checkRows(v) {
+  if (!Array.isArray(v)) return [];
+  const rows = [];
+  for (const row of v) {
+    if (Array.isArray(row) && typeof row[0] === "string" && typeof row[1] === "string") rows.push([row[0], row[1]]);
+    else {
+      const o = asRecord(row);
+      if (o && typeof o.cmd === "string") rows.push([o.cmd, str(o.expected, "exit 0")]);
+    }
+  }
+  return rows;
+}
+function readRequest(v, batch) {
+  const o = asRecord(v);
+  if (!o) return void 0;
+  const id = str(o.id);
+  if (id === "") return void 0;
+  const req = {
+    id,
+    batch: num(o.batch, batch),
+    agent: str(o.agent, "task"),
+    session: str(o.session),
+    objective: str(o.objective),
+    checks: checkRows(o.checks),
+    enqueued_utc: str(o.enqueued_utc, (/* @__PURE__ */ new Date(0)).toISOString())
+  };
+  if (typeof o.task_id === "string" && o.task_id !== "") req.task_id = o.task_id;
+  if (typeof o.acceptance === "string" && o.acceptance !== "") req.acceptance = o.acceptance;
+  if (typeof o.claimed_batch === "number" && Number.isFinite(o.claimed_batch)) req.claimed_batch = o.claimed_batch;
+  const verdict = asRecord(o.verdict);
+  if (verdict) req.verdict = { accepted: bool(verdict.accepted), notes: str(verdict.notes), at: str(verdict.at) };
+  return req;
+}
+function parseDesk(v, runId) {
+  const o = asRecord(v);
+  if (!o || o.schema !== DESK_SCHEMA) return void 0;
+  if (runId !== void 0 && typeof o.run_id === "string" && o.run_id !== "" && o.run_id !== runId) return void 0;
+  const epoch = num(o.epoch, 0);
+  const desk = {
+    schema: DESK_SCHEMA,
+    run_id: str(o.run_id, runId ?? ""),
+    epoch,
+    open_utc: str(o.open_utc, (/* @__PURE__ */ new Date(0)).toISOString()),
+    expected: num(o.expected, 0),
+    agents: Array.isArray(o.agents) ? o.agents.filter((a) => typeof a === "string") : [],
+    churn: bool(o.churn),
+    requests: Array.isArray(o.requests) ? o.requests.map((r) => readRequest(r, epoch)).filter((r) => r !== void 0) : [],
+    addressed: [],
+    updated_utc: str(o.updated_utc, (/* @__PURE__ */ new Date(0)).toISOString())
+  };
+  if (typeof o.sealed_utc === "string" && o.sealed_utc !== "") desk.sealed_utc = o.sealed_utc;
+  if (typeof o.churn_utc === "string" && o.churn_utc !== "") desk.churn_utc = o.churn_utc;
+  if (Array.isArray(o.addressed)) {
+    for (const a of o.addressed) {
+      const row = asRecord(a);
+      if (!row) continue;
+      desk.addressed.push({
+        batch: num(row.batch, 0),
+        ids: Array.isArray(row.ids) ? row.ids.filter((i) => typeof i === "string") : [],
+        routed: row.routed === "subagent" ? "subagent" : "swap",
+        at: str(row.at)
+      });
+    }
+  }
+  return desk;
+}
+function openRequests(desk) {
+  return desk.requests.filter((r) => r.batch === desk.epoch && r.claimed_batch === void 0 && r.verdict === void 0);
+}
+function readyToAddress(desk, nowMs, opts = {}) {
+  const settleMs = opts.settleMs ?? DESK_SETTLE_MS;
+  const deadlineMs = opts.deadlineMs ?? DESK_DEADLINE_MS;
+  const live = openRequests(desk);
+  const base = { open: live.length, registered: live.length, expected: desk.expected, churn: desk.churn };
+  if (live.length === 0) return { ready: false, reason: "desk_empty", oldest_ms: -1, ...base };
+  const oldestMs = nowMs - Math.min(...live.map((r) => isoMs(r.enqueued_utc, nowMs)));
+  const oldest = { oldest_ms: oldestMs };
+  if (desk.sealed_utc !== void 0) return { ready: true, reason: "sealed", ...oldest, ...base };
+  if (desk.expected > 0 && live.length >= desk.expected) return { ready: true, reason: "all_registered", ...oldest, ...base };
+  if (nowMs - isoMs(desk.open_utc, nowMs) >= deadlineMs) return { ready: true, reason: "deadline", ...oldest, ...base };
+  if (oldestMs >= settleMs) return { ready: true, reason: "settled", ...oldest, ...base };
+  return { ready: false, reason: `waiting for the batch to close: ${live.length}/${desk.expected > 0 ? desk.expected : "?"} workers registered`, ...oldest, ...base };
+}
+function claimBatch(desk, routed, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  const live = openRequests(desk);
+  const batch = desk.epoch;
+  for (const r of live) r.claimed_batch = batch;
+  const ids = live.map((r) => r.id);
+  const next = {
+    ...desk,
+    epoch: batch + 1,
+    open_utc: at,
+    expected: 0,
+    agents: [],
+    addressed: [...desk.addressed, { batch, ids, routed, at }],
+    updated_utc: at
+  };
+  delete next.sealed_utc;
+  return { desk: next, batch, ids };
+}
+function enqueueRequest(desk, req, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  const existing = desk.requests.find((r) => r.batch === desk.epoch && r.agent === req.agent && r.claimed_batch === void 0 && r.objective === req.objective);
+  if (existing) return { desk, request: existing, deduped: true };
+  const n = desk.requests.filter((r) => r.batch === desk.epoch).length + 1;
+  const request = {
+    id: `V${desk.epoch + 1}.${n}`,
+    batch: desk.epoch,
+    agent: req.agent,
+    session: req.session,
+    objective: req.objective,
+    checks: checkRows(req.checks),
+    enqueued_utc: at
+  };
+  if (req.task_id) request.task_id = req.task_id;
+  if (req.acceptance) request.acceptance = req.acceptance;
+  return {
+    desk: { ...desk, requests: [...desk.requests, request], agents: desk.agents.includes(req.agent) ? desk.agents : [...desk.agents, req.agent], updated_utc: at },
+    request,
+    deduped: false
+  };
+}
+function noteTaskBatch(desk, batch, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  const agents = [...desk.agents];
+  for (const a of batch.agents) if (!agents.includes(a)) agents.push(a);
+  return { ...desk, expected: Math.max(desk.expected, Math.max(0, batch.count)), agents, updated_utc: at };
+}
+function sealBatch(desk, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  if (desk.sealed_utc !== void 0) return desk;
+  return { ...desk, sealed_utc: at, updated_utc: at };
+}
+function setChurn(desk, on, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  if (desk.churn === on) return desk;
+  if (on) return { ...desk, churn: true, churn_utc: at, updated_utc: at };
+  delete desk.churn_utc;
+  return { ...desk, churn: false, updated_utc: at };
+}
+function attachVerdicts(desk, verdicts, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  const attached = [];
+  const unknown = [];
+  for (const v of verdicts) {
+    const hit = desk.requests.find((r) => r.id === v.id);
+    if (!hit) {
+      unknown.push(v.id);
+      continue;
+    }
+    hit.verdict = { accepted: v.accepted === true, notes: v.notes, at };
+    attached.push(v.id);
+  }
+  return { desk: { ...desk, requests: desk.requests, updated_utc: at }, attached, unknown };
+}
+var requestById = (desk, id) => desk.requests.find((r) => r.id === id);
+function deskCensus(desk) {
+  return {
+    open: openRequests(desk).length,
+    owed: desk.requests.filter((r) => r.claimed_batch !== void 0 && r.verdict === void 0).length,
+    answered: desk.requests.filter((r) => r.verdict !== void 0).length,
+    batches: desk.addressed.length,
+    churn: desk.churn
+  };
+}
+function deskLine(desk) {
+  const c = deskCensus(desk);
+  return `desk batch ${desk.epoch + 1}: ${c.open} open, ${c.owed} awaiting verdict, ${c.answered} answered, ${c.batches} addressed${desk.churn ? " \xB7 CHURN ROUTE (subagent verification)" : ""}`;
+}
+async function readDesk(dir, runId) {
+  return parseDesk(await readJsonAsync(deskPath(dir)), runId);
+}
+async function mutateDesk(dir, runId, fn, tries = 4) {
+  let last;
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    const current = await readDesk(dir, runId) ?? emptyDesk(runId);
+    const next = fn(current);
+    next.updated_utc = (/* @__PURE__ */ new Date()).toISOString();
+    await writeJsonAsync(deskPath(dir), next);
+    const back = await readDesk(dir, runId);
+    if (back && JSON.stringify(back) === JSON.stringify(next)) return next;
+    last = back ?? next;
+  }
+  return last ?? emptyDesk(runId);
+}
+var sleep = (ms) => {
+  const { promise, resolve: resolve2 } = Promise.withResolvers();
+  setTimeout(resolve2, ms);
+  return promise;
+};
+async function awaitVerdict(dir, runId, id, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? DESK_WAIT_MS;
+  const pollMs = opts.pollMs ?? DESK_POLL_MS;
+  const t0 = Date.now();
+  let polls = 0;
+  for (; ; ) {
+    polls += 1;
+    if (opts.signal?.aborted === true) {
+      return { state: "cancelled", note: `${id}: the wait was cancelled; the request stays on the desk and the next verification pass answers it`, polls, waited_ms: Date.now() - t0 };
+    }
+    const desk = await readDesk(dir, runId);
+    const req = desk ? requestById(desk, id) : void 0;
+    if (req?.verdict) return { state: "answered", request: req, note: `${id} ${req.verdict.accepted ? "ACCEPTED" : "needs_repair"}: ${req.verdict.notes}`, polls, waited_ms: Date.now() - t0 };
+    if (Date.now() - t0 >= timeoutMs) {
+      return {
+        state: "deferred",
+        request: req,
+        note: `${id} is queued in batch ${(desk?.epoch ?? 0) + 1} with no verdict after ${Math.round((Date.now() - t0) / 1e3)}s (${polls} polls): the batch is owed its verification pass \u2014 report your result and end, do not re-register`,
+        polls,
+        waited_ms: Date.now() - t0
+      };
+    }
+    await sleep(pollMs);
+  }
+}
+
+// src/subagent.ts
+var VERIFIER_AGENT = process.env.FADE_ORCHESTRATE_VERIFIER_AGENT ?? "fade-verifier";
+var VERIFIER_MODEL = process.env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
+var ROUTER_ENTRIES = [CODE_LANE, THINK_LANE, PROVIDER].map((s) => s.toLowerCase());
+function isRouterModel(model) {
+  const m = model.toLowerCase();
+  return ROUTER_ENTRIES.some((entry) => m === entry || m.startsWith(`${entry}/`) || m.includes(`/${entry}`) || m.startsWith(`${entry}:`));
+}
+var textOf = (v) => {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.map(textOf).join("\n");
+  return "";
+};
+function carriesVerification(body) {
+  if (/\bverif(y|ication|ied)\b/i.test(body)) return true;
+  if (/\bacceptance\b|\bgate\b|\baudit\b|promotion gate/i.test(body)) return true;
+  if (/\b(cargo (test|clippy)|pytest|node --test|npm (run )?test|playwright|tsc|typecheck|lint)\b/i.test(body)) return true;
+  return /\bverify\b|\bverify that\b|\bprove\b|\bscore\b|\bparit(?:y|es)\b/i.test(body);
+}
+function taskBatchOf(input) {
+  const items = [];
+  const list = Array.isArray(input?.tasks) ? input.tasks : [];
+  for (const item of list) {
+    const o = item !== null && typeof item === "object" && !Array.isArray(item) ? item : { task: String(item) };
+    items.push(o);
+  }
+  if (items.length === 0) {
+    const single = input?.task !== void 0 || input?.agent !== void 0;
+    if (single) items.push(input);
+  }
+  const kinds = items.map((o) => {
+    const agent = textOf(o.agent).trim() || textOf(o.name).trim() || "task";
+    const body = `${textOf(o.task)}
+${textOf(o.target)}
+${textOf(o.acceptance)}
+${textOf(o.solutionSpace)}`;
+    return { agent, verification: carriesVerification(body) };
+  });
+  const agents = kinds.map((k) => k.agent);
+  const verifyAgents = kinds.filter((k) => k.verification).map((k) => k.agent);
+  return {
+    count: Math.max(1, kinds.length),
+    agents: agents.length > 0 ? agents : ["task"],
+    verifyAgents,
+    carriesVerification: verifyAgents.length > 0,
+    kinds: kinds.length > 0 ? kinds : [{ agent: "task", verification: false }]
+  };
+}
+function routeFor(desk, flip, opts = {}) {
+  const guardAt = opts.guardAt ?? FLIP_MIN_SWAPS;
+  if (desk.churn) return { route: "subagent", reason: `the desk has churn declared${desk.churn_utc ? ` since ${desk.churn_utc}` : ""}: batches are answered by a verification subagent on ${VERIFIER_MODEL}, and no lane load is paid`, flips: flip.flips };
+  if (flip.flips >= guardAt) return { route: "subagent", reason: `lane churn began: ${flip.flips} swaps away from the run's lane in the guard window \u2014 the verification goes to a subagent on ${VERIFIER_MODEL} (zero router swaps) instead of a lane load`, flips: flip.flips };
+  return { route: "swap", reason: `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
+}
+function verifierTaskCall(batch, ids, requests = []) {
+  return `task { "agent": "${VERIFIER_AGENT}", "name": "Verify${batch + 1}", "solutionSpace": "one batched verification pass, verdicts posted by id", "task": ${JSON.stringify(verifierTaskBody(batch, ids, requests))} }`;
+}
+function verifierTaskBody(batch, ids, requests = []) {
+  const rows = requests.map((r) => {
+    const checks = r.checks.map(([cmd, expected]) => `    - \`${cmd}\` (expected ${expected})`).join("\n");
+    return [`  - ${r.id} (worker ${r.agent}${r.task_id ? `, task ${r.task_id}` : ""}): ${r.objective}`, r.acceptance ? `    acceptance: ${r.acceptance}` : "", checks ? `  checks:
+${checks}` : ""].filter(Boolean).join("\n");
+  });
+  return [
+    `# Verification batch ${batch + 1}`,
+    "",
+    "You are the verification lane for this batch. You run on a non-router model, so you cost the",
+    "orchestrator ZERO lane swaps. Do NOT touch the basalt router (`/v1/load`, `setModel`), do NOT",
+    "edit any file, and do NOT verify anything outside the ids below \u2014 every other slice is in",
+    "another agent's hands and a second pass over it is the churn this route exists to avoid.",
+    "",
+    "Rules:",
+    "1. Run each check command yourself, in the session cwd, and judge the request on what it",
+    "   printed. A check you did not run cannot be accepted.",
+    "2. Read the diff (`git status --porcelain`, `git diff`) for the files each id names.",
+    "3. Post exactly one verdict per id with the `fade_verdicts` tool: `batch` is the number in",
+    `   the heading above (${batch + 1}), and \`verdicts: [{id, accepted, notes}]\`. \`notes\` names the`,
+    "   command and what it printed, or the cause the coder must fix. An id you did not judge is a",
+    "   defect, not a pass.",
+    "4. Report the verdicts verbatim in your final message; the desk is the durable record.",
+    "",
+    ids.length > 0 ? `Ids to judge: ${ids.join(", ")}` : "Ids to judge: (none \u2014 the batch was claimed empty; post nothing and end)",
+    rows.length > 0 ? `
+Requests:
+${rows.join("\n")}` : ""
+  ].join("\n");
+}
+function verifierDirective(batch, ids, reason, requests = []) {
+  return [
+    `Verification batch ${batch + 1} (${ids.length} worker request${ids.length === 1 ? "" : "s"}: ${ids.join(", ")}) is READY, and the loop will NOT pay a lane load for it.`,
+    `Reason: ${reason}`,
+    "",
+    "Do exactly this, once, in this turn:",
+    "1. Call the `task` tool with the verifier agent \u2014",
+    verifierTaskCall(batch, ids, requests),
+    `   (agent definition \`${VERIFIER_AGENT}\`, model \`${VERIFIER_MODEL}\`, off the router: no pack is loaded and no swap is paid).`,
+    "2. When it returns, the verdicts are already on the desk (`fade_verdicts` posted them), so the",
+    "   waiting workers unblock on their own. Do not re-run the checks in this session.",
+    "3. Do not call `fade_phase verification_done` for these ids from the code lane; the batch's",
+    "   verdicts are the worker-scoped answer. Act on a `needs_repair` verdict by fixing the cause.",
+    "",
+    "Do not load the thinking lane for this batch, and do not delegate the same ids twice."
+  ].join("\n");
+}
+function verifierAgentMd(model = VERIFIER_MODEL, agent = VERIFIER_AGENT) {
+  const offRouter = !isRouterModel(model);
+  const routerWarning = offRouter ? "" : `
+  # WARNING: ${model} IS a basalt ROUTER entry \u2014 a subagent on it pays the 13-25 s
+  # pack swap this agent exists to avoid, which is the churn the route was
+  # built to escape. Point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router
+  # model (e.g. ninfer-local/coder-gpu1) and re-run /orchestrate verifier install.
+`;
+  return [
+    "---",
+    `name: ${agent}`,
+    `description: Batched verification lane for the fade orchestrator: judges every request of one verification batch by id and posts the verdicts. Runs on ${model}${offRouter ? ", off the basalt router, so it costs zero lane swaps" : " \u2014 WARNING: a ROUTER entry, which pays the pack swap"}.`,
+    `model: "${model}"`,
+    "tools: read, grep, glob, bash, ls, fade_verdicts",
+    "---",
+    "",
+    `You are the fade orchestrator's **verification lane** for ONE batch.`,
+    routerWarning,
+    "You are handed a batch of worker requests, each with an id, an objective, an acceptance line",
+    "and check commands. Your job is to judge each of them, exactly once, and post the verdicts.",
+    "",
+    "- Run every check command yourself, in the session cwd, and judge on what it printed. A check",
+    "  you did not run cannot be accepted.",
+    "- Inspect the diff for the files a request names. `git status --porcelain`, `git diff`.",
+    "- You are READ-ONLY on the tree. Never edit, write, patch, commit, restart a service, touch the",
+    "  basalt router (`/v1/load`), or start a long-running process. Report the cause; the coder fixes it.",
+    "- Judge ONLY the ids in your batch. Verifying another agent's live slice is the churn this lane",
+    "  exists to prevent.",
+    "- Post exactly one verdict per id with the `fade_verdicts` tool: `{batch, verdicts:[{id,",
+    "  accepted, notes}]}`. In `notes`, name the command and what it printed, or the cause the coder",
+    "  must fix. Then print the verdicts verbatim as your final message.",
+    "- Data files (parquets, duckdb, `data/`) are read-only. Do not query a locked DuckDB writer.",
+    ""
+  ].join("\n");
+}
+var verifierAgentPath = (repo, agent = VERIFIER_AGENT) => `.omp/agents/${agent}.md`;
+function routeLine(route) {
+  return route.route === "subagent" ? `verification \u2192 ${VERIFIER_AGENT} on ${VERIFIER_MODEL} \xB7 zero lane loads` : `verification \u2192 ${THINK_LANE} lane \xB7 one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
+}
 
 // src/ui.ts
 import { hostname as hostname2, userInfo } from "node:os";
@@ -1082,21 +1514,21 @@ function actCode(run) {
 }
 
 // src/history.ts
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 import { appendFile, mkdir as mkdir2, open as open2, rename as rename2, stat } from "node:fs/promises";
 var HISTORY_FILENAME = "swap_history.json";
 var METRICS_JSONL_FILENAME = "metrics.jsonl";
 var HOT_STEADY_TPS = 120;
 var MAX_ROWS = 200;
 async function readSwaps(dir) {
-  const rows = await readJsonAsync(join2(dir, HISTORY_FILENAME));
+  const rows = await readJsonAsync(join3(dir, HISTORY_FILENAME));
   return Array.isArray(rows?.rows) ? rows.rows : [];
 }
 async function appendSwap(dir, row) {
   const rows = await readSwaps(dir);
   rows.unshift(row);
   if (rows.length > MAX_ROWS) rows.length = MAX_ROWS;
-  await writeJsonAsync(join2(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
+  await writeJsonAsync(join3(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
 }
 function rampClass(decodeTps, mapRestored, threshold = HOT_STEADY_TPS) {
   if (mapRestored) return "map_restored";
@@ -1132,7 +1564,7 @@ var ledgerMaxBytes = () => {
 };
 async function appendTurn(dir, rec) {
   await mkdir2(dir, { recursive: true });
-  const path = join2(dir, METRICS_JSONL_FILENAME);
+  const path = join3(dir, METRICS_JSONL_FILENAME);
   const cap = ledgerMaxBytes();
   if (cap > 0) {
     let size = 0;
@@ -1158,7 +1590,7 @@ async function readTurns(dir, n = turnTail()) {
   const limit = Math.max(1, Math.floor(n));
   let fh;
   try {
-    fh = await open2(join2(dir, METRICS_JSONL_FILENAME), "r");
+    fh = await open2(join3(dir, METRICS_JSONL_FILENAME), "r");
   } catch {
     return [];
   }
@@ -1191,7 +1623,7 @@ async function readTurns(dir, n = turnTail()) {
 }
 
 // src/livedata.ts
-import { join as join3 } from "node:path";
+import { join as join4 } from "node:path";
 var METRICS_FILENAME = "metrics_state.json";
 async function fetchJson(url, timeoutMs = 1500) {
   const ac = new AbortController();
@@ -1379,12 +1811,12 @@ function laneBestRate(s, lane) {
   return rates.length > 0 ? Math.max(...rates) : void 0;
 }
 async function persistMetrics(dir, snap) {
-  await writeJsonAsync(join3(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
+  await writeJsonAsync(join4(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
 }
 
 // src/moe.ts
 import { closeSync as closeSync2, openSync as openSync2, readdirSync, readFileSync as readFileSync2, readSync, statSync } from "node:fs";
-import { join as join4, resolve } from "node:path";
+import { join as join5, resolve } from "node:path";
 var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
 function readServeConfig(path) {
   if (!path) return void 0;
@@ -1406,7 +1838,7 @@ function engineProof() {
     for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
       let cmd;
       try {
-        cmd = readFileSync2(join4("/proc", pid, "cmdline"), "utf8");
+        cmd = readFileSync2(join5("/proc", pid, "cmdline"), "utf8");
       } catch {
         continue;
       }
@@ -2173,11 +2605,11 @@ async function openPanel(ctx, provider, onAction, headless = process.env.FADE_OR
 }
 
 // src/runs.ts
-import { join as join5 } from "node:path";
+import { join as join6 } from "node:path";
 import { readdir, stat as stat2 } from "node:fs/promises";
 var RUNS_DIRNAME = "runs";
-var runsDir = (dir) => join5(dir, RUNS_DIRNAME);
-var runArchivePath = (dir, runId) => join5(runsDir(dir), `${runId}.json`);
+var runsDir = (dir) => join6(dir, RUNS_DIRNAME);
+var runArchivePath = (dir, runId) => join6(runsDir(dir), `${runId}.json`);
 async function archiveRun(dir, state) {
   if (TERMINAL[state.state] !== true) return void 0;
   const path = runArchivePath(dir, state.run_id);
@@ -2203,7 +2635,7 @@ async function listRuns(dir) {
   }
   const summaries = [];
   for (const name of names.filter((n) => n.endsWith(".json"))) {
-    const rec = await readJsonAsync(join5(shelf, name));
+    const rec = await readJsonAsync(join6(shelf, name));
     if (typeof rec?.goal !== "string") continue;
     const tasks = Array.isArray(rec.tasks) ? rec.tasks : [];
     const runId = typeof rec.run_id === "string" ? rec.run_id : name.replace(/\.json$/, "");
@@ -2237,11 +2669,24 @@ var isDelegatedSession = () => {
   const parent = basename(dirname(f));
   return MAIN_SESSION_DIR.test(parent) && !f.endsWith(`${parent}.jsonl`);
 };
+var hostAgent = (ctx) => {
+  const c = ctx !== null && typeof ctx === "object" && !Array.isArray(ctx) ? ctx : void 0;
+  const a = c?.agent;
+  const rec = a !== null && a !== void 0 && typeof a === "object" && !Array.isArray(a) ? a : void 0;
+  if (!rec) return void 0;
+  return { kind: typeof rec.kind === "string" ? rec.kind : "", name: typeof rec.name === "string" ? rec.name : "" };
+};
+var isWorkerSession = (ctx) => hostAgent(ctx)?.kind === "sub" || isDelegatedSession();
+var workerName = (ctx) => hostAgent(ctx)?.name || basename(process.env.PI_SESSION_FILE ?? "").replace(/\.jsonl$/, "") || "worker";
+var deskDirFor = (ctx) => join7(ctx.cwd, "var", "omp-orchestrate");
 function fadeOrchestrate(pi) {
   let run;
   let runDir;
   let lockDir;
   let pending;
+  let deskBatch;
+  let deskAnnounced = -1;
+  let deskBriefing = false;
   let settledNotified = false;
   let metrics;
   let laneBest = 0;
@@ -2335,7 +2780,7 @@ function fadeOrchestrate(pi) {
       return false;
     }
   };
-  const statePath = () => runDir ? join6(runDir, STATE_FILENAME) : "<unset>";
+  const statePath = () => runDir ? join7(runDir, STATE_FILENAME) : "<unset>";
   let publishedAtUs = 0;
   const syncFromDisk = async () => {
     if (!run || !runDir) return false;
@@ -2386,7 +2831,7 @@ function fadeOrchestrate(pi) {
   let liveCache;
   const liveState = async () => {
     if (!runDir) return void 0;
-    const path = join6(runDir, STATE_FILENAME);
+    const path = join7(runDir, STATE_FILENAME);
     try {
       const s = await stat3(path);
       const key = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
@@ -2499,6 +2944,47 @@ function fadeOrchestrate(pi) {
     const gen = ++switchGen;
     switchChain = switchChain.then(() => gen === switchGen ? runSwitch(lane, ctx, gen) : void 0).catch(() => void 0);
   };
+  const dispatchDeskBatch = async (ctx) => {
+    if (!run || !runDir || TERMINAL[run.state] === true) return false;
+    const desk = await readDesk(runDir, run.run_id);
+    if (!desk) return false;
+    const live = openRequests(desk);
+    if (live.length === 0) return false;
+    const ready = readyToAddress(desk, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+    if (!ready.ready) {
+      if (deskAnnounced !== desk.epoch) {
+        deskAnnounced = desk.epoch;
+        ctx.ui.notify(`orchestrate: the verification desk holds ${ready.open} request(s) \u2014 ${ready.reason}; no lane is loaded until the batch closes`, "info");
+      }
+      return false;
+    }
+    await observeSwaps();
+    const route = routeFor(desk, flipState(run.lane, FLIP_WINDOW_MS));
+    const claimed = claimBatch(desk, route.route);
+    const requests = desk.requests.filter((r) => claimed.ids.includes(r.id));
+    deskBatch = { batch: claimed.batch, ids: claimed.ids, routed: route.route };
+    run.verify_batch = { batch: claimed.batch, ids: claimed.ids, routed: route.route, at: (/* @__PURE__ */ new Date()).toISOString() };
+    pushRejection(run, "task", `verification batch ${claimed.batch + 1} (${claimed.ids.join(", ")}) addressed AT ONCE, routed ${route.route}: ${route.reason}`);
+    if (route.route === "subagent") {
+      await writeJsonAsync(deskPath(runDir), setChurn(claimed.desk, true));
+      await persist();
+      paint(ctx);
+      ctx.ui.notify(`orchestrate: verification batch ${claimed.batch + 1} \xB7 ${claimed.ids.length} worker request(s) \u2192 ${routeLine(route)}`, "warning");
+      await ensurePhaseTool();
+      pi.sendUserMessage(verifierDirective(claimed.batch, claimed.ids, route.reason, requests));
+      return true;
+    }
+    await writeJsonAsync(deskPath(runDir), claimed.desk);
+    run.state = "verifying";
+    pending = { lane: THINK_LANE, phase: "verification_batch" };
+    deskBriefing = true;
+    settledNotified = false;
+    await persist();
+    paint(ctx);
+    ctx.ui.notify(`orchestrate: ${deskLine(desk)} \u2014 one ${THINK_LANE} load answers the whole batch`, "info");
+    requestLane(THINK_LANE, ctx);
+    return true;
+  };
   const runSwitch = async (lane, ctx, gen) => {
     const model = ctx.modelRegistry.find(PROVIDER, lane);
     if (!model) {
@@ -2519,6 +3005,24 @@ function fadeOrchestrate(pi) {
         run.operator_note = `lane thrash: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; the loop is HALTED and paid no ${lane} load \u2014 /orchestrate lanes reset clears the ledger and lands it`;
         pushRejection(run, "task", `LANE THRASH: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; ${lane} refused, loop halted, ZERO load paid`);
         pending = { lane, phase: turnPhase ?? "lane" };
+      }
+      if (run && runDir) {
+        const d = await readDesk(runDir, run.run_id);
+        if (d) {
+          const churned = setChurn(d, true);
+          const live = openRequests(churned);
+          if (live.length > 0) {
+            const claimed = claimBatch(churned, "subagent");
+            deskBatch = { batch: claimed.batch, ids: claimed.ids, routed: "subagent" };
+            run.verify_batch = { batch: claimed.batch, ids: claimed.ids, routed: "subagent", at: (/* @__PURE__ */ new Date()).toISOString() };
+            await writeJsonAsync(deskPath(runDir), claimed.desk);
+            pushRejection(run, "task", `LANE THRASH routed verification batch ${claimed.batch + 1} (${claimed.ids.join(", ")}) to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}: zero lane loads paid`);
+            await ensurePhaseTool();
+            pi.sendUserMessage(verifierDirective(claimed.batch, claimed.ids, `lane thrash: ${flip.flips} swaps in ${flip.window_s}s naming ${who}; the loop is HALTED and pays no load, so this batch is answered off the router`, churned.requests.filter((r) => claimed.ids.includes(r.id))));
+          } else {
+            await writeJsonAsync(deskPath(runDir), churned);
+          }
+        }
       }
       await persist();
       paint(ctx);
@@ -2567,6 +3071,24 @@ function fadeOrchestrate(pi) {
     setTimeout(async () => {
       if (gen !== switchGen) return;
       await ensurePhaseTool();
+      const owed = deskBriefing && lane === THINK_LANE && run?.verify_batch;
+      deskBriefing = false;
+      if (owed && runDir && run) {
+        const st = run;
+        const ids = st.verify_batch?.ids ?? [];
+        const d = await readDesk(runDir, st.run_id);
+        if (d) {
+          pi.sendUserMessage(
+            briefings.verifyBatch(st, {
+              batch: st.verify_batch?.batch ?? d.epoch,
+              ids,
+              routed: st.verify_batch?.routed ?? "swap",
+              requests: d.requests.filter((r) => ids.includes(r.id)).map((r) => ({ id: r.id, agent: r.agent, ...r.task_id ? { task_id: r.task_id } : {}, objective: r.objective, ...r.acceptance ? { acceptance: r.acceptance } : {}, checks: r.checks }))
+            })
+          );
+          return;
+        }
+      }
       const text = await (run.state === "repair" ? briefings.repair(run) : lane === CODE_LANE && run.gate_last && run.gate_last.passed === false ? briefings.gate(run) : lane === CODE_LANE ? briefings.code(run) : briefings.verify(run));
       pi.sendUserMessage(text);
     }, 0);
@@ -2598,7 +3120,7 @@ function fadeOrchestrate(pi) {
   };
   const packageVersion = async () => {
     const here = dirname(fileURLToPath(import.meta.url));
-    for (const p of [join6(here, "..", "package.json"), join6(here, "package.json")]) {
+    for (const p of [join7(here, "..", "package.json"), join7(here, "package.json")]) {
       try {
         const raw = JSON.parse(await readFile2(p, "utf8"));
         if (raw && typeof raw === "object" && "version" in raw && typeof raw.version === "string" && raw.version !== "") return raw.version;
@@ -2609,7 +3131,7 @@ function fadeOrchestrate(pi) {
   };
   const bundleHash = async () => {
     const here = dirname(fileURLToPath(import.meta.url));
-    for (const p of [join6(here, "index.js"), join6(here, "..", "dist", "index.js")]) {
+    for (const p of [join7(here, "index.js"), join7(here, "..", "dist", "index.js")]) {
       try {
         return createHash("sha256").update(await readFile2(p)).digest("hex");
       } catch {
@@ -2813,7 +3335,7 @@ function fadeOrchestrate(pi) {
         const allowedKeys = {
           planning_done: /* @__PURE__ */ new Set(["tasks", "checks"]),
           coding_done: /* @__PURE__ */ new Set(["done"]),
-          verification_done: /* @__PURE__ */ new Set(["verdict", "checks", "notes", "tasks"])
+          verification_done: /* @__PURE__ */ new Set(["verdict", "checks", "notes", "tasks", "verdicts"])
         };
         for (const key of Object.keys(payload)) {
           if (!allowedKeys[params.phase].has(key)) throw new Error(`fade_phase: ${params.phase} does not take key "${key}"`);
@@ -2844,6 +3366,20 @@ function fadeOrchestrate(pi) {
         }
         if (params.phase === "verification_done") {
           if (!["accepted", "needs_repair"].includes(String(payload.verdict))) throw new Error("fade_phase: verdict must be accepted or needs_repair");
+          if (payload.verdicts !== void 0) {
+            const open3 = run.verify_batch;
+            if (!open3) throw new Error(`fade_phase: "verdicts" is the verification DESK's fan-out, and no batch is claimed for this run (the desk names its ids in your briefing) \u2014 drop the key`);
+            if (!Array.isArray(payload.verdicts) || payload.verdicts.length === 0) throw new Error("fade_phase: verdicts must be a non-empty array of {id, accepted, notes} \u2014 one row per id of the claimed batch");
+            const ids = new Set(open3.ids);
+            const rows = payload.verdicts;
+            for (const row of rows) {
+              if (typeof row.id !== "string" || !ids.has(row.id)) throw new Error(`fade_phase: verdicts row ${JSON.stringify(row.id)} is not an id of claimed batch ${open3.batch + 1} (${open3.ids.join(", ")})`);
+              if (typeof row.accepted !== "boolean") throw new Error(`fade_phase: verdicts row ${row.id} needs a boolean "accepted"`);
+              if (typeof row.notes !== "string" || row.notes.trim() === "") throw new Error(`fade_phase: verdicts row ${row.id} needs "notes" naming the command run and what it printed, or the cause to fix`);
+            }
+            const silent = open3.ids.filter((id) => !rows.some((row) => row.id === id));
+            if (silent.length > 0) throw new Error(`fade_phase: claimed batch ${open3.batch + 1} is answered by EVERY id \u2014 ${silent.join(", ")} has no verdict row, and a request with no verdict leaves its worker parked in fade_verify`);
+          }
           if (payload.checks !== void 0) {
             const checks = validateChecks(payload.checks);
             if (checks.error) throw new Error(`fade_phase: ${checks.error}`);
@@ -2867,6 +3403,18 @@ ${SCHEMA_HINT}` : text);
       }
       const applied = applyPhase(params.phase, payload);
       turnPhase = params.phase;
+      let verdictNote = "";
+      const claimed = run.verify_batch;
+      if (params.phase === "verification_done" && claimed && runDir) {
+        const st3 = run;
+        const rows = Array.isArray(payload.verdicts) ? payload.verdicts : [];
+        const aggregate = String(payload.verdict) === "accepted";
+        const fan = rows.length > 0 ? rows.map((r) => ({ id: String(r.id), accepted: r.accepted === true, notes: String(r.notes) })) : claimed.ids.map((id) => ({ id, accepted: aggregate, notes: typeof payload.notes === "string" ? payload.notes : `round verdict: ${String(payload.verdict)}` }));
+        await mutateDesk(runDir, st3.run_id, (d) => attachVerdicts(d, fan).desk);
+        st3.verify_batch = void 0;
+        deskBatch = void 0;
+        verdictNote = `; desk batch ${claimed.batch + 1} answered for ${fan.length} worker request(s) (${fan.filter((f) => f.accepted).length} accepted)`;
+      }
       classifyTurnEnd(run, true);
       if (applied.nextState === "complete" || applied.nextState === "failed") releaseLock();
       let checkpointNote = "";
@@ -2928,8 +3476,105 @@ ${SCHEMA_HINT}` : text);
       settledNotified = false;
       ctx.abort();
       return {
-        content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${checkpointNote}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
+        content: [{ type: "text", text: `phase ${params.phase} recorded; state ${applied.nextState}${checkpointNote}${verdictNote}${pending ? `, ${pending.lane} loads at the turn boundary` : "; run terminal, lane left resident"}` }],
         details: { phase: params.phase, state: applied.nextState, next_lane: pending?.lane ?? null, checkpoints: run.checkpoints ?? {} }
+      };
+    }
+  });
+  pi.registerTool({
+    name: "fade_verify",
+    label: "fade verify",
+    description: "Register THIS session's verification request with the run's verification desk, then wait for the batched verdict. The orchestrator answers every request of one batch in a SINGLE verification pass and never loads a lane per arrival, so a worker that finishes early waits for its peers by design. Call it ONCE per slice: a second call for the same objective returns the same request. params: objective (what must be judged), acceptance (the command that proves it and what it must print), checks [[cmd, expected]], task_id.",
+    parameters: Type.Object({
+      objective: Type.String({ description: "what must be judged, in one sentence" }),
+      acceptance: Type.Optional(Type.String({ description: "one command and what it must print" })),
+      checks: Type.Optional(Type.Array(Type.Any(), { description: '[["cmd","expected"]] rows the verifier must run; {"cmd","expected"} objects are accepted too' })),
+      task_id: Type.Optional(Type.String({ description: "the run task this slice belongs to, when one was named" }))
+    }),
+    // @ts-expect-error loadMode is accepted at runtime (essential = shipped in the catalog).
+    loadMode: "essential",
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const objective = String(params.objective ?? "").trim();
+      if (objective === "") throw new Error('fade_verify: "objective" is the thing to judge \u2014 name it in one sentence');
+      const dir = deskDirFor(ctx);
+      const state = await readJsonAsync(join7(dir, STATE_FILENAME));
+      const active = await readJsonAsync(join7(dir, ACTIVE_FILENAME));
+      const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
+      if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against \u2014 nothing was written`);
+      const rows = Array.isArray(params.checks) ? params.checks : [];
+      const agent = isWorkerSession(ctx) ? workerName(ctx) : "owner";
+      let captured;
+      const after = await mutateDesk(dir, runId, (d) => {
+        const enq = enqueueRequest(d, {
+          agent,
+          session: process.env.PI_SESSION_FILE ?? "",
+          ...typeof params.task_id === "string" && params.task_id.trim() !== "" ? { task_id: params.task_id.trim() } : {},
+          objective,
+          ...typeof params.acceptance === "string" && params.acceptance.trim() !== "" ? { acceptance: params.acceptance.trim() } : {},
+          checks: rows
+        });
+        captured = { request: enq.request, deduped: enq.deduped };
+        return enq.desk;
+      });
+      const request = captured?.request;
+      if (!request) throw new Error(`fade_verify: the desk at ${dir} did not accept the registration (concurrent writers exhausted the retry budget); nothing was queued`);
+      const ready = readyToAddress(after, Date.now());
+      const queue = `request ${request.id} of batch ${after.epoch + 1} \xB7 ${ready.open} registered, ${ready.expected > 0 ? `${ready.registered}/${ready.expected} of the launching task call` : "the launching task call named no count"}`;
+      if (agent === "owner") {
+        return {
+          content: [{ type: "text", text: `${queue}. Registered; NOT blocked here \u2014 this session dispatches the batch, so blocking it would stall the pass. The batch is answered at the turn boundary when it closes (${ready.reason}). Do not call fade_verify twice for this slice.` }],
+          details: { desk: { run_id: runId, id: request.id, batch: after.epoch + 1, deduped: captured?.deduped === true, ready: ready.ready, reason: ready.reason, owner: true } }
+        };
+      }
+      const wait = await awaitVerdict(dir, runId, request.id, { timeoutMs: DESK_WAIT_MS, signal });
+      if (wait.state === "answered") {
+        const v = wait.request?.verdict;
+        return {
+          content: [{ type: "text", text: `${request.id} ${v?.accepted === true ? "ACCEPTED" : "NEEDS REPAIR"} after ${Math.round(wait.waited_ms / 1e3)}s in the batched pass: ${v?.notes ?? "no notes posted"}` }],
+          details: { desk: { run_id: runId, id: request.id, batch: after.epoch + 1, state: "answered", accepted: v?.accepted === true, notes: v?.notes, polls: wait.polls, waited_ms: wait.waited_ms } }
+        };
+      }
+      throw new Error(`${queue} \xB7 ${wait.state}: ${wait.note}`);
+    }
+  });
+  pi.registerTool({
+    name: "fade_verdicts",
+    label: "fade verdicts",
+    description: 'Post the verdicts of ONE claimed verification batch, by id. Call ONCE per batch \u2014 the write unblocks every worker parked in fade_verify. batch is the batch number the briefing names; verdicts is [{"id","accepted","notes"}] with one row per id of that batch, and `notes` naming the command run and what it printed (or the cause to fix).',
+    parameters: Type.Object({
+      batch: Type.Number({ description: "the batch number from the briefing (the number after `batch`)" }),
+      verdicts: Type.Array(Type.Object({ id: Type.String({ description: "the request id, e.g. V2.1" }), accepted: Type.Boolean(), notes: Type.String({ description: "the command run and what it printed, or the cause to fix" }) }))
+    }),
+    // @ts-expect-error loadMode is accepted at runtime (essential = shipped in the catalog).
+    loadMode: "essential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const dir = deskDirFor(ctx);
+      const state = await readJsonAsync(join7(dir, STATE_FILENAME));
+      const active = await readJsonAsync(join7(dir, ACTIVE_FILENAME));
+      const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
+      if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
+      const label2 = Number(params.batch);
+      const epoch = label2 - 1;
+      const rows = Array.isArray(params.verdicts) ? params.verdicts : [];
+      if (rows.length === 0) throw new Error("fade_verdicts: verdicts[] is empty \u2014 a batch is answered by one row per id, never by silence");
+      const desk = await readDesk(dir, runId);
+      if (!desk) throw new Error(`fade_verdicts: no desk file at ${dir} yet \u2014 nothing has been claimed, so nothing can be answered`);
+      const claim = desk.addressed.find((a) => a.batch === epoch);
+      if (!claim) {
+        throw new Error(
+          `fade_verdicts: batch ${label2} was never claimed by the desk${desk.addressed.length > 0 ? ` (claimed: ${desk.addressed.map((a) => `batch ${a.batch + 1} [${a.ids.join(",")}]`).join(" \xB7 ")})` : " (nothing has been claimed)"}; batch ${desk.epoch + 1} is the OPEN one, still being COLLECTED, and answering it early is the double pass this gate exists to stop`
+        );
+      }
+      const want = new Set(claim.ids);
+      const strays = rows.map((r) => String(r.id)).filter((id) => !want.has(id));
+      if (strays.length > 0) throw new Error(`fade_verdicts: ${strays.join(", ")} ${strays.length === 1 ? "is" : "are"} not part of batch ${label2} (its ids: ${claim.ids.join(", ")}) \u2014 judge only your batch`);
+      const missing = claim.ids.filter((id) => !rows.some((r) => String(r.id) === id));
+      const verdicts = rows.map((r) => ({ id: String(r.id), accepted: r.accepted === true, notes: typeof r.notes === "string" ? r.notes : "no notes" }));
+      const res = await mutateDesk(dir, runId, (d) => attachVerdicts(d, verdicts).desk);
+      const accepted = verdicts.filter((v) => v.accepted).length;
+      return {
+        content: [{ type: "text", text: `batch ${label2} answered: ${accepted} accepted, ${verdicts.length - accepted} needs_repair; ${verdicts.length} worker${verdicts.length === 1 ? "" : "s"} unblocked${missing.length > 0 ? `; STILL UNANSWERED in this batch: ${missing.join(", ")} \u2014 an id you did not judge is a defect, not a pass` : ""}` }],
+        details: { desk: { run_id: runId, batch: label2, attached: res.requests.filter((r) => verdicts.some((v) => v.id === r.id)).length, missing, routed: claim.routed, churn: desk.churn } }
       };
     }
   });
@@ -2963,7 +3608,7 @@ ${SCHEMA_HINT}` : text);
     registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
   }
   pi.registerCommand("orchestrate", {
-    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
     handler: async (args, ctx) => {
       let raw = args.trim();
       const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
@@ -2988,28 +3633,30 @@ ${SCHEMA_HINT}` : text);
         const held = Number.isFinite(started) ? ` \xB7 held ${formatElapsed(Math.max(0, (Date.now() - started) / 1e3))}` : "";
         const cost = runDir ? summarizeSwaps(await readSwaps(runDir), run.run_id) : { count: 0, total_elapsed_s: 0 };
         const paid = cost.count > 0 ? `swaps ${cost.count} \xB7 ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
+        const d = runDir ? await readDesk(runDir, run.run_id) : void 0;
+        const deskPart = d ? ` \xB7 ${deskLine(d)}` : "";
         ctx.ui.notify(
-          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid} \xB7 ${statePath()}`,
+          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid}${deskPart} \xB7 ${statePath()}`,
           "info"
         );
         paint(ctx);
         return;
       }
       if (first === "runs") {
-        const dir = runDir ?? join6(ctx.cwd, "var", "omp-orchestrate");
+        const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
         const archived = await listRuns(dir);
         if (archived.length === 0) {
-          ctx.ui.notify(`orchestrate: no archived runs in ${join6(dir, RUNS_DIRNAME)}`, "info");
+          ctx.ui.notify(`orchestrate: no archived runs in ${join7(dir, RUNS_DIRNAME)}`, "info");
           return;
         }
         for (const r of archived.slice(0, 5)) {
           ctx.ui.notify(`run ${r.run_id}: ${r.state} \xB7 ${r.rounds} rounds \xB7 ${r.tasks_passed}/${r.tasks_total} tasks \xB7 ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
         }
-        if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join6(dir, RUNS_DIRNAME)}`, "info");
+        if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join7(dir, RUNS_DIRNAME)}`, "info");
         return;
       }
       if (first === "moe") {
-        const dir = runDir ?? join6(ctx.cwd, "var", "omp-orchestrate");
+        const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
         for (const c of classWarmth(await readSwaps(dir))) {
           ctx.ui.notify(`orchestrate: ${c.cls}: ${c.swaps} swaps \xB7 ${c.warm}/${c.swaps} warm \xB7 profile ${c.profile ?? "none named"}`, "info");
         }
@@ -3022,6 +3669,47 @@ ${SCHEMA_HINT}` : text);
           ctx.ui.notify(`orchestrate: ${r.label} \xB7 ${r.value}`, "info");
         }
         ctx.ui.notify(`orchestrate: ${versionLine(snap?.engine_version, await packageVersion(), await bundleHash())}`, "info");
+        return;
+      }
+      if (first === "desk") {
+        const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
+        const st = run ?? await readJsonAsync(join7(dir, STATE_FILENAME));
+        if (!st) {
+          ctx.ui.notify(`orchestrate: no run in ${dir}, so there is no desk`, "info");
+          return;
+        }
+        const d = await readDesk(dir, st.run_id);
+        if (!d) {
+          ctx.ui.notify(`orchestrate: no desk file at ${deskPath(dir)} \u2014 no worker has registered a verification request for ${st.run_id}`, "info");
+          return;
+        }
+        const ready = readyToAddress(d, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+        ctx.ui.notify(`orchestrate: ${deskLine(d)} \xB7 batch ${d.epoch + 1} open since ${d.open_utc}${d.sealed_utc ? ` \xB7 sealed ${d.sealed_utc}` : " \xB7 NOT sealed"} \xB7 ${ready.reason}`, "info");
+        for (const r of d.requests.slice(-8)) {
+          ctx.ui.notify(`  ${r.id} [batch ${r.batch + 1}] ${r.agent}${r.task_id ? `/${r.task_id}` : ""}: ${r.objective.slice(0, 70)} \u2192 ${r.verdict ? r.verdict.accepted ? "ACCEPTED" : "needs_repair" : r.claimed_batch !== void 0 ? "claimed, verdict owed" : "collecting"}`, "info");
+        }
+        for (const a of d.addressed.slice(-4)) ctx.ui.notify(`  batch ${a.batch + 1} addressed ${a.at} routed ${a.routed}: ${a.ids.join(", ")}`, "info");
+        if (d.churn) ctx.ui.notify(`orchestrate: CHURN ROUTE in force${d.churn_utc ? ` since ${d.churn_utc}` : ""} \u2014 batches go to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}; /orchestrate lanes reset hands them back to the lane`, "warning");
+        return;
+      }
+      if (first === "verifier") {
+        const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
+        const abs = join7(ctx.cwd, verifierAgentPath(ctx.cwd));
+        if (sub === "install") {
+          try {
+            mkdirSync2(join7(ctx.cwd, ".omp", "agents"), { recursive: true });
+            writeFileSync2(abs, verifierAgentMd());
+          } catch (e) {
+            ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
+            return;
+          }
+          const warn = isRouterModel(VERIFIER_MODEL) ? ` WARNING: ${VERIFIER_MODEL} is a ROUTER entry \u2014 a subagent on it pays the very swap this agent exists to avoid; point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1)` : "";
+          ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) \u2014 the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
+          return;
+        }
+        const installed = existsSync(abs);
+        ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} \xB7 model ${VERIFIER_MODEL} \xB7 ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
+        if (installed) ctx.ui.notify(`orchestrate: ${readFileSync3(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
         return;
       }
       if (first === "overlay") {
@@ -3050,6 +3738,13 @@ ${SCHEMA_HINT}` : text);
         pending = void 0;
         resetFlipLedger();
         flipBadge = void 0;
+        if (run?.run_id && runDir) {
+          const d = await readDesk(runDir, run.run_id);
+          if (d?.churn) {
+            await writeJsonAsync(deskPath(runDir), setChurn(d, false));
+            ctx.ui.notify(`orchestrate: churn route cleared \u2014 verification batches answer on the ${THINK_LANE} lane again`, "info");
+          }
+        }
         run.paused = false;
         run.operator_note = void 0;
         const wanted = owed?.lane ?? run.lane;
@@ -3091,7 +3786,7 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
         if (raw.includes("--clear")) {
           try {
-            unlinkSync2(join6(runDir, ACTIVE_FILENAME));
+            unlinkSync2(join7(runDir, ACTIVE_FILENAME));
           } catch {
           }
           run = void 0;
@@ -3151,9 +3846,9 @@ ${SCHEMA_HINT}` : text);
         return;
       }
       const previous = run;
-      runDir = join6(repo, "var", "omp-orchestrate");
+      runDir = join7(repo, "var", "omp-orchestrate");
       if (previous && TERMINAL[previous.state] === true) {
-        const archived = await archiveRun(join6(previous.repo || repo, "var", "omp-orchestrate"), previous);
+        const archived = await archiveRun(join7(previous.repo || repo, "var", "omp-orchestrate"), previous);
         if (archived) ctx.ui.notify(`orchestrate: the finished run ${previous.run_id} is archived at ${archived}`, "info");
       }
       run = {
@@ -3174,7 +3869,7 @@ ${SCHEMA_HINT}` : text);
         started_utc: (/* @__PURE__ */ new Date()).toISOString()
       };
       settledNotified = false;
-      await writeJsonAsync(join6(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+      await writeJsonAsync(join7(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
       await persist();
       const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
       if (!model) {
@@ -3205,11 +3900,11 @@ ${SCHEMA_HINT}` : text);
     }
     const chordNote = resolveChord();
     const repo = ctx.cwd;
-    const active = await readJsonAsync(join6(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
-    const state = await readJsonAsync(join6(repo, "var", "omp-orchestrate", STATE_FILENAME));
+    const active = await readJsonAsync(join7(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
+    const state = await readJsonAsync(join7(repo, "var", "omp-orchestrate", STATE_FILENAME));
     let runNote;
     if (active && state) {
-      runDir = join6(repo, "var", "omp-orchestrate");
+      runDir = join7(repo, "var", "omp-orchestrate");
       run = normalizeRun(state);
       settledNotified = false;
       paint(ctx);
@@ -3254,6 +3949,10 @@ ${SCHEMA_HINT}` : text);
       if (run.paused === true) {
         ctx.ui.notify(`orchestrate: paused at round ${run.round} \u2014 no nudge sent, no lane loaded; [p] resumes`, "info");
         void recordTurn("paused");
+        return;
+      }
+      if (await dispatchDeskBatch(ctx)) {
+        void recordTurn("verification_batch");
         return;
       }
       const tier = classifyTurnEnd(run, false);
@@ -3326,8 +4025,16 @@ ${SCHEMA_HINT}`);
     void recordTurn(turnPhase ?? next.phase);
     requestLane(next.lane, ctx);
   });
-  pi.on("tool_call", async (event) => {
-    if (!run || isDelegatedSession()) return void 0;
+  pi.on("tool_call", async (event, ctx) => {
+    if (!run || !runDir || isDelegatedSession()) return void 0;
+    if (event.toolName === "task") {
+      const batch = taskBatchOf(event.input);
+      if (batch.carriesVerification) {
+        await mutateDesk(runDir, run.run_id, (d) => noteTaskBatch(d, { count: batch.verifyAgents.length, agents: batch.verifyAgents }));
+        ctx.ui.notify(`orchestrate: task call carries ${batch.count} worker(s), ${batch.verifyAgents.length} with verification work \u2014 the desk batch closes at ${batch.verifyAgents.length} registration(s)`, "info");
+      }
+      return void 0;
+    }
     const live = await liveState();
     if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return void 0;
     const name = event.toolName ?? "";
@@ -3335,6 +4042,16 @@ ${SCHEMA_HINT}`);
     pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);
     await persist();
     return { block: true, reason: `fade_orchestrate: the verifier lane is read-only \u2014 ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
+  });
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName !== "task" || !run || !runDir || isDelegatedSession()) return void 0;
+    const desk = await readDesk(runDir, run.run_id);
+    if (!desk || openRequests(desk).length === 0) return void 0;
+    const sealed = sealBatch(desk);
+    await writeJsonAsync(deskPath(runDir), sealed);
+    const ready = readyToAddress(sealed, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+    ctx.ui.notify(`orchestrate: task call settled \u2014 desk batch ${sealed.epoch + 1} sealed with ${openRequests(sealed).length} request(s): ${ready.reason}`, "info");
+    return void 0;
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     clearSurface(ctx);

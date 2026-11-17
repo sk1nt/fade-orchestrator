@@ -33,6 +33,8 @@ export function buildTestBundle() {
     "src/livedata.ts",
     "src/history.ts",
     "src/core.ts",
+    "src/desk.ts",
+    "src/subagent.ts",
     "src/moe.ts",
     "src/taskmoe.ts",
     "src/ui.ts",

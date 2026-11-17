@@ -178,7 +178,11 @@ because tmux's `screen` terminal has no Kitty protocol and cannot produce it una
 exactly why the rig passed with ESC dead.
 
 A delegated session (a subagent's own session file) binds **no extra** listener: one listener per
-process, proved by `test/gate_rig.mjs` and `test/rpc_rig.mjs`.
+process, proved by `test/gate_rig.mjs` and `test/rpc_rig.mjs`. A delegated session is not inert: it
+is a desk client. It calls `fade_verify`, which files a request in `<run>/verify/desk.json` and
+blocks until a verdict is written by id — it never switches a lane, never pays a `POST /v1/load`,
+and never renders a screen. [`docs/DELEGATION.md`](DELEGATION.md) is the authority for the desk and
+for the churn route that answers a batch on a **non-router** model.
 
 ## The screen
 

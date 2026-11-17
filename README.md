@@ -164,6 +164,9 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_SWITCH_GLYPH` | U+F051F | the icon on the model-switch row, in the same Nerd Font private-use family as the status glyph; an empty value removes it and its space (`test/ui_status.test.mjs`) |
 | `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so the keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call, and a lane load drops the cache. Measured on this box (1103 processes): one walk 2-4 ms, so the TTL is what keeps that out of the panel's refresh path |
 | `FADE_ORCHESTRATE_LEDGER_MAX_BYTES` | `8388608` | the turn ledger's size cap: past it, `metrics.jsonl` rotates to `metrics.jsonl.1` (the older `.1` is replaced) and the append starts a fresh file. `0` disables rotation; `readTurns` reads the current file only, so the rotated-out tail is a postmortem file (`node --test test/history.test.mjs`) |
+| `FADE_ORCHESTRATE_VERIFY_SETTLE_S` | `8` | the desk's batch window: a batch closes when every censused worker has registered; if some launch and never register (they died, or they verify inline), the batch closes after this many seconds, so the queue never sits on a worker that is never coming |
+| `FADE_ORCHESTRATE_VERIFIER_MODEL` | `ninfer-local/coder-gpu1` | the churn route's model. It **must not** resolve to the router: a router entry is a lane load behind the guard, which is the cost the route exists to pay zero of. On this box `@gpu1`, `@slow`, `@task` and `@judge` all resolve to the router entry, so a bare alias is a refusal, not a preference |
+| `FADE_ORCHESTRATE_VERIFIER_AGENT` | `fade-verifier` | the verification subagent's name: the `task` call's `agent`, and the file `/orchestrate verifier install` writes at `.omp/agents/<name>.md` |
 
 ## Surface and commands
 
@@ -200,6 +203,42 @@ archive already on the shelf is never rewritten); `/orchestrate runs` reads the 
 `metrics.jsonl` is append-only, so past `FADE_ORCHESTRATE_LEDGER_MAX_BYTES` it rotates to
 `metrics.jsonl.1`, one predecessor kept — the screen reads the current file, so a rotated-out tail is
 a postmortem file, not a panel row.
+
+## Subagents and the verification desk
+
+A delegated worker verifies **its own** acceptance and **never switches a lane** — lane control is the
+owner run's. It calls `fade_verify` with its objective, acceptance line and commands; the plugin
+files that as a request (`V<batch>.<n>`) in `<run>/verify/desk.json` and **blocks the worker** until
+a verdict is written against its id.
+
+**The batch, not the arrival, is answered.** A `task` call is censused when it launches and sealed
+when it returns: `expected` is the number of workers in flight that **carry verification work** (a
+plain worker opens no batch), and the batch closes when every one of them has registered. While a
+batch is open, a request pays **zero** `POST /v1/load` — one worker registering while its peers have
+not is a queue position, not a lane. A closed batch is claimed **once**, and N requests in it are
+answered by **one** lane load: the verifier's briefing is a single page carrying every request's
+objective, acceptance, checks and files, and the round answers with
+`verdicts: [{id, accepted, notes}]` covering every id. A verdict for an id outside the claimed
+batch, a batch the desk never claimed, and a partial id set are each refused by name; a claimed
+batch is never claimed again, so a request that arrives mid-pass lands in the **next** batch and is
+told which one.
+
+**Churn is a route, not a retry.** When the churn has begun — the thrash breaker halted the loop, or
+the flip guard was reached — the desk is marked and every batch answers on the **verification
+subagent** at **zero lane loads**: `task { "agent": "fade-verifier" }` on a **non-router** model
+(`ninfer-local/coder-gpu1`, the NInfer coding server on `:8002`, a separate process from the router;
+NInfer's own `/v1/load` is a cold pack load, so paying it is the thing to avoid). The route is
+recorded on the desk batch and in the run's rejection history, holds for every later batch of the
+run, and is released by `/orchestrate lanes reset`.
+
+- `/orchestrate desk` — the queue: batch epoch, open / awaiting-verdict / answered counts, churn state, verifier model.
+- `/orchestrate verifier install` — write `.omp/agents/fade-verifier.md`, the definition the `task` tool resolves; `verifier show` prints it and says whether it is installed.
+- `fade_verdicts {batch, verdicts}` — the desk write for a verifier that runs **outside** the phase protocol (the subagent): post the verdicts by id, fan them out, unblock the workers.
+
+A prose answer never unblocks a worker: only a verdict written to the desk does. A worker that
+cannot reach the desk **refuses** — it never answers optimistically on the router's state.
+
+The desk's schema, closure rules and measured invariants: [`docs/DELEGATION.md`](docs/DELEGATION.md).
 
 ## MoE expert placement (last known placement between turns)
 
@@ -278,12 +317,14 @@ Ways to load it:
 npm test                 # unit tests: keymap, state v2, gate (off the event loop, and its
                         # total budget kills a hung row), MoE, history, livedata, the screen's
                         # renderer (every ESC encoding closes), the screen's data contract, the
-                        # status line
+                        # status line, the desk's batch rules, the verifier's routing
 npm run test:gate        # the gate rig — a host-less CI gate (fake pi + stub router): the whole
                          # phase protocol, the pre-swap gate (zero loads on red, the row named as
                          # it runs), the Alt+F raw listener, the login line that names only the
                          # run, the fast path, the
-                         # --demo-redact surface, the top-widget surface
+                         # --demo-redact surface, the top-widget surface, the verification desk
+                         # (zero loads while a batch is open, ONE load per closed batch, verdicts
+                         # by id), and the churn route to a non-router model at zero loads
 node test/load_hostile.mjs # the pre-unload gate against a hostile /health (error state,
                          # zero/low VRAM, no model, swap in flight, unreachable): ZERO
                          # POST /v1/load with the class named
@@ -330,8 +371,10 @@ identity (`--no-session`).
 ```
 src/index.ts      extension wiring: tool, commands, hooks, lane switching, the panel's raw-key listener
 src/core.ts       state machine data half: schema v2, validation, briefings (per-task critique,
-                  compact repair), the gate runner, the task window
+                  compact repair, the ONE verification-batch page), the gate runner, the task window
 src/router.ts     basalt router client: listLanes/laneHealth/loadLane + the pre-unload gate
+src/desk.ts       the verification desk: batched worker requests, claims, verdicts, churn state
+src/subagent.ts   the churn route: the off-router verifier, its task call, its agent definition
 src/ui.ts         the status line, the model label, the ramp, the redactor
 src/panel.ts      the Alt+F screen: layout, scroll, keys (every ESC encoding), both surfaces
 src/screendata.ts the screen's data contract: every row, and the name of every missing number
@@ -343,6 +386,7 @@ test/             unit tests, the gate rig (fake host), the RPC rig, the pty rig
 docs/OVERLAY.md   the surface: layout, metrics, keys, redaction, proof inventory
 docs/quant-choice.md the IQ1_M pin: the measurement, the method, the reproduce commands
 docs/FEATURES.md  the feature sweep: each proposal, the code that shows the gap, its cost, the command that accepts it
+docs/DELEGATION.md the verification desk: schema, closure rules, the churn route, the invariants
 ```
 
 ## License
