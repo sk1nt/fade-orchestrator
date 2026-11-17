@@ -2058,6 +2058,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// registered yet. A call that carries no verification work is not counted at all — nothing
 		// will register for it, and an `expected` it set would keep a batch open to the deadline.
 		if (!run || !runDir || isDelegatedSession()) return undefined;
+		// The desk is claimed at ANY owner tool call, not only at a turn boundary. Measured live: the
+		// owner delegated two verifying workers, they blocked in `fade_verify` waiting for the verdict
+		// the owner must answer, the owner blocked in `wait` on them, and `agent_end` therefore NEVER
+		// arrived — the batch sat `registered == expected` with an empty `addressed`: the loop's own
+		// verification deadlocked. `dispatchDeskBatch` is its own throttle: no run, no desk, no LIVE
+		// request (a claimed batch is not live) or an OPEN batch all return with zero lane load, so a
+		// check per tool call is one small file read. No closure flag: a flag set by a batch that is
+		// never answered (halted, paused) would mute this for the rest of the session.
+		if (await dispatchDeskBatch(ctx)) return undefined;
 		if (event.toolName === "task") {
 			const batch = taskBatchOf(event.input);
 			if (batch.carriesVerification) {

@@ -41,6 +41,10 @@
 //      batch pays EXACTLY ONE load for the WHOLE batch; a request arriving during a pass lands in
 //      the NEXT batch; verdicts fan out BY ID and the claimed batch closes; answering an unclaimed
 //      batch, a foreign id, or a partial id set is refused by name.
+//      A READY batch is claimed at an OWNER TOOL CALL, not only at a turn boundary: an owner that
+//      delegated verifying workers is blocked in `wait` on sessions blocked on its verdict, so no
+//      `agent_end` ever comes (the deadlock is measured in a live run); a later boundary pays
+//      nothing for a batch already claimed.
 //  22. THE CHURN ROUTE: with churn declared a closed batch pays ZERO loads, is claimed once and
 //      routed to the verification SUBAGENT on a NON-ROUTER model; the loop is handed the exact
 //      `task` call as a command; the route stays for every later batch; `/orchestrate lanes reset`
@@ -1240,10 +1244,20 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the registration names its queue position and why the batch is open", /request V1.1 of batch 1/.test(w1.content[0].text) && /1\/2 of the launching task call/.test(w1.content[0].text), w1.content[0].text.slice(0, 220));
   ok("the queue is announced once, with its reason, and the reason is NOT a swap", notes.filter((n) => n.includes("verification desk holds")).length === 1 && notes.some((n) => n.includes("no lane is loaded until the batch closes")), JSON.stringify(notes.filter((n) => n.includes("desk"))));
   // Worker two registers: the census is complete, so ONE pass answers BOTH.
+  const l21ready = loads();
   await tools.fade_verify.execute("w2", { objective: "T2: the acceptance line", checks: [["bash -lc 'echo ok'", "exit 0"]] }, null, null, ctx);
-  await hooks.agent_end({}, ctx);
-  const landed21 = await settleLoads(base21, 1);
+  // THE DEADLOCK PATH, measured live: the owner DELEGATED these workers, so it is blocked in `wait`
+  // on sessions that are blocked on its verdict — there is NO `agent_end` boundary to claim a ready
+  // batch. An owner tool call must claim it, or the loop deadlocks on its own verification.
+  await hooks.tool_call({ toolName: "wait", input: { jobs: [] } }, ctx);
+  const landed21 = await settleLoads(l21ready, 1);
   await new Promise((r) => setTimeout(r, 200));
+  ok("a READY batch is claimed at an owner `wait` call, where no `agent_end` will ever come", loads() - l21ready === 1, `extra=${loads() - l21ready}`);
+  // The turn boundary may arrive later; it must NEVER pay a second load for the claimed batch.
+  const l21after = loads();
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 150));
+  ok("the turn boundary claims an already-claimed batch NEVER: zero extra load", loads() === l21after, `extra=${loads() - l21after}`);
   const s21 = readState();
   const desk21 = readDeskFile();
   ok("a closed batch pays EXACTLY ONE POST /v1/load for the WHOLE batch", landed21 === 1, `extra=${landed21}`);

@@ -4066,6 +4066,7 @@ ${SCHEMA_HINT}`);
   });
   pi.on("tool_call", async (event, ctx) => {
     if (!run || !runDir || isDelegatedSession()) return void 0;
+    if (await dispatchDeskBatch(ctx)) return void 0;
     if (event.toolName === "task") {
       const batch = taskBatchOf(event.input);
       if (batch.carriesVerification) {

@@ -71,6 +71,11 @@ thing in this system is a lane load, not a prompt.
 4. **Claim, once.** A ready batch is claimed atomically, records its ids and route in `addressed`,
    and advances `epoch`. Nothing in a claimed batch is ever answered twice; a request that arrives
    mid-pass lands in the next epoch and its worker is told the batch number.
+   The claim fires at the owner's turn boundary **and at any owner tool call**: an owner that
+   delegated the workers is blocked in `wait` on sessions that are blocked on its verdict, so no
+   turn boundary exists — measured live, the batch sat `registered == expected` with `addressed: []`
+   forever. The dispatch self-throttles: an open batch, an empty desk or a claimed batch costs zero
+   lane loads, so checking per tool call is cheap.
 5. **Answer once.** Route `swap`: **one** `POST /v1/load` for the whole batch, and the verifier's
    briefing is one page (`## VERIFICATION — ONE BATCH, batch N of run <id>`) carrying every
    request's objective, acceptance, checks and files. The round ends with
@@ -149,4 +154,4 @@ its model resolves to the router.
 | `node test/gate_rig.mjs` (block 21) | one worker registering pays **zero** loads while its peer is unregistered; a closed batch pays **exactly one** load for both requests; the briefing carries both check commands; a mid-pass arrival is batch 2; verdicts fan out by id; the three gates refuse by name |
 | `node test/gate_rig.mjs` (block 19b) | the thrash breaker **marks the desk** and routes the batch it halts, at zero loads |
 | `node test/gate_rig.mjs` (block 22) | under churn: zero loads, one claim routed `subagent`, the directive carries the off-router model and every worker's check command, the route **stays** for the next batch, `lanes reset` releases it |
-| live `/orchestrate` run over `omp --mode rpc` | the census counted 2 verification workers, `scout` registered `V1.1` and the default `task` agent `V1.2`, the read-only `reviewer` registered NOTHING, and the desk held the batch open with zero lane loads |
+| live `/orchestrate` run over `omp --mode rpc` | run 1: `scout` registered `V1.1`, the default `task` agent `V1.2`, the read-only `reviewer` registered NOTHING (the gap `fade-worker` closes); run 2: both `fade-worker` workers registered (`registered == expected`) and the ready batch sat unclaimed while the owner blocked in `wait` — the deadlock the tool-call claim closes |
