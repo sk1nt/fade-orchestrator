@@ -1,7 +1,7 @@
 // src/index.ts
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync4, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { basename, dirname, join as join7 } from "node:path";
 import { readFile as readFile2, stat as stat3 } from "node:fs/promises";
 import { Type } from "typebox";
@@ -671,6 +671,7 @@ async function handover(run) {
     `Task state: ${JSON.stringify(run.tasks.map((t) => ({ id: t.id, status: t.status ?? "pending", result: t.result ?? "" })))}`,
     ...run.repair_tasks.length > 0 ? [`In repair: ${JSON.stringify(run.repair_tasks.map((t) => ({ id: t.id, objective: t.objective, acceptance: t.acceptance })))}`] : [],
     ...run.gate_last && run.gate_last.passed === false ? [`Last pre-swap gate FAILED: ${JSON.stringify(run.gate_last.results.filter((r) => !r.ok).map((r) => ({ cmd: r.cmd, tail: r.tail })))}`] : [],
+    ...run.gate_last?.triage ? [`Gate triage (ADVISORY, no authority \u2014 the gate's exit codes are the verdict; name the cause you actually confirm): ${run.gate_last.triage}`] : [],
     ...run.rejection_history.length > 0 ? [
       `Rejections so far (do not repeat): ${JSON.stringify(
         run.rejection_history.slice(-5).map((r) => ({ round: r.round, kind: r.kind, task: r.task_id, reason: r.reason }))
@@ -1340,6 +1341,9 @@ function deskCensus(desk) {
     churn: desk.churn
   };
 }
+function owedRequests(desk) {
+  return desk.requests.filter((r) => r.claimed_batch !== void 0 && r.verdict === void 0);
+}
 function deskLine(desk) {
   const c = deskCensus(desk);
   return `desk batch ${desk.epoch + 1}: ${c.open} open, ${c.owed} awaiting verdict, ${c.answered} answered, ${c.batches} addressed${desk.churn ? " \xB7 CHURN ROUTE (subagent verification)" : ""}`;
@@ -1389,6 +1393,357 @@ async function awaitVerdict(dir, runId, id, opts = {}) {
     }
     await sleep(pollMs);
   }
+}
+
+// src/lane.ts
+import { execFile as execFile2 } from "node:child_process";
+import { readFileSync as readFileSync2 } from "node:fs";
+import { promisify as promisify2 } from "node:util";
+var execFileAsync2 = promisify2(execFile2);
+var PROBE_TIMEOUT_MS = Number(process.env.FADE_ORCHESTRATE_LANE_PROBE_TIMEOUT_MS ?? 8e3);
+var PROBE_CACHE_MS = Number(process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS ?? 15e3);
+var strip = (v) => {
+  const t = v.trim();
+  if (t.startsWith('"') && t.endsWith('"') && t.length > 1) return t.slice(1, -1).replace(/\\"/g, '"');
+  if (t.startsWith("'") && t.endsWith("'") && t.length > 1) return t.slice(1, -1);
+  return t;
+};
+var unquoteKey = (k) => k.replace(/^["']|["']$/g, "");
+function parseProviderBlocks(yml) {
+  const lines = yml.split("\n");
+  const start = lines.findIndex((l) => /^providers:\s*$/.test(l));
+  if (start < 0) return [];
+  const blocks = [];
+  let current;
+  let entryIndent = -1;
+  let sub;
+  for (let i = start + 1; i < lines.length; i++) {
+    const raw = lines[i];
+    if (/^\s*#/.test(raw) || raw.trim() === "") continue;
+    const indent = raw.length - raw.trimStart().length;
+    if (indent === 0) break;
+    const body = raw.trim();
+    const dash = /^-\s*([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
+    const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
+    const bare = /^-\s*(.+)$/.exec(body);
+    const key = dash ? dash[1] : kv ? kv[1] : "";
+    const value = strip(dash ? dash[2] ?? "" : kv ? kv[2] ?? "" : bare ? bare[1] : "");
+    const opensProvider = kv && value === "" && key !== "models" && key !== "headers" && key !== "compat" && (entryIndent < 0 || indent <= entryIndent) || dash && key === "id" && value !== "" && (entryIndent < 0 || indent <= entryIndent);
+    if (opensProvider) {
+      entryIndent = indent;
+      current = { id: unquoteKey(dash ? value : key), api: "openai-completions", headers: {}, models: [] };
+      blocks.push(current);
+      sub = void 0;
+      continue;
+    }
+    if (!current) continue;
+    if (sub && indent > sub.indent) {
+      if (sub.name === "models") {
+        if (bare) {
+          const id = unquoteKey(strip(/^-\s*(?:id:\s*)?(.+)$/.exec(body)?.[1] ?? ""));
+          if (id && id !== "[]") current.models.push(id);
+        }
+      } else {
+        const hk = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(body.replace(/^-\s*/, ""));
+        if (hk) current.headers[unquoteKey(hk[1])] = strip(hk[2] ?? "");
+      }
+      continue;
+    }
+    if (!kv) continue;
+    sub = void 0;
+    if (value === "") {
+      const next = lines.slice(i + 1).find((l) => l.trim() !== "" && !/^\s*#/.test(l));
+      const nextIndent = next ? next.length - next.trimStart().length : -1;
+      if (nextIndent > indent && (key === "models" || key === "headers")) sub = { name: key, indent };
+      continue;
+    }
+    if (key === "baseUrl") current.baseUrl = value;
+    else if (key === "api") current.api = value;
+    else if (key === "apiKey") current.apiKey = value;
+    else if (key === "authHeader") current.authHeader = value === "true";
+  }
+  return blocks;
+}
+function splitSpec(spec) {
+  const i = spec.indexOf("/");
+  return i < 0 ? { provider: "", model: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
+}
+function resolveLaneSpec(spec, yml, env) {
+  const { provider, model } = splitSpec(spec);
+  const fromEnv = env.FADE_ORCHESTRATE_VERIFIER_BASE_URL?.trim();
+  if (fromEnv) {
+    return {
+      spec: {
+        spec,
+        provider,
+        model,
+        baseUrl: fromEnv.replace(/\/$/, ""),
+        api: env.FADE_ORCHESTRATE_VERIFIER_API?.trim() || "openai-completions",
+        apiKey: env.FADE_ORCHESTRATE_VERIFIER_API_KEY?.trim() || void 0,
+        authHeader: true,
+        headers: {},
+        source: "env"
+      }
+    };
+  }
+  if (!yml) return { error: `${spec}: no baseUrl and no ~/.omp/agent/models.yml, so the verifier lane cannot be resolved, let alone proved live (set FADE_ORCHESTRATE_VERIFIER_BASE_URL to a real server)` };
+  const want = provider || void 0;
+  const blocks = parseProviderBlocks(yml);
+  const block = blocks.find((b) => want ? b.id === want : b.models.includes(model));
+  if (!block) return { error: `${spec}: provider ${want ?? "(any)"} is not in models.yml` };
+  if (!block.baseUrl) return { error: `${spec}: provider ${block.id} declares no baseUrl` };
+  if (block.models.length > 0 && !block.models.includes(model)) {
+    return { error: `${spec}: provider ${block.id} advertises ${block.models.slice(0, 6).join(", ")}${block.models.length > 6 ? ", \u2026" : ""}, not ${model}` };
+  }
+  const key = block.apiKey ?? "";
+  const isCmd = key.startsWith("!");
+  return {
+    spec: {
+      spec,
+      provider: block.id,
+      model,
+      baseUrl: block.baseUrl.replace(/\/$/, ""),
+      api: block.api ?? "openai-completions",
+      apiKey: isCmd ? void 0 : key || void 0,
+      apiKeyCommand: isCmd ? key.slice(1).trim() : void 0,
+      authHeader: block.authHeader === true,
+      headers: block.headers,
+      source: "models.yml"
+    }
+  };
+}
+function substituteEnv(value, env) {
+  let missing = false;
+  const out = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, a, b) => {
+    const v = env[a ?? b];
+    if (v === void 0 || v === "") missing = true;
+    return v ?? "";
+  });
+  return missing ? void 0 : out;
+}
+function fieldOf(payload, key) {
+  return key in payload ? Reflect.get(payload, key) : void 0;
+}
+function advertisedIds(payload) {
+  if (!payload || typeof payload !== "object") return [];
+  const data = fieldOf(payload, "data");
+  if (!Array.isArray(data)) return [];
+  const ids = [];
+  for (const m of data) {
+    if (!m || typeof m !== "object") continue;
+    const id = fieldOf(m, "id") ?? fieldOf(m, "model");
+    if (typeof id === "string" && id !== "") ids.push(id);
+  }
+  return ids;
+}
+function answered(status, payload) {
+  if (status !== 200 || !payload || typeof payload !== "object") return false;
+  for (const key of ["choices", "content", "output"]) {
+    const v = fieldOf(payload, key);
+    if (v !== void 0) return Array.isArray(v) && v.length > 0;
+  }
+  return true;
+}
+var completionRequest = (api, model) => api === "anthropic-messages" ? { path: "/messages", body: { model, max_tokens: 1, messages: [{ role: "user", content: "ping" }] } } : { path: "/chat/completions", body: { model, max_tokens: 1, temperature: 0, stream: false, messages: [{ role: "user", content: "ping" }] } };
+async function runKeyCommand(command, runShell, timeoutMs) {
+  const shell = runShell ?? (async (cmd, ms) => {
+    const r = await execFileAsync2("/bin/bash", ["-lc", cmd], { timeout: ms, maxBuffer: 1 << 20, encoding: "utf8" });
+    return { code: 0, out: r.stdout };
+  });
+  try {
+    const r = await shell(command, timeoutMs);
+    const key = r.out.trim();
+    if (r.code !== 0) return { detail: `the lane's key command exited ${r.code}` };
+    if (!key) return { detail: "the lane's key command printed no key" };
+    return { key, detail: "key ok" };
+  } catch (e) {
+    return { detail: `the lane's key command failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+async function probeLane(spec, deps = {}) {
+  const env = deps.env ?? process.env;
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const now = deps.now ?? Date.now;
+  const t0 = now();
+  const timeoutMs = PROBE_TIMEOUT_MS;
+  let note = "";
+  const fail = (detail) => ({ ok: false, detail: `${detail}${note}`, at: t0, ms: now() - t0 });
+  const headers = { "content-type": "application/json" };
+  if (spec.apiKeyCommand) {
+    const k = await runKeyCommand(spec.apiKeyCommand, deps.runShell, timeoutMs);
+    if (!k.key) return fail(k.detail);
+    if (spec.authHeader) headers.authorization = `Bearer ${k.key}`;
+    else headers["x-api-key"] = k.key;
+  } else if (spec.apiKey) {
+    if (spec.authHeader) headers.authorization = `Bearer ${spec.apiKey}`;
+    else headers["x-api-key"] = spec.apiKey;
+  }
+  const dropped = [];
+  for (const [name, decl] of Object.entries(spec.headers)) {
+    const v = substituteEnv(decl, env);
+    if (v === void 0) dropped.push(`${name}: ${decl}`);
+    else headers[name] = v;
+  }
+  if (dropped.length > 0) note = `; sent without ${dropped.join(", ")}`;
+  try {
+    const r = await fetchImpl(`${spec.baseUrl}/models`, { method: "GET", headers, signal: AbortSignal.timeout(timeoutMs) });
+    if (r.ok) {
+      const ids = advertisedIds(await r.json().catch(() => null));
+      if (ids.length > 0 && !ids.includes(spec.model)) return fail(`${spec.baseUrl}/models advertises ${ids.slice(0, 6).join(", ")} \u2014 not ${spec.model}`);
+    }
+  } catch {
+  }
+  const { path, body } = completionRequest(spec.api, spec.model);
+  let res;
+  try {
+    res = await fetchImpl(`${spec.baseUrl}${path}`, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    return fail(`${spec.baseUrl}${path} refused: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    const shown2 = payload !== null ? JSON.stringify(payload).slice(0, 160) : await res.text().then((t) => t.slice(0, 160)).catch(() => "");
+    return fail(`${spec.baseUrl}${path} \u2192 http ${res.status} for model ${spec.model}: ${shown2}`);
+  }
+  if (!answered(res.status, payload)) return fail(`${spec.baseUrl}${path} \u2192 http 200 with no completion for model ${spec.model}`);
+  return { ok: true, detail: `${spec.baseUrl}${path} answered model ${spec.model}${note}`, at: t0, ms: now() - t0 };
+}
+var cache = /* @__PURE__ */ new Map();
+function readModelsYml(env = process.env) {
+  const home = env.HOME;
+  if (!home) return null;
+  try {
+    return readFileSync2(`${home}/.omp/agent/models.yml`, "utf8");
+  } catch {
+    return null;
+  }
+}
+async function probeVerifierLane(deps = {}) {
+  const env = deps.env ?? process.env;
+  const model = env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
+  const now = deps.now ?? Date.now;
+  const ttl = Number(env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS ?? PROBE_CACHE_MS);
+  if (ttl <= 0) return { ok: true, skipped: true, detail: "probing disabled (FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS=0)", at: now(), ms: 0 };
+  const hit = cache.get(model);
+  if (hit && now() - hit.at < ttl) return hit;
+  if (isRouterModel(model)) return { ok: false, detail: `${model} is a ROUTER entry: probing it pays the very swap the subagent route exists to avoid, so the zero-swap route is refused`, at: now(), ms: 0 };
+  const resolved = resolveLaneSpec(model, deps.yml !== void 0 ? deps.yml : readModelsYml(env), env);
+  if ("error" in resolved) {
+    const miss = { ok: false, detail: resolved.error, at: now(), ms: 0 };
+    cache.set(model, miss);
+    return miss;
+  }
+  const r = await probeLane(resolved.spec, { ...deps, env });
+  cache.set(model, r);
+  return r;
+}
+function probeLabel(r) {
+  const age = Math.round((Date.now() - r.at) / 1e3 * 10) / 10;
+  return r.skipped ? r.detail : `${r.detail} (${Math.round(r.ms)}ms, read ${age}s ago)`;
+}
+
+// src/triage.ts
+import { spawn } from "node:child_process";
+var TRIAGE_BIN = process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN ?? "grok";
+var TRIAGE_TIMEOUT_MS = Number(process.env.FADE_ORCHESTRATE_GATE_TRIAGE_TIMEOUT_MS ?? 45e3);
+var triageEnabled = (env = process.env) => env.FADE_ORCHESTRATE_GATE_TRIAGE !== "0";
+var TAIL_CHARS = 900;
+function triagePrompt(failing) {
+  const rows = failing.map((r, i) => {
+    const want = r.want && r.want !== "exit0" ? ` (declared: ${r.want})` : "";
+    const tail = (r.tail ?? "").slice(0, TAIL_CHARS);
+    return `${i + 1}. cmd: ${r.cmd}
+   expected: ${r.expected}${want}
+   tail:
+${tail}`;
+  });
+  return [
+    `A pre-swap verification gate is RED. These are its failing rows \u2014 the command, the plan's expectation, and the captured tail. Nothing here is invented and you have no tools: answer from this text alone.`,
+    ``,
+    rows.join("\n\n"),
+    ``,
+    `Answer in AT MOST two sentences, plain text, no markdown, no plan, no code block:`,
+    `- the single most probable ROOT CAUSE, named concretely (the file/symbol/flag/config the tail points at), and`,
+    `- the ONE command the coder should run first to confirm it.`,
+    `If the tails do not identify a cause, say exactly: "cause not determinable from the tails". Do not guess.`
+  ].join("\n");
+}
+function decodeAnswer(out) {
+  const s = out.trim();
+  if (s === "") return { why: "the CLI printed nothing" };
+  let env;
+  try {
+    env = JSON.parse(s);
+  } catch {
+    const i = s.indexOf("{");
+    if (i < 0) return { why: "the CLI did not answer JSON" };
+    try {
+      env = JSON.parse(s.slice(i));
+    } catch {
+      return { why: "the CLI did not answer JSON" };
+    }
+  }
+  if (!env || typeof env !== "object") return { why: "the CLI did not answer JSON" };
+  const stop = "stopReason" in env ? Reflect.get(env, "stopReason") : void 0;
+  const text = "text" in env ? Reflect.get(env, "text") : void 0;
+  if (typeof stop === "string" && stop !== "end_turn") return { stopReason: stop, why: `the CLI turn ended with stopReason ${stop}` };
+  if (typeof text !== "string" || text.trim() === "") return { stopReason: typeof stop === "string" ? stop : void 0, why: "the CLI's answer carried no text" };
+  return { text: text.trim().replace(/\s+/g, " ").slice(0, 400) };
+}
+async function defaultRunCli(args, cwd, timeoutMs) {
+  const { promise, resolve: resolve2, reject } = Promise.withResolvers();
+  const child = spawn(args[0], args.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+  let out = "";
+  const kill = setTimeout(() => {
+    child.kill("SIGKILL");
+    reject(new Error(`the triage call exceeded its ${Math.round(timeoutMs / 1e3)} s cap`));
+  }, timeoutMs);
+  child.stdout.on("data", (b) => out += String(b));
+  child.stderr.on("data", () => void 0);
+  child.on("error", (e) => {
+    clearTimeout(kill);
+    reject(e);
+  });
+  child.on("close", (code) => {
+    clearTimeout(kill);
+    resolve2({ code: code ?? 1, out });
+  });
+  return promise;
+}
+async function gateTriage(failing, repo, deps = {}) {
+  const env = deps.env ?? process.env;
+  const now = deps.now ?? Date.now;
+  const t0 = now();
+  const timeoutMs = Number(env.FADE_ORCHESTRATE_GATE_TRIAGE_TIMEOUT_MS ?? TRIAGE_TIMEOUT_MS);
+  const bin = env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN ?? TRIAGE_BIN;
+  if (!triageEnabled(env)) return { note: "", ms: 0, skipped: true, why: "triage disabled (FADE_ORCHESTRATE_GATE_TRIAGE=0)" };
+  if (failing.length === 0) return { note: "", ms: now() - t0, why: "no failing rows" };
+  const args = [
+    "-p",
+    triagePrompt(failing),
+    "--cwd",
+    repo,
+    "--output-format",
+    "json",
+    "--max-turns",
+    "1",
+    "--no-subagents",
+    "--disable-web-search",
+    "--disallowed-tools",
+    "*"
+  ];
+  try {
+    const r = await (deps.runCli ?? defaultRunCli)([bin, ...args], repo, timeoutMs);
+    const d = decodeAnswer(r.out);
+    if (!d.text) return { note: "", ms: now() - t0, why: d.why ?? `the CLI exited ${r.code} with no answer` };
+    return { note: d.text, ms: now() - t0 };
+  } catch (e) {
+    return { note: "", ms: now() - t0, why: e instanceof Error ? e.message : String(e) };
+  }
+}
+function triageLine(r) {
+  if (r.note === "") return "";
+  return `probable cause (advisory, ${Math.round(r.ms / 100) / 10}s, no authority \u2014 the gate's exit codes decide): ${r.note}`;
 }
 
 // src/ui.ts
@@ -1850,13 +2205,13 @@ async function persistMetrics(dir, snap) {
 }
 
 // src/moe.ts
-import { closeSync as closeSync2, openSync as openSync2, readdirSync, readFileSync as readFileSync2, readSync, statSync } from "node:fs";
+import { closeSync as closeSync2, openSync as openSync2, readdirSync, readFileSync as readFileSync3, readSync, statSync } from "node:fs";
 import { join as join5, resolve } from "node:path";
 var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
 function readServeConfig(path) {
   if (!path) return void 0;
   try {
-    const raw = JSON.parse(readFileSync2(path, "utf8"));
+    const raw = JSON.parse(readFileSync3(path, "utf8"));
     const models = {};
     for (const m of raw.models ?? []) {
       const alias = String(m.alias ?? m.model ?? "");
@@ -1873,7 +2228,7 @@ function engineProof() {
     for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
       let cmd;
       try {
-        cmd = readFileSync2(join5("/proc", pid, "cmdline"), "utf8");
+        cmd = readFileSync3(join5("/proc", pid, "cmdline"), "utf8");
       } catch {
         continue;
       }
@@ -1907,10 +2262,10 @@ function engineProofInvalidate() {
 }
 function processStartEpoch(pid) {
   try {
-    const stat4 = readFileSync2(`/proc/${pid}/stat`, "utf8");
+    const stat4 = readFileSync3(`/proc/${pid}/stat`, "utf8");
     const fields = stat4.slice(stat4.lastIndexOf(")") + 2).split(" ");
     const starttime = Number(fields[19]);
-    const uptime = Number(readFileSync2("/proc/uptime", "utf8").split(" ")[0]);
+    const uptime = Number(readFileSync3("/proc/uptime", "utf8").split(" ")[0]);
     if (!Number.isFinite(starttime) || !Number.isFinite(uptime)) return void 0;
     return Math.floor(Date.now() / 1e3 - (uptime - starttime / 100));
   } catch {
@@ -2994,7 +3349,16 @@ function fadeOrchestrate(pi) {
       return false;
     }
     await observeSwaps();
-    const route = routeFor(desk, flipState(run.lane, FLIP_WINDOW_MS));
+    let route = routeFor(desk, flipState(run.lane, FLIP_WINDOW_MS));
+    if (route.route === "subagent") {
+      const probe = await probeVerifierLane();
+      run.lane_probe = { ok: probe.ok, detail: probe.detail, at: (/* @__PURE__ */ new Date()).toISOString(), ms: probe.ms, skipped: probe.skipped };
+      if (!probe.ok && probe.skipped !== true) {
+        route = { route: "swap", reason: `the ${VERIFIER_MODEL} verifier lane failed its claim-time probe: ${probe.detail}`, flips: route.flips };
+        pushRejection(run, "task", `the zero-swap subagent verification route was REFUSED before the claim: ${probeLabel(probe)}. A claimed batch cannot be reclaimed (desk.ts:214), so an unproven lane leaves the batch owed for the whole run; paid the ${THINK_LANE} swap instead, the route with recovery`);
+        ctx.ui.notify(`orchestrate: verifier lane UNPROVEN \u2014 ${probeLabel(probe)}; the batch goes to one ${THINK_LANE} swap, not the zero-swap subagent route`, "warning");
+      }
+    }
     const claimed = claimBatch(desk, route.route);
     const requests = desk.requests.filter((r) => claimed.ids.includes(r.id));
     deskBatch = { batch: claimed.batch, ids: claimed.ids, routed: route.route };
@@ -3019,6 +3383,17 @@ function fadeOrchestrate(pi) {
     ctx.ui.notify(`orchestrate: ${deskLine(desk)} \u2014 one ${THINK_LANE} load answers the whole batch`, "info");
     requestLane(THINK_LANE, ctx);
     return true;
+  };
+  const auditOwedOnComplete = async (st, ctx) => {
+    if (!runDir) return "";
+    const d = await readDesk(runDir, st.run_id);
+    if (!d) return "";
+    const owed = owedRequests(d);
+    if (owed.length === 0) return "";
+    const ids = owed.map((r) => r.id).join(", ");
+    pushRejection(st, "task", `the run completed with ${owed.length} verification request(s) CLAIMED and NEVER judged: ${ids} \u2014 a claimed batch has no reclaim path (desk.ts:214), so the slices behind them are unverified`);
+    ctx.ui.notify(`orchestrate: run COMPLETE with ${owed.length} OWED verification request(s): ${ids} \u2014 treat those slices as unverified`, "error");
+    return `; OWED ${owed.length} unjudged verification request(s): ${ids} \u2014 those slices are UNVERIFIED`;
   };
   const runSwitch = async (lane, ctx, gen) => {
     const model = ctx.modelRegistry.find(PROVIDER, lane);
@@ -3460,6 +3835,7 @@ ${SCHEMA_HINT}` : text);
         if (ok.length > 0) checkpointNote = `; checkpoints ${ok.join(", ")}`;
         const refused = tags.filter((t) => !t.ok);
         if (refused.length > 0) checkpointNote += `; checkpoint FAILED ${refused.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+        checkpointNote += await auditOwedOnComplete(st, ctx);
       }
       if (params.phase === "coding_done" && applied.nextState === "verifying" && run.checks.length > 0) {
         await gateChecks(ctx);
@@ -3467,6 +3843,10 @@ ${SCHEMA_HINT}` : text);
         run.gate_last = gate;
         if (!gate.passed) {
           const failing = gate.results.filter((r) => !r.ok);
+          const triage = await gateTriage(failing, run.repo);
+          const triageNote = triageLine(triage);
+          if (triage.note !== "") run.gate_last = { ...gate, triage: triage.note };
+          if (triage.note === "" && triage.skipped !== true) ctx.ui.notify(`orchestrate: gate triage produced nothing (${triage.why})`, "info");
           pushRejection(run, "task", `pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
           run.state = "coding";
           await persist();
@@ -3475,7 +3855,7 @@ ${SCHEMA_HINT}` : text);
           settledNotified = false;
           ctx.abort();
           return {
-            content: [{ type: "text", text: `pre-swap gate RED (${failing.length}/${gate.results.length} failing); the verifier swap was not paid; fix and re-report coding_done` }],
+            content: [{ type: "text", text: `pre-swap gate RED (${failing.length}/${gate.results.length} failing); the verifier swap was not paid; fix and re-report coding_done${triageNote !== "" ? `; ${triageNote}` : ""}` }],
             details: { gate: "red", failing: failing.map((f) => f.cmd) }
           };
         }
@@ -3493,6 +3873,7 @@ ${SCHEMA_HINT}` : text);
           const refused2 = tags2.filter((t) => !t.ok);
           checkpointNote = ok2.length > 0 ? `; checkpoints ${ok2.join(", ")}` : "";
           if (refused2.length > 0) checkpointNote += `; checkpoint FAILED ${refused2.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+          checkpointNote += await auditOwedOnComplete(st2, ctx);
           turnPhase = "verification_done";
           await persist();
           paint(ctx);
@@ -3720,6 +4101,8 @@ ${SCHEMA_HINT}` : text);
         }
         const ready = readyToAddress(d, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
         ctx.ui.notify(`orchestrate: ${deskLine(d)} \xB7 batch ${d.epoch + 1} open since ${d.open_utc}${d.sealed_utc ? ` \xB7 sealed ${d.sealed_utc}` : " \xB7 NOT sealed"} \xB7 ${ready.reason}`, "info");
+        const owed = owedRequests(d);
+        if (owed.length > 0) ctx.ui.notify(`orchestrate: ${owed.length} request(s) CLAIMED with NO verdict \u2014 owed: ${owed.map((r) => r.id).join(", ")}. Nothing re-opens a claimed batch (desk.ts:214), so the run completes over them and the slices behind them are UNVERIFIED; answer them with fade_verdicts`, "error");
         for (const r of d.requests.slice(-8)) {
           ctx.ui.notify(`  ${r.id} [batch ${r.batch + 1}] ${r.agent}${r.task_id ? `/${r.task_id}` : ""}: ${r.objective.slice(0, 70)} \u2192 ${r.verdict ? r.verdict.accepted ? "ACCEPTED" : "needs_repair" : r.claimed_batch !== void 0 ? "claimed, verdict owed" : "collecting"}`, "info");
         }
@@ -3748,7 +4131,9 @@ ${SCHEMA_HINT}` : text);
         const installedWorker = existsSync(absWorker);
         ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} \xB7 model ${VERIFIER_MODEL} \xB7 ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
         ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} \xB7 inherits the code lane \xB7 ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} \u2014 a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
-        if (installed) ctx.ui.notify(`orchestrate: ${readFileSync3(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
+        if (installed) ctx.ui.notify(`orchestrate: ${readFileSync4(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
+        const probe = await probeVerifierLane();
+        ctx.ui.notify(`orchestrate: verifier lane ${VERIFIER_MODEL} claim-time probe: ${probeLabel(probe)}`, probe.ok ? "info" : "error");
         return;
       }
       if (first === "overlay") {

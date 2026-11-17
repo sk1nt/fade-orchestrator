@@ -34,6 +34,8 @@ export function buildTestBundle() {
     "src/history.ts",
     "src/core.ts",
     "src/desk.ts",
+    "src/lane.ts",
+    "src/triage.ts",
     "src/subagent.ts",
     "src/moe.ts",
     "src/taskmoe.ts",

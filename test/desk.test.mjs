@@ -24,6 +24,7 @@ import {
 	mutateDesk,
 	noteTaskBatch,
 	openRequests,
+	owedRequests,
 	parseDesk,
 	readDesk,
 	readyToAddress,
@@ -204,4 +205,27 @@ test("a worker's block is answered by the fan-out, and bounded when its own verd
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+/**
+ * The invariant the claim-time lane guard stands on. A claim is the UNRECOVERABLE act: the stamped
+ * request leaves the live set, the desk issues no further directive for it, and a worker that
+ * re-registers its objective after its `deferred` exit gets a FRESH request, because the dedupe only
+ * matches unclaimed ones. So the owed count grows across a run and each duplicate is priced — which
+ * is why the lane must be proved BEFORE `claimBatch`, not after.
+ */
+test("a claimed batch has no reclaim path: an unjudged claim is owed, and a re-register grows it", () => {
+	const enq = enqueueRequest(emptyDesk("run-1"), { agent: "scout", session: "s1", objective: "verify a" }).desk;
+	const claimed = claimBatch(enq, "subagent");
+	assert.equal(openRequests(claimed.desk).length, 0, "the stamped request left the live set (desk.ts:214)");
+	assert.deepEqual(owedRequests(claimed.desk).map((r) => r.id), ["V1.1"]);
+	assert.equal(deskCensus(claimed.desk).owed, 1);
+	const ready = readyToAddress(claimed.desk, T0 + 10 * 60_000, { settleMs: 8_000, deadlineMs: 120_000 });
+	assert.equal(ready.ready, false);
+	assert.equal(ready.reason, "desk_empty", "no directive follows a claim — the guard cannot be a poll-time thing");
+	const again = enqueueRequest(claimed.desk, { agent: "scout", session: "s1", objective: "verify a" });
+	assert.equal(again.deduped, false, "the dedupe cannot see the claimed original (desk.ts:285)");
+	assert.equal(owedRequests(again.desk).length, 1, "the fresh request is open, not yet owed");
+	const second = claimBatch(again.desk, "subagent");
+	assert.deepEqual(owedRequests(second.desk).map((r) => r.id), ["V1.1", "V2.1"], "the owed set grows monotonically");
 });

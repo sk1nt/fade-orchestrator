@@ -220,6 +220,9 @@ export interface GateResult {
 		budget?: boolean;
 		tail: string;
 	}[];
+	/** One advisory cause line for a RED gate, from the tails this gate already captured. It carries
+	 *  NO authority: the verdict is the exit codes above, and a `coding_done` re-runs the checks. */
+	triage?: string;
 }
 /**
  * Can bash even PARSE this check string? A check is a claim the machine runs, and a string that
@@ -559,6 +562,9 @@ export async function handover(run: RunState): Promise<{ stable: string[]; volat
 		...(run.gate_last && run.gate_last.passed === false
 			? [`Last pre-swap gate FAILED: ${JSON.stringify(run.gate_last.results.filter((r) => !r.ok).map((r) => ({ cmd: r.cmd, tail: r.tail })))}`]
 			: []),
+		...(run.gate_last?.triage
+			? [`Gate triage (ADVISORY, no authority — the gate's exit codes are the verdict; name the cause you actually confirm): ${run.gate_last.triage}`]
+			: []),
 		...(run.rejection_history.length > 0
 			? [
 					`Rejections so far (do not repeat): ${JSON.stringify(
@@ -645,6 +651,9 @@ export interface RunState {
 	synthesized?: { phase: string; round: number; at: string };
 	/** Task id -> the checkpoint tag naming the HEAD that task passed against. */
 	checkpoints?: Record<string, string>;
+	/** The last claim-time probe of the verifier lane: what it asked and what answered. Recorded
+	 *  every time the zero-swap route is taken or refused; the panel and `verifier` print it. */
+	lane_probe?: { ok: boolean; detail: string; at: string; ms: number; skipped?: boolean };
 }
 
 /**

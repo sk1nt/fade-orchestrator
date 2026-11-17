@@ -363,6 +363,16 @@ export function deskCensus(desk: VerifyDesk): { open: number; owed: number; answ
 	};
 }
 
+/**
+ * The requests that are OWED: claimed by a verification pass that never answered them. Nothing
+ * re-opens a claimed batch (`openRequests` drops the stamped ones, `desk.ts:214`, and no code
+ * clears the stamp), so an owed request is permanent — the run completes over it, and the worker
+ * that ignores "do not re-register" adds a fresh one. The census prints the count; this names them.
+ */
+export function owedRequests(desk: VerifyDesk): VerifyRequest[] {
+	return desk.requests.filter((r) => r.claimed_batch !== undefined && r.verdict === undefined);
+}
+
 /** The desk as one line, for the status row and the `desk` verb. */
 export function deskLine(desk: VerifyDesk): string {
 	const c = deskCensus(desk);

@@ -56,7 +56,7 @@
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { hostname, tmpdir, userInfo } from "node:os";
 
@@ -225,6 +225,12 @@ process.env.FADE_ORCHESTRATE_GATE_POLL_MS = "5";
 process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS = "15";
 process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS = "60000";
 process.env.FADE_ORCHESTRATE_FLIP_BREAKER_AT = "3";
+// The rigs stub the ROUTER; the off-router verifier lane is out of their scope, so the claim-time
+// probe is disabled here. Block 27 turns it back on against its own stub lane server.
+process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS = "0";
+// Red-gate triage spawns a CLI; the rig's blocks must not pay for it, and block 28 turns it on
+// against a stub script so the contract is proved without a subscription.
+process.env.FADE_ORCHESTRATE_GATE_TRIAGE = "0";
 
 // ---- fake pi + ctx ----
 const tools = {};
@@ -1388,6 +1394,169 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the release pays AT MOST one lane load (only a lane the loop owes)", loads() - lReset22 <= 1, `extra=${loads() - lReset22}`);
   swapLine = null;
   resident = "flash-next";
+}
+
+// 27. THE CLAIM-TIME LANE GUARD. A claimed batch has NO reclaim path: `claimBatch` stamps the live
+// requests (desk.ts:264), `openRequests` drops the stamped ones (desk.ts:214), and nothing clears
+// the stamp. So a batch handed to a verifier lane that cannot answer is not stalled — it is OWED
+// for the whole run, every worker in it exits `fade_verify` deferred, and a worker that
+// re-registers its objective adds a FRESH owed request (desk.ts:285 dedupes only UNCLAIMED ones),
+// so the owed count grows and each duplicate is priced. The zero-swap route therefore requires
+// PROOF: one 1-token completion, through the lane's own auth path (`apiKey: "!bash -lc …'"` means a
+// 200 on `/v1/models` can coexist with a 401 at generate time). A lane that refuses sends the batch
+// to the swap route — the route with recovery — loudly; a lane that answers keeps the zero-swap
+// route and pays nothing.
+{
+  resident = "flash-next";
+  swapLine = null;
+  let laneMode = "refuse";
+  const laneCalls = [];
+  const lane = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const c of req) body += c;
+    laneCalls.push({ url: req.url, auth: String(req.headers.authorization ?? ""), body });
+    const json = (code, obj) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.url === "/v1/models") return json(200, { data: [{ id: "probe-model" }] });
+    if (req.url === "/v1/chat/completions") {
+      if (laneMode === "refuse") return json(401, { error: { message: "missing api key" } });
+      return json(200, { choices: [{ message: { role: "assistant", content: "ok" } }] });
+    }
+    return json(404, { error: { message: "no route" } });
+  });
+  await new Promise((r) => lane.listen(0, "127.0.0.1", r));
+  process.env.FADE_ORCHESTRATE_VERIFIER_MODEL = "probe-lane/probe-model";
+  process.env.FADE_ORCHESTRATE_VERIFIER_BASE_URL = `http://127.0.0.1:${lane.address().port}/v1`;
+  process.env.FADE_ORCHESTRATE_VERIFIER_API_KEY = "rig-probe-key";
+  process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS = "1"; // a fresh probe per case, never a cached pass
+  const deskFile27 = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
+  const readDesk27 = () => JSON.parse(readFileSync(deskFile27, "utf8"));
+  const request27 = (id) => ({ id, batch: 0, agent: "reviewer", session: "sub-1", objective: "T1 with an unproven lane", acceptance: "node --test exits 0", checks: [["node --test test/desk.test.mjs", "exit 0"]], enqueued_utc: new Date().toISOString() });
+  const seed27 = (requests, epoch, addressed) => {
+    const at = new Date().toISOString();
+    writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+    writeFileSync(deskFile27, JSON.stringify({
+      schema: "fade.orchestrate.verify_desk.v1", run_id: "GATE1", epoch, open_utc: at, expected: requests.length, agents: ["reviewer"],
+      churn: true, churn_utc: at, requests, addressed: addressed ?? [], updated_utc: at,
+    }));
+  };
+
+  // A. The lane answers `/v1/models` and REFUSES the completion: the batch is not claimed for the
+  // zero-swap route, because that claim is the unrecoverable act.
+  seed27([request27("V1.1")], 0);
+  await hooks.session_start({}, ctx);
+  const l27 = loads();
+  notes.length = 0;
+  sent.length = 0;
+  laneCalls.length = 0;
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 250));
+  const d27 = readDesk27();
+  const s27 = readState();
+  ok("the guard probes a COMPLETION through the lane's own auth path", laneCalls.some((c) => c.url === "/v1/chat/completions" && /^Bearer /.test(c.auth)), JSON.stringify(laneCalls.map((c) => c.url)));
+  ok("a lane that refuses the completion routes the batch to the swap route", d27.addressed.length === 1 && d27.addressed[0].routed === "swap" && d27.addressed[0].ids.join(",") === "V1.1", JSON.stringify(d27.addressed));
+  ok("the refusal is said, naming the lane, the http status and the model", notes.some((n) => n.includes("verifier lane UNPROVEN") && n.includes("http 401") && n.includes("probe-model")), JSON.stringify(notes.slice(0, 4)));
+  ok("the refusal is in the run's history and names the reclaim rule", (s27.rejection_history ?? []).some((r) => r.reason.includes("REFUSED before the claim") && r.reason.includes("desk.ts:214")), JSON.stringify((s27.rejection_history ?? []).slice(-1)));
+  ok("the probe rides the run state, so the panel and `verifier` print it", s27.lane_probe?.ok === false && /http 401/.test(String(s27.lane_probe?.detail)), JSON.stringify(s27.lane_probe));
+  ok("the batch is answered by the one load the swap route pays", loads() - l27 === 1 && readState().state === "verifying", `extra=${loads() - l27} state=${readState().state}`);
+  ok("no verifier directive is handed out for a lane that cannot be proved", !/fade-verifier/.test(sent.join("\n")), sent.join("\n").slice(0, 200));
+
+  // B. The lane answers a 1-token completion: the zero-swap route stands, at zero loads.
+  laneMode = "answer";
+  // Case A left the loop OWING the swap route's lane, and `agent_end` pays an owed lane BEFORE it
+  // dispatches a batch, so the debt is settled first. It comes BEFORE the seed because
+  // `lanes reset` also releases the desk's churn mark — seeded first, the desk would be reset out
+  // of churn and this case would measure the swap route it is meant to rule out.
+  await commands.orchestrate.handler("lanes reset", ctx);
+  await new Promise((r) => setTimeout(r, 250));
+  seed27([request27("V1.1")], 0);
+  await hooks.session_start({}, ctx);
+  const l27b = loads();
+  notes.length = 0;
+  sent.length = 0;
+  laneCalls.length = 0;
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 250));
+  const d27b = readDesk27();
+  const s27b = readState();
+  ok("a lane that answers keeps the zero-swap route at ZERO loads", d27b.addressed.length === 1 && d27b.addressed[0].routed === "subagent" && loads() === l27b, `${JSON.stringify(d27b.addressed.map((a) => a.routed))} extra=${loads() - l27b}`);
+  // The directive's model text comes from `VERIFIER_MODEL`, read at import; the probe reads the env
+  // at call time. In production both are the process's own value, so the check names the ACT.
+  ok("the proved route hands the loop the verifier call, by id, promising zero loads", /task \{ "agent": "fade-verifier"/.test(sent.join("\n")) && /V1\.1/.test(sent.join("\n")) && /will NOT pay a lane load/.test(sent.join("\n")), sent.join("\n").slice(0, 240));
+  ok("the proved probe rides the run state", s27b.lane_probe?.ok === true && /answered model probe-model/.test(String(s27b.lane_probe?.detail)), JSON.stringify(s27b.lane_probe));
+
+  // C. The census NAMES what is owed: claimed, no verdict, and nothing re-opens it.
+  seed27([{ ...request27("V1.1"), claimed_batch: 0 }, { ...request27("V1.2"), claimed_batch: 0, verdict: { accepted: true, notes: "node --test: 12 pass" } }], 1, [{ batch: 0, ids: ["V1.1", "V1.2"], routed: "subagent", at: new Date().toISOString() }]);
+  notes.length = 0;
+  await commands.orchestrate.handler("desk", ctx);
+  const census27 = notes.join("\n");
+  ok("the desk census calls an unjudged claim OWED, by id", /CLAIMED with NO verdict — owed: V1\.1/.test(census27) && census27.includes("UNVERIFIED"), census27.slice(0, 400));
+  ok("a judged request is not counted as owed", !/owed: V1\.2/.test(census27), census27.slice(0, 400));
+
+  delete process.env.FADE_ORCHESTRATE_VERIFIER_MODEL;
+  delete process.env.FADE_ORCHESTRATE_VERIFIER_BASE_URL;
+  delete process.env.FADE_ORCHESTRATE_VERIFIER_API_KEY;
+  process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS = "0";
+  lane.close();
+}
+
+// 28. RED-GATE TRIAGE. A red gate already says WHAT failed — the exit codes are the verdict — and
+// the triage call says WHY, as one ADVISORY line in the briefing and the tool's answer. The contract
+// is its boundaries: ZERO authority (the gate stays RED and pays zero lane loads, whatever the
+// triage claims), NO tools (the prompt carries the gate's own rows, so the advisory agent cannot
+// touch the tree the coder is repairing), and SILENCE on failure (a CLI that answers nothing leaves
+// the briefing exactly as it was before this feature existed).
+{
+  const stub = join(repo, "stub-triage.sh");
+  const stubLog = join(repo, "triage-prompt.txt");
+  const argsLog = join(repo, "triage-args.txt");
+  writeFileSync(stub, '#!/bin/sh\nprintf \'%s\\n\' "$2" >> "$STUB_PROMPT_LOG"\nprintf \'%s\\n\' "$@" >> "$STUB_ARGS_LOG"\nprintf \'%s\' \'{"text":"probable cause: the stub read the tails","stopReason":"end_turn"}\'\n');
+  chmodSync(stub, 0o755);
+  process.env.FADE_ORCHESTRATE_GATE_TRIAGE = "1";
+  process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN = stub;
+  process.env.STUB_PROMPT_LOG = stubLog;
+  process.env.STUB_ARGS_LOG = argsLog;
+  rmSync(stubLog, { force: true });
+  rmSync(argsLog, { force: true });
+  writeState({ ...seedState("coding", [["false", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  const l28 = loads();
+  notes.length = 0;
+  const r28 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  const text28 = r28?.content?.[0]?.text ?? "";
+  ok("a red gate carries the ADVISORY cause line", /probable cause \(advisory/.test(text28) && text28.includes("the stub read the tails"), text28.slice(0, 260));
+  ok("the line names the verdict as the exit codes, not itself", text28.includes("exit codes decide"), text28.slice(0, 260));
+  ok("the gate verdict is UNCHANGED by the triage: RED, and the swap is not paid", /pre-swap gate RED \(1\/1 failing\)/.test(text28) && loads() === l28, `${text28.slice(0, 90)} extra=${loads() - l28}`);
+  const s28 = readState();
+  ok("gate_last carries the triage, stays red, and the lane is owed the repair", (s28.gate_last?.triage ?? "").includes("stub read the tails") && s28.gate_last?.passed === false && s28.state === "coding", JSON.stringify({ triage: s28.gate_last?.triage, passed: s28.gate_last?.passed, state: s28.state }));
+  const prompt28 = existsSync(stubLog) ? readFileSync(stubLog, "utf8") : "";
+  const args28 = existsSync(argsLog) ? readFileSync(argsLog, "utf8") : "";
+  ok("the prompt carries the gate's OWN rows — command, expectation, tail", prompt28.includes("false") && /expected: green/i.test(prompt28) && prompt28.includes("RED"), prompt28.slice(0, 300));
+  ok("the prompt forbids guessing and demands one confirming command", /cause not determinable/.test(prompt28) && /ONE command/.test(prompt28), prompt28.slice(-300));
+  ok("the call is tool-less, one turn, bounded", args28.includes("--disallowed-tools") && args28.includes("*") && args28.includes("--max-turns") && args28.includes("--output-format"), args28.slice(0, 300));
+
+  // The failure path: a CLI that answers nothing must change NOTHING.
+  const silent = join(repo, "stub-silent.sh");
+  writeFileSync(silent, "#!/bin/sh\nprintf '%s' '{\"stopReason\":\"cancelled\"}'\n");
+  chmodSync(silent, 0o755);
+  process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN = silent;
+  writeState({ ...seedState("coding", [["false", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  await hooks.session_start({}, ctx);
+  const l28b = loads();
+  notes.length = 0;
+  const r28b = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
+  const text28b = r28b?.content?.[0]?.text ?? "";
+  ok("a triage that answers nothing changes nothing: same red briefing, zero loads", !/probable cause/.test(text28b) && /pre-swap gate RED \(1\/1 failing\)/.test(text28b) && loads() === l28b, `${text28b.slice(0, 90)} extra=${loads() - l28b}`);
+  ok("the operator is told WHY there is no line, naming the CLI's stopReason", notes.some((n) => n.includes("gate triage produced nothing") && n.includes("cancelled")), JSON.stringify(notes.slice(0, 4)));
+  const s28b = readState();
+  ok("no triage is recorded when there is no answer", s28b.gate_last?.triage === undefined && s28b.gate_last?.passed === false, JSON.stringify(s28b.gate_last?.triage));
+
+  process.env.FADE_ORCHESTRATE_GATE_TRIAGE = "0";
+  delete process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN;
+  delete process.env.STUB_PROMPT_LOG;
+  delete process.env.STUB_ARGS_LOG;
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

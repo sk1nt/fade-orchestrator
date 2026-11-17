@@ -44,8 +44,11 @@ import {
 	mutateDesk,
 	deskPath,
 	type VerifyRequest,
+	owedRequests,
 } from "./desk.ts";
-import { VERIFIER_AGENT, VERIFIER_MODEL, WORKER_AGENT, isRouterModel, routeFor, routeLine, taskBatchOf, verifierAgentMd, verifierAgentPath, verifierDirective, workerAgentMd, workerAgentPath } from "./subagent.ts";
+import { VERIFIER_AGENT, VERIFIER_MODEL, WORKER_AGENT, isRouterModel, routeFor, routeLine, taskBatchOf, verifierAgentMd, verifierAgentPath, verifierDirective, workerAgentMd, workerAgentPath, type RouteDecision } from "./subagent.ts";
+import { probeLabel, probeVerifierLane } from "./lane.ts";
+import { gateTriage, triageLine } from "./triage.ts";
 import {
 	ACTIVE_FILENAME,
 	DEFAULT_ROUNDS,
@@ -634,7 +637,25 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			return false;
 		}
 		await observeSwaps();
-		const route = routeFor(desk, flipState(run.lane, FLIP_WINDOW_MS));
+		let route: RouteDecision = routeFor(desk, flipState(run.lane, FLIP_WINDOW_MS));
+		// THE CLAIM-TIME LANE GUARD. A claimed batch has NO reclaim path: `claimBatch` stamps every
+		// live request (desk.ts:264), `openRequests` drops stamped requests from the live set
+		// (desk.ts:214), and nothing clears the stamp. So handing a batch to a verifier lane that
+		// cannot answer does not stall it — the batch becomes permanently OWED, every worker in it
+		// exits `fade_verify` deferred at DESK_WAIT_MS, and a worker that re-registers its objective
+		// adds a FRESH owed request (desk.ts:285 dedupes only UNCLAIMED ones). The zero-swap route is
+		// therefore taken only on PROOF: one 1-token completion, through the lane's own auth path,
+		// cached for PROBE_CACHE_MS. Refusing it buys the only recovery that exists — the swap route,
+		// which the loop already knows how to pay for and retry.
+		if (route.route === "subagent") {
+			const probe = await probeVerifierLane();
+			run.lane_probe = { ok: probe.ok, detail: probe.detail, at: new Date().toISOString(), ms: probe.ms, skipped: probe.skipped };
+			if (!probe.ok && probe.skipped !== true) {
+				route = { route: "swap", reason: `the ${VERIFIER_MODEL} verifier lane failed its claim-time probe: ${probe.detail}`, flips: route.flips };
+				pushRejection(run, "task", `the zero-swap subagent verification route was REFUSED before the claim: ${probeLabel(probe)}. A claimed batch cannot be reclaimed (desk.ts:214), so an unproven lane leaves the batch owed for the whole run; paid the ${THINK_LANE} swap instead, the route with recovery`);
+				ctx.ui.notify(`orchestrate: verifier lane UNPROVEN — ${probeLabel(probe)}; the batch goes to one ${THINK_LANE} swap, not the zero-swap subagent route`, "warning");
+			}
+		}
 		const claimed = claimBatch(desk, route.route);
 		const requests = desk.requests.filter((r) => claimed.ids.includes(r.id));
 		deskBatch = { batch: claimed.batch, ids: claimed.ids, routed: route.route };
@@ -659,6 +680,25 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		ctx.ui.notify(`orchestrate: ${deskLine(desk)} — one ${THINK_LANE} load answers the whole batch`, "info");
 		requestLane(THINK_LANE, ctx);
 		return true;
+	};
+
+	/**
+	 * The OWED audit, run the moment a run reaches `complete`. A request claimed by a verification
+	 * pass that never answered is permanent (nothing re-opens a claimed batch), so a run that ends
+	 * with owed requests is NOT green: the slices behind them were never verified. It is recorded in
+	 * `rejection_history`, said out loud at error severity, and appended to the tool's own answer, so
+	 * the lane cannot report success over it without reading the sentence.
+	 */
+	const auditOwedOnComplete = async (st: RunState, ctx: ExtensionContext): Promise<string> => {
+		if (!runDir) return "";
+		const d = await readDesk(runDir, st.run_id);
+		if (!d) return "";
+		const owed = owedRequests(d);
+		if (owed.length === 0) return "";
+		const ids = owed.map((r) => r.id).join(", ");
+		pushRejection(st, "task", `the run completed with ${owed.length} verification request(s) CLAIMED and NEVER judged: ${ids} — a claimed batch has no reclaim path (desk.ts:214), so the slices behind them are unverified`);
+		ctx.ui.notify(`orchestrate: run COMPLETE with ${owed.length} OWED verification request(s): ${ids} — treat those slices as unverified`, "error");
+		return `; OWED ${owed.length} unjudged verification request(s): ${ids} — those slices are UNVERIFIED`;
 	};
 
 	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number): Promise<void> => {
@@ -1262,6 +1302,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				if (ok.length > 0) checkpointNote = `; checkpoints ${ok.join(", ")}`;
 				const refused = tags.filter((t) => !t.ok);
 				if (refused.length > 0) checkpointNote += `; checkpoint FAILED ${refused.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+				checkpointNote += await auditOwedOnComplete(st, ctx);
 			}
 			// The pre-swap gate: on coding_done, before paying the verifier swap (13-25 s pack
 			// load), run the plan's own checks on the code lane. Red keeps the coding lane
@@ -1273,6 +1314,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				run.gate_last = gate;
 				if (!gate.passed) {
 					const failing = gate.results.filter((r) => !r.ok);
+					// Red-gate TRIAGE: one bounded, tool-less advisory call naming the probable cause,
+					// so the coding lane starts its repair with a hypothesis. It has ZERO authority: the
+					// verdict is the exit codes, `coding_done` re-runs the checks, and a failure (no
+					// binary, timeout, no answer) returns an empty note, leaving the briefing exactly as
+					// it was before this existed.
+					const triage = await gateTriage(failing, run.repo);
+					const triageNote = triageLine(triage);
+					if (triage.note !== "") run.gate_last = { ...gate, triage: triage.note };
+					if (triage.note === "" && triage.skipped !== true) ctx.ui.notify(`orchestrate: gate triage produced nothing (${triage.why})`, "info");
 					pushRejection(run, "task", `pre-swap gate red: ${failing.map((f) => f.cmd).join(" | ")}`);
 					run.state = "coding";
 					await persist();
@@ -1281,7 +1331,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					settledNotified = false;
 					ctx.abort();
 					return {
-						content: [{ type: "text", text: `pre-swap gate RED (${failing.length}/${gate.results.length} failing); the verifier swap was not paid; fix and re-report coding_done` }],
+						content: [{ type: "text", text: `pre-swap gate RED (${failing.length}/${gate.results.length} failing); the verifier swap was not paid; fix and re-report coding_done${triageNote !== "" ? `; ${triageNote}` : ""}` }],
 						details: { gate: "red", failing: failing.map((f) => f.cmd) },
 					};
 				}
@@ -1306,6 +1356,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					const refused2 = tags2.filter((t) => !t.ok);
 					checkpointNote = ok2.length > 0 ? `; checkpoints ${ok2.join(", ")}` : "";
 					if (refused2.length > 0) checkpointNote += `; checkpoint FAILED ${refused2.map((t) => `${t.tag}: ${t.error}`).join(", ")}`;
+					checkpointNote += await auditOwedOnComplete(st2, ctx);
 					turnPhase = "verification_done";
 					await persist();
 					paint(ctx);
@@ -1614,6 +1665,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				}
 				const ready = readyToAddress(d, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
 				ctx.ui.notify(`orchestrate: ${deskLine(d)} · batch ${d.epoch + 1} open since ${d.open_utc}${d.sealed_utc ? ` · sealed ${d.sealed_utc}` : " · NOT sealed"} · ${ready.reason}`, "info");
+				const owed = owedRequests(d);
+				if (owed.length > 0) ctx.ui.notify(`orchestrate: ${owed.length} request(s) CLAIMED with NO verdict — owed: ${owed.map((r) => r.id).join(", ")}. Nothing re-opens a claimed batch (desk.ts:214), so the run completes over them and the slices behind them are UNVERIFIED; answer them with fade_verdicts`, "error");
 				for (const r of d.requests.slice(-8)) {
 					ctx.ui.notify(`  ${r.id} [batch ${r.batch + 1}] ${r.agent}${r.task_id ? `/${r.task_id}` : ""}: ${r.objective.slice(0, 70)} → ${r.verdict ? (r.verdict.accepted ? "ACCEPTED" : "needs_repair") : r.claimed_batch !== undefined ? "claimed, verdict owed" : "collecting"}`, "info");
 				}
@@ -1649,6 +1702,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} · model ${VERIFIER_MODEL} · ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
 				ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} · inherits the code lane · ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} — a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
 				if (installed) ctx.ui.notify(`orchestrate: ${readFileSync(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
+				const probe = await probeVerifierLane();
+				ctx.ui.notify(`orchestrate: verifier lane ${VERIFIER_MODEL} claim-time probe: ${probeLabel(probe)}`, probe.ok ? "info" : "error");
 				return;
 			}
 			if (first === "overlay") {

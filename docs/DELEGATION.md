@@ -135,6 +135,33 @@ definition the host's `task` tool resolves (`Fade verification subagent. Model: 
 router.` plus the procedure). `verifier show` prints it and whether it is installed, and warns when
 its model resolves to the router.
 
+### The claim-time lane guard, and what OWED means
+
+A claim is the **unrecoverable act**. `claimBatch` stamps `claimed_batch` on every live request
+(`desk.ts:264`), `openRequests` drops stamped requests from the live set (`desk.ts:214`), and nothing
+in `desk.ts` clears the stamp. So a batch handed to a verifier lane that cannot answer is not stalled
+and does not get re-issued: it is **owed for the whole run**. Every worker in it exits `fade_verify`
+at `DESK_WAIT_MS` (240 s) with "the batch is owed its verification pass — report your result and end,
+do not re-register", and a worker that re-registers its objective gets a FRESH request, because
+`enqueueRequest` dedupes only UNCLAIMED ones (`desk.ts:285`). The owed count therefore grows
+monotonically across a run, each duplicate priced at its own verification pass, and the run completes
+reading unverified slices as reported.
+
+So the lane is proved **before the claim** (`src/lane.ts`): one 1-token completion, through the same
+auth path the lane declares — its provider key is a command (`apiKey: "!bash -lc 'source … && printf
+%s \"$FADE_NINFER_API_KEY\"'"`), so a reachable port and a 200 on `/v1/models` can coexist with a
+generate-time 401, which is why a `GET`-shaped probe is not accepted. The reading is cached for
+`FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS`. Consequences, all rig-proved (block 27):
+
+- a lane that **refuses** the completion: no claim, the batch goes to the `swap` route (the route
+  with recovery) at one load, the probe is in the operator line and the rejection history, and
+  `state.lane_probe` carries the reading;
+- a lane that **answers**: the zero-swap route stands, at zero loads;
+- a **router entry** is refused without any request — a completion to the router unloads the resident
+  lane, so proving the "zero-swap" lane would pay the swap the lane exists to avoid;
+- `/orchestrate desk` names the owed ids and calls the slices behind them UNVERIFIED, and a run that
+  reaches `complete` with owed requests says so in the `fade_phase` answer itself.
+
 ## Refusals, deliberate
 
 - `fade_verify` **refuses** when no orchestrated run is bound (a subagent's cwd is the parent's, so
@@ -154,4 +181,8 @@ its model resolves to the router.
 | `node test/gate_rig.mjs` (block 21) | one worker registering pays **zero** loads while its peer is unregistered; a closed batch pays **exactly one** load for both requests; the briefing carries both check commands; a mid-pass arrival is batch 2; verdicts fan out by id; the three gates refuse by name |
 | `node test/gate_rig.mjs` (block 19b) | the thrash breaker **marks the desk** and routes the batch it halts, at zero loads |
 | `node test/gate_rig.mjs` (block 22) | under churn: zero loads, one claim routed `subagent`, the directive carries the off-router model and every worker's check command, the route **stays** for the next batch, `lanes reset` releases it |
+| `node --test test/lane.test.mjs` | the provider scan in BOTH `models.yml` forms (the operator's file is the mapping form — a scan that reads only sequences reports every provider missing and prices a swap on every churn batch), the spec resolution, the completion probe through the lane's own auth path, the unset-header rule, the cache window, the disabled state, and the router-entry refusal at ZERO requests |
+| `node --test test/triage.test.mjs` | the triage prompt carries the gate's own rows, the CLI call is tool-less/one-turn/bounded, every failure path returns an empty note, and a banner before the JSON still decodes |
+| `node test/gate_rig.mjs` (block 27) | claim-time guard: a lane that refuses the completion routes `swap` at ONE load with the probe named in the history; a lane that answers keeps `subagent` at ZERO loads; the owed census names ids and does NOT count judged ones |
+| `node test/gate_rig.mjs` (block 28) | red-gate triage: the advisory line rides the briefing, the gate stays **RED** at zero loads (the exit codes are still the verdict), and a CLI that answers nothing changes nothing |
 | live `/orchestrate` run over `omp --mode rpc` | run 1: `scout` registered `V1.1`, the default `task` agent `V1.2`, the read-only `reviewer` registered NOTHING (the gap `fade-worker` closes); run 2: both `fade-worker` workers registered (`registered == expected`) and the ready batch sat unclaimed while the owner blocked in `wait` — the deadlock the tool-call claim closes |
