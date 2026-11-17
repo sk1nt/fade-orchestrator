@@ -1231,7 +1231,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ] } }, ctx);
   const census21 = notes.join("\n");
   ok("the task census counts ONLY the verification-carrying workers", hasRow(census21, "4 worker(s), 2 with verification work — the desk batch closes at 2 registration(s)"), census21.slice(0, 300));
-  ok("the census paid ZERO lane load", loads() === base21, `extra=${loads() - base21}`);
+  ok("the census names the launch that CANNOT register and the agent that can", /reviewer, security-reviewer do not carry `fade_verify` by definition/.test(census21) && /launch verification workers as "fade-worker"/.test(census21), census21.slice(0, 420));
   // Worker one registers. Its peer is unregistered, so the batch is OPEN: the boundary pays nothing.
   const w1 = await tools.fade_verify.execute("w1", { objective: "T1: the batch closes at 2 registrations", acceptance: "node --test test/desk.test.mjs exits 0", checks: [["node --test test/desk.test.mjs", "exit 0"]] }, null, null, ctx);
   await hooks.agent_end({}, ctx);

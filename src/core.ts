@@ -10,6 +10,7 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { msg } from "./router.ts";
+import { WORKER_AGENT } from "./subagent.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1217,6 +1218,11 @@ export const briefings = {
 				"Context",
 				'this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections — nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.',
 				'Run each task\'s acceptance command and put what it printed in that task\'s "result". Do not commit.',
+			),
+			section(
+				"Delegated verification",
+				`A slice handed to a \`task\` worker can verify ITSELF: launch it as agent "${WORKER_AGENT}", whose definition carries the \`fade_verify\` tool. Its request joins the desk, the batch closes when every worker the round launched has registered, and ONE verification pass answers the whole batch by id.`,
+				`A worker launched on an agent whose tools do NOT carry \`fade_verify\` (a read-only reviewer, for example) runs its checks and cannot register; the census counted it, so the batch closes on the settle window instead of on its request — install the definition with \`/orchestrate verifier install\`.`,
 			),
 			await gitCaveat(run.repo),
 		);

@@ -245,6 +245,52 @@ export function verifierAgentMd(model = VERIFIER_MODEL, agent = VERIFIER_AGENT):
 /** Where the definition lands for a run root: the repo's own agent plane. */
 export const verifierAgentPath = (repo: string, agent = VERIFIER_AGENT): string => `.omp/agents/${agent}.md`;
 
+/**
+ * The WORKER's agent name. A delegated worker registers on the desk through the plugin's
+ * `fade_verify` tool, and the host only exposes a tool to a subagent whose definition lists it:
+ * measured in a live run, a `scout` (which carries bash/read and inherits extension tools)
+ * registered, and a `reviewer` (read-only) ran the checks and NEVER registered — so the batch
+ * waited on a worker that could not arrive. This definition is the agent a verification-carrying
+ * worker is launched as.
+ */
+export const WORKER_AGENT = process.env.FADE_ORCHESTRATE_WORKER_AGENT ?? "fade-worker";
+
+/**
+ * The worker definition. NO `model:` line on purpose: a worker does the coding slice and inherits
+ * the run's code lane; only the verifier pins off the router. Its `tools:` line is the load-bearing
+ * part — without `fade_verify` in it the worker cannot register, and a census that counted it makes
+ * the batch close on the settle deadline instead of on its request.
+ */
+export function workerAgentMd(agent = WORKER_AGENT): string {
+	return [
+		"---",
+		`name: ${agent}`,
+		"description: A delegated worker of the fade orchestrator: does one slice, then registers its own acceptance on the verification desk and waits for the verdict.",
+		"tools: read, grep, glob, bash, ls, write, edit, fade_verify",
+		"---",
+		"",
+		`You are one **worker** of a fade orchestrated run. You own the slice you were handed, and you`,
+		"verify your OWN acceptance line — never another worker's slice, and never the whole run.",
+		"",
+		"- Do the slice, then run the acceptance commands your task names, in the session cwd.",
+		"- Call `fade_verify` ONCE with: `objective` (the slice in one line), `acceptance` (the exact",
+		"  command and what it must print), `checks` (rows of [command, expected]), `files` (paths you",
+		"  touched), and `task_id` when your task names one.",
+		"- The tool answers with a request id (`V<batch>.<n>`). **Quote that id in your final message** —",
+		"  it is the handle the verdict comes back on. The tool blocks until the verdict is posted, so",
+		"  do not answer before it returns; a `deferred` answer says the batch is still open, so report",
+		"  the id and the queue position, not a verdict you invented.",
+		"- NEVER call `fade_phase`, switch a model, touch the router (`/v1/load`), or post a verdict:",
+		"  the owner run claims the batch and answers it. A worker that certifies its own slice is the",
+		"  self-certification this desk exists to prevent.",
+		"- Data files (parquets, duckdb, `data/`) are read-only.",
+		"",
+	].join("\n");
+}
+
+/** Where the worker definition lands for a run root. */
+export const workerAgentPath = (repo: string, agent = WORKER_AGENT): string => `.omp/agents/${agent}.md`;
+
 /** The one-line cost of a route, for the panel and the ledger. */
 export function routeLine(route: RouteDecision): string {
 	return route.route === "subagent"

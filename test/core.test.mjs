@@ -566,6 +566,8 @@ test("briefings.window carries every ready objective UNTRUNCATED, the blocked id
 	assert.match(text, /T3 blocked by T1/, "the blocked task is named with its blocker");
 	assert.match(text, /ONE coding_done/, "the one-payload contract is in the turn's own words");
 	assert.ok(text.includes('{"id":"T1"') && text.includes('{"id":"T2"'), "the payload template names BOTH tasks of the window");
+	assert.match(text, /Delegated verification/, "the page names the desk path a slice can take");
+	assert.match(text, /agent "fade-worker"/, "and the agent whose definition carries the registration tool");
 	assert.ok(!text.includes('{"id":"T3"'), "the blocked task is never in the report template");
 });
 

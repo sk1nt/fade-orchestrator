@@ -117,3 +117,13 @@ test("the directive is a command with the call spelled out, and the worker body 
 	assert.match(body, /V2\.2 \(worker task, task T3\)/);
 	assert.match(verifierTaskCall(1, ["V2.1"], requests), /^task \{ "agent"/);
 });
+
+test("the WORKER definition carries fade_verify, because a read-only agent cannot register", async () => {
+	const { workerAgentMd, WORKER_AGENT } = await import("../.test-build/subagent.mjs");
+	const w = workerAgentMd();
+	assert.equal(WORKER_AGENT, "fade-worker");
+	assert.match(w, /^name: fade-worker$/m);
+	assert.match(w, /^tools: .*fade_verify/m, w.slice(0, 400));
+	assert.doesNotMatch(w, /fade_verdicts/, "a worker never posts verdicts");
+	assert.match(w, /Quote that id in your final message/, "the id is the handle the verdict comes back on");
+});

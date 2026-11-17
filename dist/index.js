@@ -208,6 +208,180 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rm
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
+
+// src/subagent.ts
+var VERIFIER_AGENT = process.env.FADE_ORCHESTRATE_VERIFIER_AGENT ?? "fade-verifier";
+var VERIFIER_MODEL = process.env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
+var ROUTER_ENTRIES = [CODE_LANE, THINK_LANE, PROVIDER].map((s) => s.toLowerCase());
+function isRouterModel(model) {
+  const m = model.toLowerCase();
+  return ROUTER_ENTRIES.some((entry) => m === entry || m.startsWith(`${entry}/`) || m.includes(`/${entry}`) || m.startsWith(`${entry}:`));
+}
+var textOf = (v) => {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.map(textOf).join("\n");
+  return "";
+};
+function carriesVerification(body) {
+  if (/\bverif(y|ication|ied)\b/i.test(body)) return true;
+  if (/\bacceptance\b|\bgate\b|\baudit\b|promotion gate/i.test(body)) return true;
+  if (/\b(cargo (test|clippy)|pytest|node --test|npm (run )?test|playwright|tsc|typecheck|lint)\b/i.test(body)) return true;
+  return /\bverify\b|\bverify that\b|\bprove\b|\bscore\b|\bparit(?:y|es)\b/i.test(body);
+}
+function taskBatchOf(input) {
+  const items = [];
+  const list = Array.isArray(input?.tasks) ? input.tasks : [];
+  for (const item of list) {
+    const o = item !== null && typeof item === "object" && !Array.isArray(item) ? item : { task: String(item) };
+    items.push(o);
+  }
+  if (items.length === 0) {
+    const single = input?.task !== void 0 || input?.agent !== void 0;
+    if (single) items.push(input);
+  }
+  const kinds = items.map((o) => {
+    const agent = textOf(o.agent).trim() || textOf(o.name).trim() || "task";
+    const body = `${textOf(o.task)}
+${textOf(o.target)}
+${textOf(o.acceptance)}
+${textOf(o.solutionSpace)}`;
+    return { agent, verification: carriesVerification(body) };
+  });
+  const agents = kinds.map((k) => k.agent);
+  const verifyAgents = kinds.filter((k) => k.verification).map((k) => k.agent);
+  return {
+    count: Math.max(1, kinds.length),
+    agents: agents.length > 0 ? agents : ["task"],
+    verifyAgents,
+    carriesVerification: verifyAgents.length > 0,
+    kinds: kinds.length > 0 ? kinds : [{ agent: "task", verification: false }]
+  };
+}
+function routeFor(desk, flip, opts = {}) {
+  const guardAt = opts.guardAt ?? FLIP_MIN_SWAPS;
+  if (desk.churn) return { route: "subagent", reason: `the desk has churn declared${desk.churn_utc ? ` since ${desk.churn_utc}` : ""}: batches are answered by a verification subagent on ${VERIFIER_MODEL}, and no lane load is paid`, flips: flip.flips };
+  if (flip.flips >= guardAt) return { route: "subagent", reason: `lane churn began: ${flip.flips} swaps away from the run's lane in the guard window \u2014 the verification goes to a subagent on ${VERIFIER_MODEL} (zero router swaps) instead of a lane load`, flips: flip.flips };
+  return { route: "swap", reason: `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
+}
+function verifierTaskCall(batch, ids, requests = []) {
+  return `task { "agent": "${VERIFIER_AGENT}", "name": "Verify${batch + 1}", "solutionSpace": "one batched verification pass, verdicts posted by id", "task": ${JSON.stringify(verifierTaskBody(batch, ids, requests))} }`;
+}
+function verifierTaskBody(batch, ids, requests = []) {
+  const rows = requests.map((r) => {
+    const checks = r.checks.map(([cmd, expected]) => `    - \`${cmd}\` (expected ${expected})`).join("\n");
+    return [`  - ${r.id} (worker ${r.agent}${r.task_id ? `, task ${r.task_id}` : ""}): ${r.objective}`, r.acceptance ? `    acceptance: ${r.acceptance}` : "", checks ? `  checks:
+${checks}` : ""].filter(Boolean).join("\n");
+  });
+  return [
+    `# Verification batch ${batch + 1}`,
+    "",
+    "You are the verification lane for this batch. You run on a non-router model, so you cost the",
+    "orchestrator ZERO lane swaps. Do NOT touch the basalt router (`/v1/load`, `setModel`), do NOT",
+    "edit any file, and do NOT verify anything outside the ids below \u2014 every other slice is in",
+    "another agent's hands and a second pass over it is the churn this route exists to avoid.",
+    "",
+    "Rules:",
+    "1. Run each check command yourself, in the session cwd, and judge the request on what it",
+    "   printed. A check you did not run cannot be accepted.",
+    "2. Read the diff (`git status --porcelain`, `git diff`) for the files each id names.",
+    "3. Post exactly one verdict per id with the `fade_verdicts` tool: `batch` is the number in",
+    `   the heading above (${batch + 1}), and \`verdicts: [{id, accepted, notes}]\`. \`notes\` names the`,
+    "   command and what it printed, or the cause the coder must fix. An id you did not judge is a",
+    "   defect, not a pass.",
+    "4. Report the verdicts verbatim in your final message; the desk is the durable record.",
+    "",
+    ids.length > 0 ? `Ids to judge: ${ids.join(", ")}` : "Ids to judge: (none \u2014 the batch was claimed empty; post nothing and end)",
+    rows.length > 0 ? `
+Requests:
+${rows.join("\n")}` : ""
+  ].join("\n");
+}
+function verifierDirective(batch, ids, reason, requests = []) {
+  return [
+    `Verification batch ${batch + 1} (${ids.length} worker request${ids.length === 1 ? "" : "s"}: ${ids.join(", ")}) is READY, and the loop will NOT pay a lane load for it.`,
+    `Reason: ${reason}`,
+    "",
+    "Do exactly this, once, in this turn:",
+    "1. Call the `task` tool with the verifier agent \u2014",
+    verifierTaskCall(batch, ids, requests),
+    `   (agent definition \`${VERIFIER_AGENT}\`, model \`${VERIFIER_MODEL}\`, off the router: no pack is loaded and no swap is paid).`,
+    "2. When it returns, the verdicts are already on the desk (`fade_verdicts` posted them), so the",
+    "   waiting workers unblock on their own. Do not re-run the checks in this session.",
+    "3. Do not call `fade_phase verification_done` for these ids from the code lane; the batch's",
+    "   verdicts are the worker-scoped answer. Act on a `needs_repair` verdict by fixing the cause.",
+    "",
+    "Do not load the thinking lane for this batch, and do not delegate the same ids twice."
+  ].join("\n");
+}
+function verifierAgentMd(model = VERIFIER_MODEL, agent = VERIFIER_AGENT) {
+  const offRouter = !isRouterModel(model);
+  const routerWarning = offRouter ? "" : `
+  # WARNING: ${model} IS a basalt ROUTER entry \u2014 a subagent on it pays the 13-25 s
+  # pack swap this agent exists to avoid, which is the churn the route was
+  # built to escape. Point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router
+  # model (e.g. ninfer-local/coder-gpu1) and re-run /orchestrate verifier install.
+`;
+  return [
+    "---",
+    `name: ${agent}`,
+    `description: Batched verification lane for the fade orchestrator: judges every request of one verification batch by id and posts the verdicts. Runs on ${model}${offRouter ? ", off the basalt router, so it costs zero lane swaps" : " \u2014 WARNING: a ROUTER entry, which pays the pack swap"}.`,
+    `model: "${model}"`,
+    "tools: read, grep, glob, bash, ls, fade_verdicts",
+    "---",
+    "",
+    `You are the fade orchestrator's **verification lane** for ONE batch.`,
+    routerWarning,
+    "You are handed a batch of worker requests, each with an id, an objective, an acceptance line",
+    "and check commands. Your job is to judge each of them, exactly once, and post the verdicts.",
+    "",
+    "- Run every check command yourself, in the session cwd, and judge on what it printed. A check",
+    "  you did not run cannot be accepted.",
+    "- Inspect the diff for the files a request names. `git status --porcelain`, `git diff`.",
+    "- You are READ-ONLY on the tree. Never edit, write, patch, commit, restart a service, touch the",
+    "  basalt router (`/v1/load`), or start a long-running process. Report the cause; the coder fixes it.",
+    "- Judge ONLY the ids in your batch. Verifying another agent's live slice is the churn this lane",
+    "  exists to prevent.",
+    "- Post exactly one verdict per id with the `fade_verdicts` tool: `{batch, verdicts:[{id,",
+    "  accepted, notes}]}`. In `notes`, name the command and what it printed, or the cause the coder",
+    "  must fix. Then print the verdicts verbatim as your final message.",
+    "- Data files (parquets, duckdb, `data/`) are read-only. Do not query a locked DuckDB writer.",
+    ""
+  ].join("\n");
+}
+var verifierAgentPath = (repo, agent = VERIFIER_AGENT) => `.omp/agents/${agent}.md`;
+var WORKER_AGENT = process.env.FADE_ORCHESTRATE_WORKER_AGENT ?? "fade-worker";
+function workerAgentMd(agent = WORKER_AGENT) {
+  return [
+    "---",
+    `name: ${agent}`,
+    "description: A delegated worker of the fade orchestrator: does one slice, then registers its own acceptance on the verification desk and waits for the verdict.",
+    "tools: read, grep, glob, bash, ls, write, edit, fade_verify",
+    "---",
+    "",
+    `You are one **worker** of a fade orchestrated run. You own the slice you were handed, and you`,
+    "verify your OWN acceptance line \u2014 never another worker's slice, and never the whole run.",
+    "",
+    "- Do the slice, then run the acceptance commands your task names, in the session cwd.",
+    "- Call `fade_verify` ONCE with: `objective` (the slice in one line), `acceptance` (the exact",
+    "  command and what it must print), `checks` (rows of [command, expected]), `files` (paths you",
+    "  touched), and `task_id` when your task names one.",
+    "- The tool answers with a request id (`V<batch>.<n>`). **Quote that id in your final message** \u2014",
+    "  it is the handle the verdict comes back on. The tool blocks until the verdict is posted, so",
+    "  do not answer before it returns; a `deferred` answer says the batch is still open, so report",
+    "  the id and the queue position, not a verdict you invented.",
+    "- NEVER call `fade_phase`, switch a model, touch the router (`/v1/load`), or post a verdict:",
+    "  the owner run claims the batch and answers it. A worker that certifies its own slice is the",
+    "  self-certification this desk exists to prevent.",
+    "- Data files (parquets, duckdb, `data/`) are read-only.",
+    ""
+  ].join("\n");
+}
+var workerAgentPath = (repo, agent = WORKER_AGENT) => `.omp/agents/${agent}.md`;
+function routeLine(route) {
+  return route.route === "subagent" ? `verification \u2192 ${VERIFIER_AGENT} on ${VERIFIER_MODEL} \xB7 zero lane loads` : `verification \u2192 ${THINK_LANE} lane \xB7 one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
+}
+
+// src/core.ts
 var execFileAsync = promisify(execFile);
 async function execGitAsync(repo, args, opts = {}) {
   const { stdout } = await execFileAsync("git", ["-C", repo, ...args], {
@@ -825,6 +999,11 @@ var briefings = {
         'this prompt carries the goal, the phase contract, the task definitions, the diff stat, the gate and the last rejections \u2014 nothing else. Re-reading a file you read this round, and pasting tool logs into "result", are what break the stable prefix the conversation cache reuses.',
         `Run each task's acceptance command and put what it printed in that task's "result". Do not commit.`
       ),
+      section(
+        "Delegated verification",
+        `A slice handed to a \`task\` worker can verify ITSELF: launch it as agent "${WORKER_AGENT}", whose definition carries the \`fade_verify\` tool. Its request joins the desk, the batch closes when every worker the round launched has registered, and ONE verification pass answers the whole batch by id.`,
+        `A worker launched on an agent whose tools do NOT carry \`fade_verify\` (a read-only reviewer, for example) runs its checks and cannot register; the census counted it, so the batch closes on the settle window instead of on its request \u2014 install the definition with \`/orchestrate verifier install\`.`
+      ),
       await gitCaveat(run.repo)
     );
   },
@@ -1210,150 +1389,6 @@ async function awaitVerdict(dir, runId, id, opts = {}) {
     }
     await sleep(pollMs);
   }
-}
-
-// src/subagent.ts
-var VERIFIER_AGENT = process.env.FADE_ORCHESTRATE_VERIFIER_AGENT ?? "fade-verifier";
-var VERIFIER_MODEL = process.env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
-var ROUTER_ENTRIES = [CODE_LANE, THINK_LANE, PROVIDER].map((s) => s.toLowerCase());
-function isRouterModel(model) {
-  const m = model.toLowerCase();
-  return ROUTER_ENTRIES.some((entry) => m === entry || m.startsWith(`${entry}/`) || m.includes(`/${entry}`) || m.startsWith(`${entry}:`));
-}
-var textOf = (v) => {
-  if (typeof v === "string") return v;
-  if (Array.isArray(v)) return v.map(textOf).join("\n");
-  return "";
-};
-function carriesVerification(body) {
-  if (/\bverif(y|ication|ied)\b/i.test(body)) return true;
-  if (/\bacceptance\b|\bgate\b|\baudit\b|promotion gate/i.test(body)) return true;
-  if (/\b(cargo (test|clippy)|pytest|node --test|npm (run )?test|playwright|tsc|typecheck|lint)\b/i.test(body)) return true;
-  return /\bverify\b|\bverify that\b|\bprove\b|\bscore\b|\bparit(?:y|es)\b/i.test(body);
-}
-function taskBatchOf(input) {
-  const items = [];
-  const list = Array.isArray(input?.tasks) ? input.tasks : [];
-  for (const item of list) {
-    const o = item !== null && typeof item === "object" && !Array.isArray(item) ? item : { task: String(item) };
-    items.push(o);
-  }
-  if (items.length === 0) {
-    const single = input?.task !== void 0 || input?.agent !== void 0;
-    if (single) items.push(input);
-  }
-  const kinds = items.map((o) => {
-    const agent = textOf(o.agent).trim() || textOf(o.name).trim() || "task";
-    const body = `${textOf(o.task)}
-${textOf(o.target)}
-${textOf(o.acceptance)}
-${textOf(o.solutionSpace)}`;
-    return { agent, verification: carriesVerification(body) };
-  });
-  const agents = kinds.map((k) => k.agent);
-  const verifyAgents = kinds.filter((k) => k.verification).map((k) => k.agent);
-  return {
-    count: Math.max(1, kinds.length),
-    agents: agents.length > 0 ? agents : ["task"],
-    verifyAgents,
-    carriesVerification: verifyAgents.length > 0,
-    kinds: kinds.length > 0 ? kinds : [{ agent: "task", verification: false }]
-  };
-}
-function routeFor(desk, flip, opts = {}) {
-  const guardAt = opts.guardAt ?? FLIP_MIN_SWAPS;
-  if (desk.churn) return { route: "subagent", reason: `the desk has churn declared${desk.churn_utc ? ` since ${desk.churn_utc}` : ""}: batches are answered by a verification subagent on ${VERIFIER_MODEL}, and no lane load is paid`, flips: flip.flips };
-  if (flip.flips >= guardAt) return { route: "subagent", reason: `lane churn began: ${flip.flips} swaps away from the run's lane in the guard window \u2014 the verification goes to a subagent on ${VERIFIER_MODEL} (zero router swaps) instead of a lane load`, flips: flip.flips };
-  return { route: "swap", reason: `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
-}
-function verifierTaskCall(batch, ids, requests = []) {
-  return `task { "agent": "${VERIFIER_AGENT}", "name": "Verify${batch + 1}", "solutionSpace": "one batched verification pass, verdicts posted by id", "task": ${JSON.stringify(verifierTaskBody(batch, ids, requests))} }`;
-}
-function verifierTaskBody(batch, ids, requests = []) {
-  const rows = requests.map((r) => {
-    const checks = r.checks.map(([cmd, expected]) => `    - \`${cmd}\` (expected ${expected})`).join("\n");
-    return [`  - ${r.id} (worker ${r.agent}${r.task_id ? `, task ${r.task_id}` : ""}): ${r.objective}`, r.acceptance ? `    acceptance: ${r.acceptance}` : "", checks ? `  checks:
-${checks}` : ""].filter(Boolean).join("\n");
-  });
-  return [
-    `# Verification batch ${batch + 1}`,
-    "",
-    "You are the verification lane for this batch. You run on a non-router model, so you cost the",
-    "orchestrator ZERO lane swaps. Do NOT touch the basalt router (`/v1/load`, `setModel`), do NOT",
-    "edit any file, and do NOT verify anything outside the ids below \u2014 every other slice is in",
-    "another agent's hands and a second pass over it is the churn this route exists to avoid.",
-    "",
-    "Rules:",
-    "1. Run each check command yourself, in the session cwd, and judge the request on what it",
-    "   printed. A check you did not run cannot be accepted.",
-    "2. Read the diff (`git status --porcelain`, `git diff`) for the files each id names.",
-    "3. Post exactly one verdict per id with the `fade_verdicts` tool: `batch` is the number in",
-    `   the heading above (${batch + 1}), and \`verdicts: [{id, accepted, notes}]\`. \`notes\` names the`,
-    "   command and what it printed, or the cause the coder must fix. An id you did not judge is a",
-    "   defect, not a pass.",
-    "4. Report the verdicts verbatim in your final message; the desk is the durable record.",
-    "",
-    ids.length > 0 ? `Ids to judge: ${ids.join(", ")}` : "Ids to judge: (none \u2014 the batch was claimed empty; post nothing and end)",
-    rows.length > 0 ? `
-Requests:
-${rows.join("\n")}` : ""
-  ].join("\n");
-}
-function verifierDirective(batch, ids, reason, requests = []) {
-  return [
-    `Verification batch ${batch + 1} (${ids.length} worker request${ids.length === 1 ? "" : "s"}: ${ids.join(", ")}) is READY, and the loop will NOT pay a lane load for it.`,
-    `Reason: ${reason}`,
-    "",
-    "Do exactly this, once, in this turn:",
-    "1. Call the `task` tool with the verifier agent \u2014",
-    verifierTaskCall(batch, ids, requests),
-    `   (agent definition \`${VERIFIER_AGENT}\`, model \`${VERIFIER_MODEL}\`, off the router: no pack is loaded and no swap is paid).`,
-    "2. When it returns, the verdicts are already on the desk (`fade_verdicts` posted them), so the",
-    "   waiting workers unblock on their own. Do not re-run the checks in this session.",
-    "3. Do not call `fade_phase verification_done` for these ids from the code lane; the batch's",
-    "   verdicts are the worker-scoped answer. Act on a `needs_repair` verdict by fixing the cause.",
-    "",
-    "Do not load the thinking lane for this batch, and do not delegate the same ids twice."
-  ].join("\n");
-}
-function verifierAgentMd(model = VERIFIER_MODEL, agent = VERIFIER_AGENT) {
-  const offRouter = !isRouterModel(model);
-  const routerWarning = offRouter ? "" : `
-  # WARNING: ${model} IS a basalt ROUTER entry \u2014 a subagent on it pays the 13-25 s
-  # pack swap this agent exists to avoid, which is the churn the route was
-  # built to escape. Point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router
-  # model (e.g. ninfer-local/coder-gpu1) and re-run /orchestrate verifier install.
-`;
-  return [
-    "---",
-    `name: ${agent}`,
-    `description: Batched verification lane for the fade orchestrator: judges every request of one verification batch by id and posts the verdicts. Runs on ${model}${offRouter ? ", off the basalt router, so it costs zero lane swaps" : " \u2014 WARNING: a ROUTER entry, which pays the pack swap"}.`,
-    `model: "${model}"`,
-    "tools: read, grep, glob, bash, ls, fade_verdicts",
-    "---",
-    "",
-    `You are the fade orchestrator's **verification lane** for ONE batch.`,
-    routerWarning,
-    "You are handed a batch of worker requests, each with an id, an objective, an acceptance line",
-    "and check commands. Your job is to judge each of them, exactly once, and post the verdicts.",
-    "",
-    "- Run every check command yourself, in the session cwd, and judge on what it printed. A check",
-    "  you did not run cannot be accepted.",
-    "- Inspect the diff for the files a request names. `git status --porcelain`, `git diff`.",
-    "- You are READ-ONLY on the tree. Never edit, write, patch, commit, restart a service, touch the",
-    "  basalt router (`/v1/load`), or start a long-running process. Report the cause; the coder fixes it.",
-    "- Judge ONLY the ids in your batch. Verifying another agent's live slice is the churn this lane",
-    "  exists to prevent.",
-    "- Post exactly one verdict per id with the `fade_verdicts` tool: `{batch, verdicts:[{id,",
-    "  accepted, notes}]}`. In `notes`, name the command and what it printed, or the cause the coder",
-    "  must fix. Then print the verdicts verbatim as your final message.",
-    "- Data files (parquets, duckdb, `data/`) are read-only. Do not query a locked DuckDB writer.",
-    ""
-  ].join("\n");
-}
-var verifierAgentPath = (repo, agent = VERIFIER_AGENT) => `.omp/agents/${agent}.md`;
-function routeLine(route) {
-  return route.route === "subagent" ? `verification \u2192 ${VERIFIER_AGENT} on ${VERIFIER_MODEL} \xB7 zero lane loads` : `verification \u2192 ${THINK_LANE} lane \xB7 one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
 }
 
 // src/ui.ts
@@ -3695,20 +3730,24 @@ ${SCHEMA_HINT}` : text);
       if (first === "verifier") {
         const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
         const abs = join7(ctx.cwd, verifierAgentPath(ctx.cwd));
+        const absWorker = join7(ctx.cwd, workerAgentPath(ctx.cwd));
         if (sub === "install") {
           try {
             mkdirSync2(join7(ctx.cwd, ".omp", "agents"), { recursive: true });
             writeFileSync2(abs, verifierAgentMd());
+            writeFileSync2(absWorker, workerAgentMd());
           } catch (e) {
             ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
             return;
           }
           const warn = isRouterModel(VERIFIER_MODEL) ? ` WARNING: ${VERIFIER_MODEL} is a ROUTER entry \u2014 a subagent on it pays the very swap this agent exists to avoid; point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1)` : "";
-          ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) \u2014 the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
+          ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) and ${workerAgentPath(ctx.cwd)} (inherits the code lane; its tools carry fade_verify) \u2014 the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
           return;
         }
         const installed = existsSync(abs);
+        const installedWorker = existsSync(absWorker);
         ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} \xB7 model ${VERIFIER_MODEL} \xB7 ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
+        ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} \xB7 inherits the code lane \xB7 ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} \u2014 a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
         if (installed) ctx.ui.notify(`orchestrate: ${readFileSync3(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
         return;
       }
@@ -4031,7 +4070,11 @@ ${SCHEMA_HINT}`);
       const batch = taskBatchOf(event.input);
       if (batch.carriesVerification) {
         await mutateDesk(runDir, run.run_id, (d) => noteTaskBatch(d, { count: batch.verifyAgents.length, agents: batch.verifyAgents }));
-        ctx.ui.notify(`orchestrate: task call carries ${batch.count} worker(s), ${batch.verifyAgents.length} with verification work \u2014 the desk batch closes at ${batch.verifyAgents.length} registration(s)`, "info");
+        const notWorker = batch.verifyAgents.filter((a) => a !== WORKER_AGENT);
+        ctx.ui.notify(
+          `orchestrate: task call carries ${batch.count} worker(s), ${batch.verifyAgents.length} with verification work \u2014 the desk batch closes at ${batch.verifyAgents.length} registration(s)${notWorker.length > 0 ? `; ${notWorker.join(", ")} ${notWorker.length > 1 ? "do" : "does"} not carry \`fade_verify\` by definition, so ${notWorker.length > 1 ? "they may" : "it may"} run the checks and never register \u2014 launch verification workers as "${WORKER_AGENT}" (/orchestrate verifier install)` : ""}`,
+          notWorker.length > 0 ? "warning" : "info"
+        );
       }
       return void 0;
     }

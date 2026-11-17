@@ -45,7 +45,7 @@ import {
 	deskPath,
 	type VerifyRequest,
 } from "./desk.ts";
-import { VERIFIER_AGENT, VERIFIER_MODEL, isRouterModel, routeFor, routeLine, taskBatchOf, verifierAgentMd, verifierAgentPath, verifierDirective } from "./subagent.ts";
+import { VERIFIER_AGENT, VERIFIER_MODEL, WORKER_AGENT, isRouterModel, routeFor, routeLine, taskBatchOf, verifierAgentMd, verifierAgentPath, verifierDirective, workerAgentMd, workerAgentPath } from "./subagent.ts";
 import {
 	ACTIVE_FILENAME,
 	DEFAULT_ROUNDS,
@@ -1628,20 +1628,26 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// is an env var plus a re-install, not an edit of a checked-in file.
 				const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
 				const abs = join(ctx.cwd, verifierAgentPath(ctx.cwd));
+				const absWorker = join(ctx.cwd, workerAgentPath(ctx.cwd));
 				if (sub === "install") {
+					// TWO definitions, one act: the verifier (pinned off the router) and the WORKER
+					// (whose `tools:` line carries fade_verify, which is what lets it register at all).
 					try {
 						mkdirSync(join(ctx.cwd, ".omp", "agents"), { recursive: true });
 						writeFileSync(abs, verifierAgentMd());
+						writeFileSync(absWorker, workerAgentMd());
 					} catch (e) {
 						ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
 						return;
 					}
 					const warn = isRouterModel(VERIFIER_MODEL) ? ` WARNING: ${VERIFIER_MODEL} is a ROUTER entry — a subagent on it pays the very swap this agent exists to avoid; point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1)` : "";
-					ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) — the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
+					ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) and ${workerAgentPath(ctx.cwd)} (inherits the code lane; its tools carry fade_verify) — the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
 					return;
 				}
 				const installed = existsSync(abs);
+				const installedWorker = existsSync(absWorker);
 				ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} · model ${VERIFIER_MODEL} · ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
+				ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} · inherits the code lane · ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} — a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
 				if (installed) ctx.ui.notify(`orchestrate: ${readFileSync(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
 				return;
 			}
@@ -2056,7 +2062,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const batch = taskBatchOf(event.input);
 			if (batch.carriesVerification) {
 				await mutateDesk(runDir, run.run_id, (d) => noteTaskBatch(d, { count: batch.verifyAgents.length, agents: batch.verifyAgents }));
-				ctx.ui.notify(`orchestrate: task call carries ${batch.count} worker(s), ${batch.verifyAgents.length} with verification work — the desk batch closes at ${batch.verifyAgents.length} registration(s)`, "info");
+				// Measured in a live run: a `scout` worker registered, a read-only `reviewer` ran the
+				// checks and NEVER registered, so the batch waited on a worker that could not arrive. The
+				// census says so at the launch, naming the agent that carries the tool by definition.
+				const notWorker = batch.verifyAgents.filter((a) => a !== WORKER_AGENT);
+				ctx.ui.notify(
+					`orchestrate: task call carries ${batch.count} worker(s), ${batch.verifyAgents.length} with verification work — the desk batch closes at ${batch.verifyAgents.length} registration(s)${notWorker.length > 0 ? `; ${notWorker.join(", ")} ${notWorker.length > 1 ? "do" : "does"} not carry \`fade_verify\` by definition, so ${notWorker.length > 1 ? "they may" : "it may"} run the checks and never register — launch verification workers as "${WORKER_AGENT}" (/orchestrate verifier install)` : ""}`,
+					notWorker.length > 0 ? "warning" : "info",
+				);
 			}
 			return undefined;
 		}

@@ -232,11 +232,17 @@ recorded on the desk batch and in the run's rejection history, holds for every l
 run, and is released by `/orchestrate lanes reset`.
 
 - `/orchestrate desk` — the queue: batch epoch, open / awaiting-verdict / answered counts, churn state, verifier model.
-- `/orchestrate verifier install` — write `.omp/agents/fade-verifier.md`, the definition the `task` tool resolves; `verifier show` prints it and says whether it is installed.
+- `/orchestrate verifier install` — write TWO definitions in one act: `.omp/agents/fade-verifier.md` (the batch judge, pinned to a non-router model) and `.omp/agents/fade-worker.md` (the worker, whose `tools:` line carries `fade_verify`). `verifier show` prints both and says which are installed.
 - `fade_verdicts {batch, verdicts}` — the desk write for a verifier that runs **outside** the phase protocol (the subagent): post the verdicts by id, fan them out, unblock the workers.
 
 A prose answer never unblocks a worker: only a verdict written to the desk does. A worker that
 cannot reach the desk **refuses** — it never answers optimistically on the router's state.
+
+**A worker registers only if its agent definition lists the tool.** Measured in a live run: a `scout`
+worker registered, and a read-only `reviewer` ran its checks and never did — so the census counted a
+worker that could not arrive and the batch closed on the settle window instead of on its request. The
+census says that at the launch, naming the agent, and the coder's window page names `fade-worker` as
+the agent to delegate a verifying slice to.
 
 The desk's schema, closure rules and measured invariants: [`docs/DELEGATION.md`](docs/DELEGATION.md).
 

@@ -61,6 +61,9 @@ thing in this system is a lane load, not a prompt.
    batch.
 2. **Register.** A worker calls `fade_verify` → `V<b>.<n>` appended to the current epoch. The answer
    carries its queue position (`1/2 registered`), never a lane.
+   The host exposes a tool to a subagent only through the agent's definition, so a verifying worker
+   is launched as `fade-worker` — the definition `/orchestrate verifier install` writes, whose
+   `tools:` line carries `fade_verify`. It pins NO model: a worker inherits the run's code lane.
 3. **Close.** The batch is ready when every expected worker registered, **or** the launching call
    sealed and all expected registered, **or** the epoch is older than
    `FADE_ORCHESTRATE_VERIFY_SETTLE_S` (8 s) with requests in it, **or** every launched worker has
@@ -78,6 +81,20 @@ thing in this system is a lane load, not a prompt.
 Gates, each named in its refusal: answering a batch the desk has not claimed; a verdict for an id
 that belongs to another batch (its batch's ids are listed); a `verification_done` whose `verdicts`
 omit any id of the claimed batch.
+
+## The worker's `tools:` line is the registration
+
+Measured in a live run (`20261117T165329Z`, one `task` call carrying a gate-rig worker and a
+unit-suite worker): the `scout` worker registered, the default `task` agent registered, and the
+read-only `reviewer` **ran its checks and never registered** — its definition does not list
+`fade_verify`, so the tool is not in its session. The census had counted it, so `expected` included a
+worker that could not arrive and the batch closed on the settle window, not on its request.
+
+Three things close that gap: `/orchestrate verifier install` writes `fade-worker` next to
+`fade-verifier`; the census at the launch warns, naming any verification-carrying agent that is not
+`fade-worker`; and the coder's window page names `fade-worker` as the agent to delegate a verifying
+slice to. `verifier show` says which of the two definitions is installed, and why the worker one
+matters.
 
 ## The churn route
 
@@ -128,7 +145,8 @@ its model resolves to the router.
 | Command | Proves |
 |---|---|
 | `node --test test/desk.test.mjs` | the desk over a temp tree: closure rules, one-use claims, verdict fan-out, churn marking, the 1-based label at the boundary |
-| `node --test test/subagent.test.mjs` | the census of both `task` forms, the verification-verb set, the route decision, the refusal for a router model, the agent definition's front matter |
+| `node --test test/subagent.test.mjs` | the census of both `task` forms, the verification-verb set, the route decision, the refusal for a router model, the verifier's front matter, and the worker definition's `tools:` carrying `fade_verify` while posting no verdict |
 | `node test/gate_rig.mjs` (block 21) | one worker registering pays **zero** loads while its peer is unregistered; a closed batch pays **exactly one** load for both requests; the briefing carries both check commands; a mid-pass arrival is batch 2; verdicts fan out by id; the three gates refuse by name |
 | `node test/gate_rig.mjs` (block 19b) | the thrash breaker **marks the desk** and routes the batch it halts, at zero loads |
 | `node test/gate_rig.mjs` (block 22) | under churn: zero loads, one claim routed `subagent`, the directive carries the off-router model and every worker's check command, the route **stays** for the next batch, `lanes reset` releases it |
+| live `/orchestrate` run over `omp --mode rpc` | the census counted 2 verification workers, `scout` registered `V1.1` and the default `task` agent `V1.2`, the read-only `reviewer` registered NOTHING, and the desk held the batch open with zero lane loads |
