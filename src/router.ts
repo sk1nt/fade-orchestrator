@@ -144,7 +144,10 @@ export const SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?
  *    serve — unreachable, an error state, a loaded context naming no model, zero/low free VRAM,
  *    a swap still in flight — is REFUSED with the class named, and `/v1/load` is never sent.
  */
-export async function loadLane(lane: string): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
+// `lease: true` asks the router for the DURABLE load: the lane stays resident until
+// `releaseLease`, and a request naming any other model is refused (409) instead of swapping
+// the lane out — the run's advisory lane runs its full turn.
+export async function loadLane(lane: string, opts: { lease?: boolean } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
 	const t0 = Date.now();
 	// Settle any in-flight swap FIRST and keep the health line the window ended on — that
 	// reading is the gate's evidence.
@@ -166,13 +169,32 @@ export async function loadLane(lane: string): Promise<{ ok: boolean; detail: str
 		const r = await fetch(`${ROUTER}/v1/load`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ model: lane }),
+			body: JSON.stringify({ model: lane, ...(opts.lease ? { lease: true, owner: "fade_orchestrate" } : {}) }),
 			signal: AbortSignal.timeout(240_000),
 		});
 		const text = await r.text();
 		return { ok: r.ok, detail: `http ${r.status} ${text.length > 300 ? `${text.slice(0, 300)}...` : text}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	} catch (e) {
 		return { ok: false, detail: `${msg(e)}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+	}
+}
+
+/** End the durable load taken by `loadLane(lane, { lease: true })`. The router lands its default
+ *  lane (flash-next) on release, so ending a run never leaves the box pinned to the run's lane.
+ *  Releasing a lease that is not held is a no-op at the router. Best-effort by contract: the run's
+ *  end must not die on a dead router. */
+export async function releaseLease(lane: string): Promise<{ ok: boolean; detail: string }> {
+	try {
+		const r = await fetch(`${ROUTER}/v1/load`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ model: lane, lease: false }),
+			signal: AbortSignal.timeout(10_000),
+		});
+		const text = await r.text();
+		return { ok: r.ok, detail: `http ${r.status} ${text.slice(0, 200)}` };
+	} catch (e) {
+		return { ok: false, detail: msg(e) };
 	}
 }
 

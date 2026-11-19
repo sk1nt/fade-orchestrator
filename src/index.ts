@@ -23,7 +23,7 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
+import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, releaseLease, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
 import {
 	DESK_DEADLINE_MS,
 	DESK_SETTLE_MS,
@@ -404,6 +404,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		lockDir = undefined;
 	};
 
+	/** Hand the router lease back at every end of a run: the router lands its DEFAULT lane
+	 *  (flash-next) on release, so no finished run pins the box to the run's lane. Best-effort —
+	 *  a dead router must never take a run's end down with it. */
+	const endLease = (lane: string | null | undefined, ctx: ExtensionContext): void => {
+		if (!lane) return;
+		void releaseLease(lane).then((r) => {
+			if (!r.ok) ctx.ui.notify(`orchestrate: lane lease release failed: ${r.detail}`, "warning");
+		});
+	};
+
 	/**
 	 * The ON-DISK run, for the verifier sandbox, which asks on EVERY tool call. `readFileSync` +
 	 * `JSON.parse` there parsed the whole state per call, on the host's loop. The file's
@@ -547,6 +557,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run.state = "failed";
 			run.reason = reason;
 			releaseLock();
+			endLease(run.lane, ctx);
 			void persist().catch(warnWrite(ctx, "fail"));
 			paint(ctx);
 		}
@@ -792,7 +803,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			paint(ctx);
 		});
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
-		const loaded = await loadLane(lane);
+		const loaded = await loadLane(lane, { lease: true });
 		if (gen !== switchGen) {
 			// The pill, the row and the briefing belong to the switch that superseded this one; the
 			// watch is the only thing here that outlives the call, so it is the thing cancelled.
@@ -1291,7 +1302,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			classifyTurnEnd(run, true);
 			// A terminal state releases the router claim in the same keystroke, so the next session
 			// starts without a manual release. Owner-only: an adopted run holds no claim of its own.
-			if (applied.nextState === "complete" || applied.nextState === "failed") releaseLock();
+			if (applied.nextState === "complete" || applied.nextState === "failed") {
+				releaseLock();
+				endLease(run.lane, ctx);
+			}
 			let checkpointNote = "";
 			if (params.phase === "verification_done" && applied.nextState === "complete") {
 				// Tag the tree at the moment each task was accepted, namespaced per run.
@@ -1801,9 +1815,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					if (runDir) writeJson(statePath(), run);
 				}
 				releaseLock();
+				endLease(run.lane, ctx);
 				pending = undefined;
 				clearSurface(ctx);
-				ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
+				ctx.ui.notify(`orchestrate: stopped; lane lease released, the router lands its default lane; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
 					try {
 						unlinkSync(join(runDir!, ACTIVE_FILENAME));
@@ -1860,8 +1875,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
 			// in this run reads a pre-load engine state.
 			engineProofInvalidate();
-			const loaded = await loadLane(THINK_LANE);
-			ctx.ui.setWorkingMessage();
+			const loaded = await loadLane(THINK_LANE, { lease: true });
 			if (!loaded.ok) {
 				// A start that never began releases its claim: a preflight failure must not strand
 				// the router behind a run that does not exist.

@@ -31,6 +31,13 @@ carries no host-specific code.
   the queued requests name — measured live as a 0–2 s ping-pong. `loadLane` settles an in-flight
   swap first and returns without reloading the resident pack, so a load the resident entry already
   covers never re-reads 52 GiB.
+- **Durable load (lane lease).** `loadLane(lane, { lease: true })` asks the router to pin the lane
+  for the run: a request naming any other model answers 409 instead of queueing, so the resident
+  pack survives the whole advisory turn — the ping-pong above is ended at the router, not only
+  avoided client-side. The run acquires the lease at preflight and on every `switchLane`, and hands
+  it back at every end — complete, failed, stopped — where the router lands its **default** lane
+  (the code lane), so a finished run never pins the box. Release is best-effort: a dead router
+  answers `ok: false`, the run's end never dies on it (`test/lease.test.mjs`).
 - **Lane thrash breaker.** Swaps the router reports away from the run's lane are counted in a
   window. Past `FADE_ORCHESTRATE_FLIP_BREAKER_AT` (4) the loop stops paying: no `setModel`, no
   `POST /v1/load`, the run pauses with the flips, the window and the competing entry in its operator
