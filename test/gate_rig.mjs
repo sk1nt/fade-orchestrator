@@ -53,6 +53,15 @@
 //      judged AT THE NEW ROOT, both refreshes are announced, and the taken repair is written back
 //      as the loop's own record — the live failure it guards is a run rooted at repo A whose tasks
 //      and rows name repo B, gate red every round on rows that pass rc=0 at B.
+//  29. A FINISHED RUN OWNS NOTHING, AND ITS DESK IS CLOSED AT THE DOOR. `state.json` is ONE slot
+//      that keeps naming the last run, so every later session in the repo adopts it. Proved: the
+//      adoption is RECORDS-ONLY — no login line, NO metrics poll (the LIVE adoption in the same
+//      block is the control that pays the router reads, the finished one pays ZERO), the status row
+//      stays cleared — while `/orchestrate status` and the panel keep answering the run. And
+//      `fade_verify` answers in the same tick with the cause instead of parking its worker for
+//      `DESK_WAIT_MS` on a batch `dispatchDeskBatch` refuses for a terminal run (index.ts:626),
+//      `fade_verdicts` writes nothing into a dead desk, no `verify/desk.json` is created, and the
+//      block pays ZERO `POST /v1/load`.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
@@ -1290,12 +1299,6 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
     gate3 = e.message;
   }
   ok("the round's `verdicts` must cover EVERY id of the claimed batch, named", /V1\.2 has no verdict row/.test(gate3), gate3.slice(0, 300));
-  // The verifier answers the claimed batch BY ID; that write is what unblocks the workers.
-  const vd = await exec("verification_done", { verdict: "accepted", checks: [["node --test test/desk.test.mjs", "rc 0"], ["bash -lc 'echo ok'", "rc 0"]], notes: "both checks re-run this turn", tasks: [], verdicts: [{ id: "V1.1", accepted: true, notes: "node --test: 234 pass" }, { id: "V1.2", accepted: true, notes: "bash echo ok: rc 0" }] });
-  const deskAfter = readDeskFile();
-  ok("the verdicts fanned onto the requests by id, so the blocked workers return", deskAfter.requests.filter((r) => r.verdict?.accepted === true).map((r) => r.id).join(",") === "V1.1,V1.2", JSON.stringify(deskAfter.requests.map((r) => [r.id, r.verdict])));
-  ok("the phase result names the batch it answered", /desk batch 1 answered for 2 worker request\(s\) \(2 accepted\)/.test(vd.content[0].text), vd.content[0].text.slice(0, 220));
-  ok("the claimed batch is closed in the run state, so it cannot be answered again", readState().verify_batch === undefined, JSON.stringify(readState().verify_batch));
   // The gates on the verifier's answer.
   let gate1 = "";
   try {
@@ -1311,6 +1314,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
     gate2 = e.message;
   }
   ok("a verdict for an id outside the claimed batch is refused with that batch's ids", /V9\.9 is not part of batch 1 \(its ids: V1\.1, V1\.2\)/.test(gate2), gate2.slice(0, 260));
+  // The verifier answers the claimed batch BY ID; that write is what unblocks the workers.
+  const vd = await exec("verification_done", { verdict: "accepted", checks: [["node --test test/desk.test.mjs", "rc 0"], ["bash -lc 'echo ok'", "rc 0"]], notes: "both checks re-run this turn", tasks: [], verdicts: [{ id: "V1.1", accepted: true, notes: "node --test: 234 pass" }, { id: "V1.2", accepted: true, notes: "bash echo ok: rc 0" }] });
+  const deskAfter = readDeskFile();
+  ok("the verdicts fanned onto the requests by id, so the blocked workers return", deskAfter.requests.filter((r) => r.verdict?.accepted === true).map((r) => r.id).join(",") === "V1.1,V1.2", JSON.stringify(deskAfter.requests.map((r) => [r.id, r.verdict])));
+  ok("the phase result names the batch it answered", /desk batch 1 answered for 2 worker request\(s\) \(2 accepted\)/.test(vd.content[0].text), vd.content[0].text.slice(0, 220));
+  ok("the claimed batch is closed in the run state, so it cannot be answered again", readState().verify_batch === undefined, JSON.stringify(readState().verify_batch));
   notes.length = 0;
   await commands.orchestrate.handler("desk", ctx);
   const deskNote = notes.join("\n");
@@ -1557,6 +1566,78 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   delete process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN;
   delete process.env.STUB_PROMPT_LOG;
   delete process.env.STUB_ARGS_LOG;
+}
+
+// 29. A FINISHED RUN OWNS NOTHING, AND ITS DESK IS CLOSED AT THE DOOR. See the header.
+{
+  resident = "flash-next";
+  swapLine = null;
+  const deskFile29 = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
+  rmSync(deskFile29, { force: true });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // THE CONTROL. A run that can still act starts its metrics poll at `session_start`, and that poll
+  // reads the router immediately. Without this row the finished run's zero-read assertion is
+  // vacuous: a router nobody polls answers zero reads whether the timer exists or not.
+  writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
+  const rLive = reqLog.length;
+  await hooks.session_start({}, ctx);
+  await sleep(120);
+  const liveReads = reqLog.length - rLive;
+  ok("a LIVE run's adoption reads the router: the control a zero-read proof needs", liveReads >= 1, `reads=${liveReads}`);
+  // The login notify is DEFERRED 500 ms (it is scheduled past the host's TUI attach), and every
+  // earlier block's `session_start` scheduled one of its own. Drain them FIRST, then open the
+  // window: from here, what `notes` carries is ONLY what a finished run's adoption says.
+  await sleep(600);
+  ok("a live run's adoption DOES print its line: the silence below is specific to a finished run", notes.some((n) => /run GATE1 is coding/.test(n)), JSON.stringify(notes.slice(-2)));
+
+  // The FINISHED run, adopted as the repo's last record.
+  writeState({
+    ...seedState("complete", [["true", "green"]]),
+    tasks: [{ ...task("T1"), status: "passed" }, { ...task("T2"), status: "passed" }],
+    schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [],
+  });
+  notes.length = 0;
+  sent.length = 0;
+  const base29 = loads();
+  const r29 = reqLog.length;
+  await hooks.session_start({}, ctx);
+  await sleep(700); // the login notify is deferred 500 ms; silence is only proved past it
+  ok("a finished run reads the router ZERO times at login: no metrics poll for a dead lane", reqLog.length - r29 === 0, `reads=${reqLog.length - r29}`);
+  ok("a finished run says NOTHING at login", notes.length === 0, JSON.stringify(notes));
+  ok("the finished run's status row stays cleared", !widgets.has("fade-top"), JSON.stringify([...widgets.keys()]));
+
+  // The desk, closed at the door. A terminal run is refused by `dispatchDeskBatch` (index.ts:626),
+  // so a request registered here is not late — it is unanswerable, and the worker pays the whole
+  // DESK_WAIT_MS for nothing. The refusal must be same-tick and must write nothing.
+  const t29 = Date.now();
+  let refuseV = "";
+  try {
+    await tools.fade_verify.execute("w1", { objective: "T1 after the run ended", acceptance: "node --test exits 0", checks: [["node --test test/desk.test.mjs", "exit 0"]] }, null, null, ctx);
+  } catch (e) {
+    refuseV = e.message;
+  }
+  const refuseMs = Date.now() - t29;
+  ok("fade_verify refuses a finished run's desk, naming the run, its state and that nothing was written", /run GATE1 is complete/.test(refuseV) && /Nothing was written/.test(refuseV), refuseV.slice(0, 240));
+  ok("the refusal is INSTANT: no DESK_WAIT_MS park on a batch nobody will ever claim", refuseMs < 1000, `${refuseMs}ms`);
+  let refuseD = "";
+  try {
+    await tools.fade_verdicts.execute("v1", { batch: 1, verdicts: [{ id: "V1.1", accepted: true, notes: "answered a dead run" }] }, null, null, ctx);
+  } catch (e) {
+    refuseD = e.message;
+  }
+  ok("fade_verdicts refuses to answer a finished run's desk, by name", /run GATE1 is complete/.test(refuseD) && /Nothing was written/.test(refuseD), refuseD.slice(0, 240));
+  ok("the refusal wrote NO desk file: a finished run never gains a batch it cannot answer", !existsSync(deskFile29), deskFile29);
+
+  // The records survive: the finished run stays readable to the operator, which is why it is adopted.
+  notes.length = 0;
+  await commands.orchestrate.handler("status", ctx);
+  ok("the finished run is kept for its RECORDS: /orchestrate status answers it", notes.some((n) => /orchestrate GATE1: complete/.test(n)), JSON.stringify(notes));
+  const open29 = inputHandlers[inputHandlers.length - 1]?.("\x1bf");
+  await sleep(300);
+  const panel29 = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
+  ok("the Alt+F screen still opens over the finished run (engine columns, swaps, claim)", open29?.consume === true && panel29.includes("fade-orchestrator GATE1"), panel29.slice(0, 200));
+  ok("a finished run pays ZERO POST /v1/load across the whole block", loads() === base29, `extra=${loads() - base29}`);
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

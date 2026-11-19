@@ -169,6 +169,12 @@ generate-time 401, which is why a `GET`-shaped probe is not accepted. The readin
   optimistically from the router's state.
 - A worker blocks for at most `timeout_s` (default 600, cap 1800). It returns `deferred` with the
   batch and queue position; the verdict, whenever it lands, is what unblocks the next round.
+- A **finished run's desk is closed at the door.** `state.json` is one slot that keeps naming the last
+  run, so a worker spawned later registers into *it*. `dispatchDeskBatch` will never claim a batch for
+  a run in `complete`/`failed`/`stopped`, so `fade_verify` refuses that registration **in the same
+  tick**, naming the run and its state, and `fade_verdicts` refuses to answer it. A
+  `DESK_WAIT_MS` timeout is the honest answer for a batch that is **owed**; for a run that has ended
+  there is nothing owed, so the worker is told so immediately and nothing is written.
 - A plain worker's request is not awaited by the batch census; the batch never waits on a worker
   that has no verification to ask for.
 
@@ -181,6 +187,7 @@ generate-time 401, which is why a `GET`-shaped probe is not accepted. The readin
 | `node test/gate_rig.mjs` (block 21) | one worker registering pays **zero** loads while its peer is unregistered; a closed batch pays **exactly one** load for both requests; the briefing carries both check commands; a mid-pass arrival is batch 2; verdicts fan out by id; the three gates refuse by name |
 | `node test/gate_rig.mjs` (block 19b) | the thrash breaker **marks the desk** and routes the batch it halts, at zero loads |
 | `node test/gate_rig.mjs` (block 22) | under churn: zero loads, one claim routed `subagent`, the directive carries the off-router model and every worker's check command, the route **stays** for the next batch, `lanes reset` releases it |
+| `node test/gate_rig.mjs` (block 29) | a finished run is adopted for its **records** and owns nothing: **zero** router reads at login where the live adoption in the same block pays them, no login line, the status row cleared, while `/orchestrate status` and the Alt+F screen keep answering it; `fade_verify` refuses its desk **in 0 ms** by name, `fade_verdicts` writes no `verify/desk.json`, and the block pays **zero** `POST /v1/load` |
 | `node --test test/lane.test.mjs` | the provider scan in BOTH `models.yml` forms (the operator's file is the mapping form — a scan that reads only sequences reports every provider missing and prices a swap on every churn batch), the spec resolution, the completion probe through the lane's own auth path, the unset-header rule, the cache window, the disabled state, and the router-entry refusal at ZERO requests |
 | `node --test test/triage.test.mjs` | the triage prompt carries the gate's own rows, the CLI call is tool-less/one-turn/bounded, every failure path returns an empty note, and a banner before the JSON still decodes |
 | `node test/gate_rig.mjs` (block 27) | claim-time guard: a lane that refuses the completion routes `swap` at ONE load with the probe named in the history; a lane that answers keeps `subagent` at ZERO loads; the owed census names ids and does NOT count judged ones |

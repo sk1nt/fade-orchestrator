@@ -1420,6 +1420,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const active = await readJsonAsync<{ run_id?: string }>(join(dir, ACTIVE_FILENAME));
 			const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : undefined;
 			if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against — nothing was written`);
+			// A TERMINAL run's desk has no dispatcher, so this is not a late request: it is an
+			// UNANSWERABLE one. `dispatchDeskBatch` refuses a terminal run (index.ts:626) and
+			// `fade_phase` refuses it (index.ts:1163); `state.json` is ONE slot that keeps naming the
+			// last run forever, so a worker spawned in this repo after the run ended would register
+			// into a dead desk, block the whole `DESK_WAIT_MS`, exit DEFERRED with nothing judged, and
+			// leave the request on a desk the next start archives. Refuse at the door, naming the
+			// cause the way `fade_phase` names its own, and write nothing.
+			if (state && TERMINAL[state.state] === true) {
+				throw new Error(`fade_verify: run ${runId} is ${state.state}, so its desk has no owner to run the verification pass. A request registered here is never answered: it would block for ${Math.round(DESK_WAIT_MS / 1000)}s and be DEFERRED with nothing judged. Report your slice in your final message; the session that owns live work dispatches its own desk. Nothing was written`);
+			}
 			const rows: unknown[] = Array.isArray(params.checks) ? params.checks : [];
 			const agent = isWorkerSession(ctx) ? workerName(ctx) : "owner";
 			let captured: { request: VerifyRequest; deduped: boolean } | undefined;
@@ -1487,6 +1497,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const active = await readJsonAsync<{ run_id?: string }>(join(dir, ACTIVE_FILENAME));
 			const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : undefined;
 			if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
+			// The same rule as `fade_verify`: a finished run answers no batch, and a verdict written
+			// into a dead desk is read by no session — the ids it names belong to nobody.
+			if (state && TERMINAL[state.state] === true) {
+				throw new Error(`fade_verdicts: run ${runId} is ${state.state}, so no session is waiting on its desk; a verdict written into a finished run's desk is read by nobody. Nothing was written`);
+			}
 			// The public batch number is the LABEL the briefing and the desk print (1-based); the
 			// desk's internal epoch is 0-based. One conversion at the boundary, so no reader ever
 			// meets two numbering systems for the same batch.
@@ -1953,19 +1968,32 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run = normalizeRun(state);
 			settledNotified = false;
 			paint(ctx);
-			startMetricsTimer();
-			if (TERMINAL[state.state] === true) {
-				runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
-			} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-				// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
-				// same line as everything else the login says.
-				setTimeout(async () => {
-					const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-					if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
-				}, 250);
-				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
-			} else {
-				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
+			// A FINISHED run is adopted for its RECORDS, and for nothing that acts: the panel's engine
+			// columns, `/orchestrate status|desk|runs` and the archive the next start all read the
+			// adopted run, so `run`/`runDir` stay set. It owns no lane and no protocol — `statusLines`
+			// clears the status row for a terminal run, `fade_phase` refuses it, and the desk verbs
+			// refuse it by name — so it starts NO metrics timer. That tick exists to watch the lane a
+			// LIVE run holds; on a finished run it is a `/health` + `/metrics` read and a
+			// `metrics_state.json` write every `METRICS_INTERVAL_MS`, for the whole life of every
+			// session opened in the repo, against a router the run stopped using (measured on the
+			// operator's box: a run complete for days, its metrics file written minutes ago). The
+			// numbers the panel shows are not lost: `agent_start` reads the router once, and the panel's
+			// own provider refreshes it on open and on every keystroke it takes.
+			// It also says NOTHING at login: the one line is for a run that can still act, and
+			// `/orchestrate status` answers the rest.
+			if (TERMINAL[state.state] !== true) {
+				startMetricsTimer();
+				if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+					// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
+					// same line as everything else the login says.
+					setTimeout(async () => {
+						const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+						if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
+					}, 250);
+					runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
+				} else {
+					runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
+				}
 			}
 		}
 		const line = [chordNote, runNote].filter((n): n is string => n !== undefined).join(" · ");
