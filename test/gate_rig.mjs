@@ -62,6 +62,13 @@
 //      `DESK_WAIT_MS` on a batch `dispatchDeskBatch` refuses for a terminal run (index.ts:626),
 //      `fade_verdicts` writes nothing into a dead desk, no `verify/desk.json` is created, and the
 //      block pays ZERO `POST /v1/load`.
+//  30. THE HAND-BACK AND THE HOSTILE FLIP: the code lane is the run's worker and the thinking lane
+//      a guest, so the session HOLDING THE ROUTER CLAIM keeps authority over the router. A
+//      thinking-lane turn that ends with no `fade_phase` call hands the router to the code lane at
+//      that boundary in ONE load and carries its protocol page onto the code lane's landing
+//      briefing; `verifying` — the one state the thinking lane owns — pays ZERO, a terminal boundary
+//      pays ZERO, an outside `POST /v1/load` is classified HOSTILE and the owner lands its
+//      authorized lane in ONE load, and a session with NO claim pays ZERO and writes NOTHING.
 //
 // Usage: node test/gate_rig.mjs
 import http from "node:http";
@@ -240,6 +247,16 @@ process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS = "0";
 // Red-gate triage spawns a CLI; the rig's blocks must not pay for it, and block 28 turns it on
 // against a stub script so the contract is proved without a subscription.
 process.env.FADE_ORCHESTRATE_GATE_TRIAGE = "0";
+// The boundary guard that judges the router's RESIDENT lane against the lane the run authorized
+// bills a restore load when it fires, and the live grace window (60 s) covers exactly ONE landing —
+// a swap is 13-25 s plus settle. The rig judges EVERY boundary, so a hostile flip is caught on the
+// next one. Block 30 is the consumer.
+process.env.FADE_ORCHESTRATE_LANE_AUTH_GRACE_MS = "0";
+// The RAM floor is a REAL box reading (`/proc/meminfo` MemAvailable) and the rigs run on the
+// operator's box, where a 64 GiB floor would refuse the discretionary loads for reasons unrelated
+// to the case under test. Disabled rig-wide; block 31 flips it per case, which is the whole point of
+// reading the floor at call time.
+process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB = "0";
 
 // ---- fake pi + ctx ----
 const tools = {};
@@ -1638,6 +1655,294 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const panel29 = (widgets.get("fade-overlay")?.lines ?? []).join("\n");
   ok("the Alt+F screen still opens over the finished run (engine columns, swaps, claim)", open29?.consume === true && panel29.includes("fade-orchestrator GATE1"), panel29.slice(0, 200));
   ok("a finished run pays ZERO POST /v1/load across the whole block", loads() === base29, `extra=${loads() - base29}`);
+}
+
+// 30. THE HAND-BACK AND THE HOSTILE FLIP. The code lane is the run's worker and the thinking lane a
+//     guest, so the session that HOLDS THE ROUTER CLAIM keeps authority over the router. On a run
+//     this rig starts and owns: (a) a deepseek turn that COMPLETED (a tool ANSWERED) and ends with NO
+//     `fade_phase` call in a state the coder owns pays EXACTLY ONE flash-next load at the boundary,
+//     the miss rides the ledger as a protocol debt, the round stays UNSPENT, and the protocol page
+//     arrives on the code lane's LANDING briefing — never on the thinking lane, where a nudge keeps
+//     paying deepseek; (b) the same turn in `verifying`, the ONE state the thinking lane owns, pays
+//     ZERO loads and keeps deepseek resident: handing that boundary to the coder would put the round's
+//     verdict in the hands of the lane that wrote the diff; (c) a terminal boundary pays ZERO loads; (d)
+//     an OUTSIDE `POST /v1/load` naming the other lane is classified HOSTILE — the owner names it in
+//     the ledger, the notify and `/orchestrate status`, and lands the lane it authorized in ONE load,
+//     so the flip never sticks; (e) a session with NO router claim that sees the same flip pays ZERO
+//     loads and writes NOTHING: it has no authority over the router.
+{
+  const sleep30 = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sentWhen = async (re, cap = 4000) => {
+    const t0 = Date.now();
+    while (!sent.some((s) => re.test(s)) && Date.now() - t0 < cap) await sleep30(10);
+    return sent.find((s) => re.test(s)) ?? "";
+  };
+  const claim30 = join(process.env.FADE_ORCHESTRATE_LOCK_DIR, "orchestrator.lock");
+  rmSync(claim30, { force: true });
+  // An earlier block can leave a lane QUEUED on this session (`pending`), and the boundary spends
+  // it before measuring anything: a queued load would otherwise be billed to the hand-back.
+  const base30drain = loads();
+  await hooks.agent_end({}, ctx);
+  await settleLoads(base30drain, 1, 1500);
+  resident = "deepseek"; // the start's preflight requires the think lane resident
+  notes.length = 0;
+  sent.length = 0;
+  const baseStart30 = loads();
+  await commands.orchestrate.handler("--rounds 3 a hand-back goal", ctx);
+  const s30 = readState();
+  ok("block 30 starts a run THIS process owns", existsSync(claim30) && JSON.parse(readFileSync(claim30, "utf8")).run_id === s30.run_id, s30.run_id);
+  ok("the start pays NO lane load: deepseek was already resident", loads() === baseStart30, String(loads() - baseStart30));
+  ok("an owned run starts on the thinking lane in planning", s30.state === "planning" && s30.lane === "deepseek", s30.state + " " + s30.lane);
+
+  // (a) THE HAND-BACK: the thinking lane's phase-less turn hands the router to the coder.
+  const base30a = loads();
+  // The turn COMPLETED: a tool answered, so the lane finished its work and the hand-back is owed.
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  const paid30a = await settleLoads(base30a, 1);
+  const sa = await readStateWhen((x) => x.lane === "flash-next");
+  ok("a COMPLETED deepseek turn with no fade_phase call pays EXACTLY ONE flash-next load", paid30a === 1, "loads=" + paid30a);
+  ok("the hand-back lands the code lane on the router too", sa.lane === "flash-next" && resident === "flash-next", sa.lane + " resident=" + resident);
+  ok("the hand-back names itself to the operator", notes.some((n) => /HAND-BACK/.test(n)), JSON.stringify(notes.slice(-3)));
+  ok("the miss is a protocol debt naming the hand-back, and the round is UNSPENT", (sa.rejection_history ?? []).some((r) => r.kind === "protocol" && /hand-back is owed/.test(r.reason)) && sa.round === 1, JSON.stringify((sa.rejection_history ?? []).slice(-2)));
+  const land30 = await sentWhen(/Protocol nudge/);
+  ok("the protocol page rides the CODE lane's landing briefing", /Protocol nudge/.test(land30), land30.slice(0, 150));
+
+  // (b) `verifying`: the thinking lane owns this state, so its boundary pays NOTHING.
+  notes.length = 0;
+  sent.length = 0;
+  await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["true", "green"]] });
+  const base30plan = loads();
+  await hooks.agent_end({}, ctx);
+  await sleep30(250);
+  ok("a phase boundary onto an already-resident lane pays ZERO loads", loads() === base30plan, String(loads() - base30plan));
+  await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }, { id: "T2", status: "passed", result: "x" }] });
+  const sb0 = await readStateWhen((x) => x.state === "verifying");
+  ok("coding_done's green gate reaches verifying", sb0.state === "verifying", sb0.state);
+  const base30v = loads();
+  await hooks.agent_end({}, ctx);
+  const paid30v = await settleLoads(base30v, 1);
+  ok("coding_done's verifier swap pays EXACTLY ONE deepseek load", paid30v === 1 && resident === "deepseek", "loads=" + paid30v + " resident=" + resident);
+  const base30b = loads();
+  notes.length = 0;
+  await hooks.agent_end({}, ctx);
+  await sleep30(300);
+  const sb = readState();
+  ok("a phase-less turn in `verifying` pays ZERO loads", loads() === base30b, String(loads() - base30b));
+  ok("`verifying` keeps the verifier's lane: no hand-back to the lane that wrote the diff", sb.state === "verifying" && sb.lane === "deepseek" && resident === "deepseek", sb.state + " " + sb.lane + " resident=" + resident);
+
+  // (c) a terminal boundary leaves the lane resident and pays nothing.
+  const base30c = loads();
+  await exec("verification_done", { verdict: "accepted", checks: [["true", "green"]], notes: "all green" });
+  const sc = await readStateWhen((x) => x.state === "complete");
+  ok("the accepted verdict completes the run", sc.state === "complete", sc.state);
+  await hooks.agent_end({}, ctx);
+  await sleep30(250);
+  ok("a terminal boundary pays ZERO loads and leaves the thinking lane resident", loads() === base30c && resident === "deepseek", "loads=" + (loads() - base30c) + " resident=" + resident);
+  await commands.orchestrate.handler("stop --clear", ctx);
+
+  // (d) the HOSTILE FLIP: an outside process loads the other lane under the owner's feet.
+  rmSync(claim30, { force: true });
+  resident = "deepseek";
+  notes.length = 0;
+  sent.length = 0;
+  await commands.orchestrate.handler("--rounds 3 a hostile-flip goal", ctx);
+  const sd0 = readState();
+  ok("a fresh owned run starts on the thinking lane", sd0.state === "planning" && sd0.lane === "deepseek", sd0.state + " " + sd0.lane);
+  const base30d1 = loads();
+  await hooks.tool_result({ toolName: "grep", isError: false }, ctx); // the turn completed
+  await hooks.agent_end({}, ctx); // the hand-back lands the code lane
+  const paid30d1 = await settleLoads(base30d1, 1);
+  await readStateWhen((x) => x.lane === "flash-next");
+  ok("the owned run's thinking-lane turn hands the router to the code lane", paid30d1 === 1 && resident === "flash-next", "loads=" + paid30d1 + " resident=" + resident);
+  await fetch((process.env.FADE_ORCHESTRATE_ROUTER ?? "") + "/v1/load", { method: "POST", body: JSON.stringify({ model: "deepseek" }) });
+  ok("an outside POST /v1/load moved the router off the authorized lane", resident === "deepseek", resident);
+  const base30d = loads();
+  notes.length = 0;
+  await hooks.agent_end({}, ctx);
+  const paid30d = await settleLoads(base30d, 1);
+  const sd = await readStateWhen((x) => x.lane_hostile && x.lane === "flash-next");
+  ok("the hostile flip is answered in ONE load, landing the authorized lane", paid30d === 1 && resident === "flash-next", "loads=" + paid30d + " resident=" + resident);
+  ok("the hostile flip is named to the operator", notes.some((n) => /HOSTILE LANE FLIP/.test(n)), JSON.stringify(notes));
+  ok("the hostile flip is in the run's ledger", (sd.rejection_history ?? []).some((r) => /HOSTILE LANE FLIP/.test(r.reason)), JSON.stringify((sd.rejection_history ?? []).slice(-2)));
+  ok("the run records the flip it judged", sd.lane_hostile?.resident === "deepseek" && sd.lane_hostile?.authorized === "flash-next", JSON.stringify(sd.lane_hostile));
+  notes.length = 0;
+  await commands.orchestrate.handler("status", ctx);
+  ok("/orchestrate status names the flip the boundary classified", notes.some((n) => /last hostile flip: router deepseek vs authorized flash-next/.test(n)), notes.join(" | ").slice(0, 220));
+
+  // (e) a session WITHOUT the router claim sees the same flip and acts on none of it.
+  await commands.orchestrate.handler("stop --clear", ctx);
+  writeState({
+    ...seedState("coding", [["true", "green"]]),
+    lane: "flash-next",
+    schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [],
+  });
+  await hooks.session_start({}, ctx);
+  resident = "deepseek"; // an outside process loaded the other lane under a session that holds NO claim
+  notes.length = 0;
+  const base30e = loads();
+  await hooks.agent_end({}, ctx);
+  await sleep30(300);
+  const se = readState();
+  ok("a session with NO router claim pays ZERO loads for the same flip", loads() === base30e, String(loads() - base30e));
+  ok("a session with no claim records NOTHING: it has no authority over the router", !("lane_hostile" in se) && !(se.rejection_history ?? []).some((r) => /HOSTILE/.test(r.reason)), JSON.stringify(Object.keys(se)));
+  ok("a session with no claim says NOTHING about the router", !notes.some((n) => /HOSTILE/.test(n)), JSON.stringify(notes));
+  await commands.orchestrate.handler("stop --clear", ctx);
+}
+
+// 31. THE HAND-BACK'S GATES. A hand-back is a 13-25 s, 52-130 GiB PACK SWAP, and the recorded
+//     incident is the box running OUT OF RAM because every phase-less thinking-lane turn forced one.
+//     So it is owed only by a turn that COMPLETED, and only into a box that can take it. Each case
+//     runs on a fresh owned run (the router starts with deepseek resident, so the start pays nothing):
+//     (a) a phase-less turn with NO tool answered — the lane is still thinking — pays ZERO loads and
+//     keeps the free in-place nudge; (b) the same turn after a tool ANSWERED hands the router to the
+//     coder in ONE load, round unspent; (c) with the router BUSY the hand-back is HELD at ZERO loads
+//     and the cause is named; (d) with the RAM floor above the box's `MemAvailable` it is HELD at ZERO
+//     loads, and the SAME turn lands it once the floor is let back down; (e) with flips already in the
+//     window it is HELD at ZERO loads, and `/orchestrate lanes reset` (the ledger release) lets the
+//     next completed turn land it in ONE load; (f) a HOSTILE outside flip whose restore cannot be paid
+//     is HELD, not forced: the run PAUSES with the lane OWED, ZERO loads, the cause named in the
+//     ledger, the notify and `/orchestrate status`, and the release verb lands it in ONE load.
+{
+  const sleep31 = (ms) => new Promise((r) => setTimeout(r, ms));
+  const claim31 = join(process.env.FADE_ORCHESTRATE_LOCK_DIR, "orchestrator.lock");
+  const start31 = async (goal) => {
+    await commands.orchestrate.handler("stop --clear", ctx);
+    rmSync(claim31, { force: true });
+    swapLine = null;
+    metricsOn = false;
+    resident = "deepseek";
+    notes.length = 0;
+    sent.length = 0;
+    const base = loads();
+    await commands.orchestrate.handler(`--rounds 3 ${goal}`, ctx);
+    const st = readState();
+    ok(`the fresh run starts owned, on the thinking lane, at ZERO loads (${goal})`, st.state === "planning" && st.lane === "deepseek" && resident === "deepseek" && loads() === base, `${st.state} ${st.lane} resident=${resident} loads=${loads() - base}`);
+    return st;
+  };
+  const s31 = await start31("a gated hand-back goal");
+
+  // (a) mid-thinking: the turn ANSWERED no tool, so the lane is still working. The old behaviour:
+  // the free nudge, in place, ZERO loads. This is the case the hand-back must never buy.
+  notes.length = 0;
+  const base31a = loads();
+  await hooks.agent_end({}, ctx);
+  await sleep31(300);
+  ok("a phase-less turn with NO tool answered pays ZERO loads", loads() === base31a, String(loads() - base31a));
+  ok("mid-thinking keeps deepseek resident and is nudged in place", resident === "deepseek" && readState().lane === "deepseek" && !notes.some((n) => /HAND-BACK/.test(n)), JSON.stringify(notes.slice(-2)));
+
+  // (b) the turn COMPLETED (a tool answered) into an idle router, a healthy context and a quiet
+  // window: the hand-back is owed and paid, ONE load, and the round stays unspent.
+  notes.length = 0;
+  const base31b = loads();
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  const paid31b = await settleLoads(base31b, 1);
+  const sb31 = await readStateWhen((x) => x.lane === "flash-next");
+  ok("a COMPLETED thinking-lane turn hands the router to the code lane in ONE load", paid31b === 1 && resident === "flash-next", "loads=" + paid31b + " resident=" + resident);
+  ok("the hand-back names itself, and says no hold", notes.some((n) => /HAND-BACK —/.test(n)) && !notes.some((n) => /HELD/.test(n)), JSON.stringify(notes.slice(-2)));
+  ok("the hand-back spends no coding round", sb31.round === 1, String(sb31.round));
+
+  // (c) the router is SERVING (`slots.active` = 1): a hand-back issued into that is the queue the
+  // router answers by swapping BACK, so it is HELD — the load is never issued.
+  await start31("a busy-router hand-back");
+  metricsOn = true;
+  notes.length = 0;
+  const base31c = loads();
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  await sleep31(300);
+  const sc31 = readState();
+  ok("a COMPLETED turn against a BUSY router pays ZERO loads", loads() === base31c, String(loads() - base31c));
+  ok("the busy router HELD the hand-back, cause named", notes.some((n) => /HAND-BACK HELD/.test(n) && /router busy/.test(n)), JSON.stringify(notes.slice(-2)));
+  ok("the hold is a protocol debt and the lane stays put", (sc31.rejection_history ?? []).some((r) => r.kind === "protocol" && /hand-back was HELD/.test(r.reason)) && sc31.lane === "deepseek" && resident === "deepseek" && sc31.round === 1, JSON.stringify((sc31.rejection_history ?? []).slice(-1)));
+  metricsOn = false;
+
+  // (d) host RAM under the pack floor: a 52-130 GiB swap issued here is the recorded exhaustion, so
+  // the hand-back is HELD at zero cost, and the SAME turn lands it once the floor is let down.
+  await start31("a low-RAM hand-back");
+  process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB = "8388608"; // 8 TiB in MiB: above any box
+  notes.length = 0;
+  const base31d = loads();
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  await sleep31(300);
+  ok("a COMPLETED turn under the RAM floor pays ZERO loads", loads() === base31d, String(loads() - base31d));
+  ok("the RAM floor HELD the hand-back, cause named", notes.some((n) => /HAND-BACK HELD/.test(n) && /MemAvailable \d+ GiB is under the 8192 GiB pack floor/.test(n)), JSON.stringify(notes.slice(-2)));
+  process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB = "0";
+  notes.length = 0;
+  const base31d2 = loads();
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  const paid31d2 = await settleLoads(base31d2, 1);
+  await readStateWhen((x) => x.lane === "flash-next");
+  ok("with the floor let down the same turn hands back in ONE load", paid31d2 === 1 && resident === "flash-next", "loads=" + paid31d2 + " resident=" + resident);
+
+  // (e) flips ALREADY in the window (the badge's count, one below the breaker): the loop adds no load
+  // to a churning window. `/orchestrate lanes reset` is the release the halt names.
+  await start31("a churning-window hand-back");
+  const poll31 = async () => {
+    await hooks.session_start({}, ctx); // the loop's poll is what watches the router's swap line
+    await sleep31(30);
+  };
+  swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 1 };
+  await poll31();
+  swapLine = null;
+  await poll31();
+  swapLine = { from: "deepseek", to: "flash-next", phase: "loading", waiting: 3 };
+  await poll31();
+  swapLine = null;
+  await poll31();
+  notes.length = 0;
+  const base31e = loads();
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  await sleep31(300);
+  ok("a COMPLETED turn inside a churning window pays ZERO loads", loads() === base31e, String(loads() - base31e));
+  ok("the flip guard HELD the hand-back, count named", notes.some((n) => /HAND-BACK HELD/.test(n) && /FLIP GUARD: 2 swaps in 60s/.test(n)), JSON.stringify(notes.slice(-2)));
+  notes.length = 0;
+  await commands.orchestrate.handler("lanes reset", ctx); // clears the ledger, lands the owed lane
+  await sleep31(200);
+  const base31e2 = loads();
+  notes.length = 0;
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx);
+  const paid31e2 = await settleLoads(base31e2, 1);
+  await readStateWhen((x) => x.lane === "flash-next");
+  ok("a quiet window lets the next completed turn hand back in ONE load", paid31e2 === 1 && resident === "flash-next", "loads=" + paid31e2 + " resident=" + resident);
+
+  // (f) the HOSTILE restore is a pack swap too. When it cannot be paid the run PAUSES with the lane
+  // owed and the cause surfaced — it does not force the swap the RAM floor named.
+  await start31("a hostile restore under the RAM floor");
+  notes.length = 0;
+  const base31f0 = loads();
+  await hooks.tool_result({ toolName: "read", isError: false }, ctx);
+  await hooks.agent_end({}, ctx); // the hand-back lands the code lane: the authorized lane is flash-next
+  await settleLoads(base31f0, 1);
+  await readStateWhen((x) => x.lane === "flash-next");
+  process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB = "8388608"; // the restore is a pack swap too
+  await fetch((process.env.FADE_ORCHESTRATE_ROUTER ?? "") + "/v1/load", { method: "POST", body: JSON.stringify({ model: "deepseek" }) });
+  notes.length = 0;
+  const base31f = loads();
+  await hooks.agent_end({}, ctx);
+  await sleep31(300);
+  const sf31 = readState();
+  ok("a hostile flip the RAM floor refuses pays ZERO loads", loads() === base31f && resident === "deepseek", "loads=" + (loads() - base31f) + " resident=" + resident);
+  ok("the unpayable restore PAUSES the run with the lane owed", sf31.paused === true && sf31.lane === "flash-next" && sf31.lane_hostile?.resident === "deepseek", JSON.stringify({ paused: sf31.paused, lane: sf31.lane, hostile: sf31.lane_hostile }));
+  ok("the hold names the cause and the release", notes.some((n) => /HOSTILE LANE FLIP/.test(n) && /restore HELD/.test(n) && /MemAvailable/.test(n) && /lanes reset/.test(n)), JSON.stringify(notes.slice(-2)));
+  ok("the ledger carries the held restore", (sf31.rejection_history ?? []).some((r) => /HOSTILE LANE FLIP/.test(r.reason) && /restore is HELD/.test(r.reason)), JSON.stringify((sf31.rejection_history ?? []).slice(-1)));
+  notes.length = 0;
+  await commands.orchestrate.handler("status", ctx);
+  ok("/orchestrate status names the flip the boundary classified", notes.some((n) => /last hostile flip: router deepseek vs authorized flash-next/.test(n)), notes.join(" | ").slice(0, 220));
+  process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB = "0";
+  notes.length = 0;
+  const base31f2 = loads();
+  await commands.orchestrate.handler("lanes reset", ctx);
+  const paid31f2 = await settleLoads(base31f2, 1);
+  const sf31b = await readStateWhen((x) => x.lane === "flash-next" && x.paused !== true);
+  ok("the release lands the owed restore in ONE load, unpaused", paid31f2 === 1 && resident === "flash-next" && sf31b.paused !== true, "loads=" + paid31f2 + " resident=" + resident + " paused=" + String(sf31b.paused));
+  process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB = "0";
+  await commands.orchestrate.handler("stop --clear", ctx);
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

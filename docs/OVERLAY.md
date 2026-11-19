@@ -31,6 +31,14 @@ One line, docked on the host's **top widget** (`setWidget(TOP_WIDGET_KEY, lines,
   `POST /v1/load`, the run pauses with the flips, the window and the competing entry in its operator
   note, and `/orchestrate lanes reset` clears this process's ledger and lands the owed lane
   (`test/gate_rig.mjs` drives both sides).
+- the boundary's lane decisions ride that SAME last-rejection clause, in the operator's words, with
+  no new format: a swap the loop chose to pay and a gate refused reads
+  `protocol: the flash-next hand-back was HELD at this boundary: MemAvailable 65 GiB is under the 64
+  GiB pack floor … (tier nudge, round 1 unspent)`, and a lane the router holds that this run never
+  authorized reads `task: HOSTILE LANE FLIP: the router holds deepseek, this run authorized
+  flash-next; …`. The notify carries the same cause and the verb that clears it; a hostile restore
+  the box cannot pay PAUSES the run with the lane owed, and the row stays on that line until a
+  boundary lands a lane (`node test/gate_rig.mjs` blocks 30, 31).
 
 The line **clears** — the widget is removed, not blanked — when there is no run, when the run is
 terminal (`complete` / `failed` / `stopped`, including a run adopted from disk at `session_start`),
