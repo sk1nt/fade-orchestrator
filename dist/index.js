@@ -3917,6 +3917,9 @@ ${SCHEMA_HINT}` : text);
       const active = await readJsonAsync(join7(dir, ACTIVE_FILENAME));
       const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
       if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against \u2014 nothing was written`);
+      if (state && TERMINAL[state.state] === true) {
+        throw new Error(`fade_verify: run ${runId} is ${state.state}, so its desk has no owner to run the verification pass. A request registered here is never answered: it would block for ${Math.round(DESK_WAIT_MS / 1e3)}s and be DEFERRED with nothing judged. Report your slice in your final message; the session that owns live work dispatches its own desk. Nothing was written`);
+      }
       const rows = Array.isArray(params.checks) ? params.checks : [];
       const agent = isWorkerSession(ctx) ? workerName(ctx) : "owner";
       let captured;
@@ -3969,6 +3972,9 @@ ${SCHEMA_HINT}` : text);
       const active = await readJsonAsync(join7(dir, ACTIVE_FILENAME));
       const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
       if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
+      if (state && TERMINAL[state.state] === true) {
+        throw new Error(`fade_verdicts: run ${runId} is ${state.state}, so no session is waiting on its desk; a verdict written into a finished run's desk is read by nobody. Nothing was written`);
+      }
       const label2 = Number(params.batch);
       const epoch = label2 - 1;
       const rows = Array.isArray(params.verdicts) ? params.verdicts : [];
@@ -4332,17 +4338,17 @@ ${SCHEMA_HINT}` : text);
       run = normalizeRun(state);
       settledNotified = false;
       paint(ctx);
-      startMetricsTimer();
-      if (TERMINAL[state.state] === true) {
-        runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
-      } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-        setTimeout(async () => {
-          const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-          if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
-        }, 250);
-        runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
-      } else {
-        runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state`;
+      if (TERMINAL[state.state] !== true) {
+        startMetricsTimer();
+        if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+          setTimeout(async () => {
+            const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+            if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
+          }, 250);
+          runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
+        } else {
+          runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state`;
+        }
       }
     }
     const line = [chordNote, runNote].filter((n) => n !== void 0).join(" \xB7 ");
