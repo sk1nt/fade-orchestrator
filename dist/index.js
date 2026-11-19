@@ -3,16 +3,15 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync4, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { basename, dirname, join as join7 } from "node:path";
-import { readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { readFile as readFile2, stat as stat3 } from "node:fs/promises";
 import { Type } from "typebox";
 
 // src/router.ts
-import { readFile } from "node:fs/promises";
 var ROUTER = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:18014";
 var PROVIDER = process.env.FADE_ORCHESTRATE_PROVIDER ?? "strata-flash";
 var THINK_LANE = process.env.FADE_ORCHESTRATE_THINK_LANE ?? "deepseek";
 var CODE_LANE = process.env.FADE_ORCHESTRATE_CODE_LANE ?? "flash-next";
-var THINKING = { think: "high", code: "low" };
+var THINKING = { [THINK_LANE]: "high", [CODE_LANE]: "low" };
 var msg = (e) => e instanceof Error ? e.message : String(e);
 async function listLanes() {
   try {
@@ -64,26 +63,6 @@ function serveVerdict(h) {
     if (model === "") return { serve: false, reason: "health claims a loaded context that names no model: nothing is serving" };
   }
   return { serve: true, reason: `context can serve${model !== "" ? ` (${model}${h.loading === false ? ", idle" : ""})` : ""}${free !== void 0 ? `, ${Math.round(free)} MiB free` : ", VRAM not reported"}` };
-}
-var ramFloorMib = () => Math.max(0, Math.trunc(Number(process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB ?? 65536)) || 0);
-async function memAvailableMib() {
-  let txt;
-  try {
-    txt = await readFile("/proc/meminfo", "utf8");
-  } catch {
-    return void 0;
-  }
-  const kb = Number(/^MemAvailable:\s+(\d+)\s*kB$/m.exec(txt)?.[1] ?? NaN);
-  return Number.isFinite(kb) && kb > 0 ? Math.round(kb / 1024) : void 0;
-}
-async function ramVerdict() {
-  const floor = ramFloorMib();
-  const gib2 = (mib) => `${(mib / 1024).toFixed(0)} GiB`;
-  if (floor === 0) return { serve: true, reason: "RAM floor disabled" };
-  const avail = await memAvailableMib();
-  if (avail === void 0) return { serve: false, reason: `/proc/meminfo reports no MemAvailable with the ${gib2(floor)} RAM floor ON: a swap whose headroom cannot be measured is a swap to refuse, not to guess` };
-  if (avail < floor) return { serve: false, reason: `MemAvailable ${gib2(avail)} is under the ${gib2(floor)} pack floor: a 52-130 GiB swap issued here is the recorded RAM exhaustion` };
-  return { serve: true, reason: `MemAvailable ${gib2(avail)}, over the ${gib2(floor)} pack floor` };
 }
 async function settleInFlight() {
   let health = await laneHealth();
@@ -226,7 +205,7 @@ import { join as join2 } from "node:path";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, open, readFile as readFile2, rename, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -282,7 +261,7 @@ function routeFor(desk, flip, opts = {}) {
   const guardAt = opts.guardAt ?? FLIP_MIN_SWAPS;
   if (desk.churn) return { route: "subagent", reason: `the desk has churn declared${desk.churn_utc ? ` since ${desk.churn_utc}` : ""}: batches are answered by a verification subagent on ${VERIFIER_MODEL}, and no lane load is paid`, flips: flip.flips };
   if (flip.flips >= guardAt) return { route: "subagent", reason: `lane churn began: ${flip.flips} swaps away from the run's lane in the guard window \u2014 the verification goes to a subagent on ${VERIFIER_MODEL} (zero router swaps) instead of a lane load`, flips: flip.flips };
-  return { route: "swap", reason: THINK_LANE === CODE_LANE ? `no churn: ${THINK_LANE} runs both roles and is resident, so the whole batch is answered at ZERO lane loads` : `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
+  return { route: "swap", reason: `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
 }
 function verifierTaskCall(batch, ids, requests = []) {
   return `task { "agent": "${VERIFIER_AGENT}", "name": "Verify${batch + 1}", "solutionSpace": "one batched verification pass, verdicts posted by id", "task": ${JSON.stringify(verifierTaskBody(batch, ids, requests))} }`;
@@ -399,7 +378,7 @@ function workerAgentMd(agent = WORKER_AGENT) {
 }
 var workerAgentPath = (repo, agent = WORKER_AGENT) => `.omp/agents/${agent}.md`;
 function routeLine(route) {
-  return route.route === "subagent" ? `verification \u2192 ${VERIFIER_AGENT} on ${VERIFIER_MODEL} \xB7 zero lane loads` : THINK_LANE === CODE_LANE ? `verification \u2192 ${THINK_LANE} resident lane \xB7 zero lane loads (${THINKING.think} thinking)` : `verification \u2192 ${THINK_LANE} lane \xB7 one load (${THINKING.think} thinking)`;
+  return route.route === "subagent" ? `verification \u2192 ${VERIFIER_AGENT} on ${VERIFIER_MODEL} \xB7 zero lane loads` : `verification \u2192 ${THINK_LANE} lane \xB7 one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
 }
 
 // src/core.ts
@@ -420,9 +399,6 @@ var MAX_ROUNDS = 6;
 var MAX_TASKS = 6;
 var TERMINAL = { complete: true, failed: true, stopped: true };
 var PHASE_FOR_STATE = { planning: "planning_done", coding: "coding_done", repair: "coding_done", verifying: "verification_done" };
-var laneForState = (st) => st.state === "verifying" ? THINK_LANE : CODE_LANE;
-var thinkPhase = (state) => state === "planning" || state === "verifying" || state === "repair";
-var landingRole = (state, lane) => THINK_LANE === CODE_LANE ? thinkPhase(state) ? "think" : "code" : lane === THINK_LANE ? "think" : "code";
 var MAX_REJECTIONS = 50;
 function normalizeRun(st) {
   if (!Array.isArray(st.tasks)) st.tasks = [];
@@ -724,7 +700,7 @@ function parseJson(text) {
 }
 async function readJsonAsync(path) {
   try {
-    return parseJson(await readFile2(path, "utf8"));
+    return parseJson(await readFile(path, "utf8"));
   } catch {
     return void 0;
   }
@@ -3098,10 +3074,6 @@ function fadeOrchestrate(pi) {
   let runDir;
   let lockDir;
   let pending;
-  let laneAuth;
-  let handbackPage;
-  const LANE_AUTH_GRACE_MS = Math.max(0, Number(process.env.FADE_ORCHESTRATE_LANE_AUTH_GRACE_MS ?? 6e4));
-  let turnTools = [];
   let deskBatch;
   let deskAnnounced = -1;
   let deskBriefing = false;
@@ -3117,7 +3089,7 @@ function fadeOrchestrate(pi) {
   let turnSeq = 0;
   let turnPhase;
   let turnSwapMs = 0;
-  let strippedWriters = [];
+  let verifierTools;
   let flipBadge;
   let swapPill;
   const refreshMetrics = async () => {
@@ -3174,18 +3146,19 @@ function fadeOrchestrate(pi) {
     turnSwapMs = 0;
     if (rec) await appendTurn(runDir, rec);
   };
-  const applyToolPolicy = async (role) => {
+  const applyToolPolicy = async (lane) => {
     const active = pi.getActiveTools();
-    if (role === "think") {
-      const writers = active.filter((t) => MUTATING_TOOLS[t] === true);
-      if (writers.length > 0) strippedWriters = [.../* @__PURE__ */ new Set([...strippedWriters, ...writers])];
+    if (lane === THINK_LANE) {
+      verifierTools = active;
       const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true);
       if (!readOnly.includes("fade_phase")) readOnly.push("fade_phase");
       if (readOnly.length !== active.length) await pi.setActiveTools(readOnly);
       return;
     }
-    const restored = [.../* @__PURE__ */ new Set([...active, ...strippedWriters])];
-    if (restored.length !== active.length) await pi.setActiveTools(restored);
+    if (verifierTools && verifierTools.length > 0) {
+      if (verifierTools.some((t) => !active.includes(t))) await pi.setActiveTools(verifierTools);
+      verifierTools = void 0;
+    }
   };
   const ensurePhaseTool = async () => {
     try {
@@ -3253,7 +3226,7 @@ function fadeOrchestrate(pi) {
       const s = await stat3(path);
       const key = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
       if (liveCache && liveCache.key === key) return liveCache.state;
-      const state = parseJson(await readFile3(path, "utf8"));
+      const state = parseJson(await readFile2(path, "utf8"));
       liveCache = { key, state };
       return state;
     } catch {
@@ -3354,27 +3327,6 @@ function fadeOrchestrate(pi) {
       last = await routerBusy();
     }
     return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
-  };
-  const hostileFlip = async () => {
-    if (!run || lockDir === void 0 || TERMINAL[run.state] === true || run.paused === true) return void 0;
-    const authorized = laneAuth?.lane ?? run.lane;
-    if (laneAuth && Date.now() - laneAuth.at < LANE_AUTH_GRACE_MS) return void 0;
-    if ((await laneHealth())?.loading === true) return void 0;
-    const resident = await residentLane();
-    if (!resident || resident === authorized) return void 0;
-    return { resident, authorized };
-  };
-  const swapSafe = async (recentHostile) => {
-    const busy = await routerBusy();
-    if (busy.busy) return { serve: false, reason: `router busy: ${busy.reason}` };
-    const serve = serveVerdict(await laneHealth());
-    if (!serve.serve) return { serve: false, reason: `pre-unload gate: ${serve.reason}` };
-    const ram = await ramVerdict();
-    if (!ram.serve) return { serve: false, reason: ram.reason };
-    const flip = flipState(await residentLane(), FLIP_WINDOW_MS);
-    if (flipGuarded(flip)) return { serve: false, reason: `FLIP GUARD: ${flip.flips} swaps in ${flip.window_s}s naming ${flip.competing.join(", ") || "the other lane"}: this loop adds no load to a window that is already churning` };
-    if (recentHostile) return { serve: false, reason: `a hostile flip was recorded at ${run?.lane_hostile?.at ?? "?"}: the restore is the load this window gets, not a second one` };
-    return { serve: true, reason: `idle router, ${ram.reason}, ${flip.flips} flips in ${flip.window_s}s` };
   };
   let switchGen = 0;
   let switchChain = Promise.resolve();
@@ -3493,8 +3445,7 @@ function fadeOrchestrate(pi) {
       fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
       return;
     }
-    const role = landingRole(run?.state, lane);
-    pi.setThinkingLevel(THINKING[role]);
+    pi.setThinkingLevel(THINKING[lane]);
     const from = run?.lane ?? "";
     swapPill = { from, to: modelLabel(model.name ?? lane) };
     paint(ctx);
@@ -3523,24 +3474,19 @@ function fadeOrchestrate(pi) {
       void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
     }
     if (run) run.lane = lane;
-    laneAuth = { lane, at: Date.now() };
     await persist();
     paint(ctx);
-    await applyToolPolicy(role);
+    await applyToolPolicy(lane);
     if (gen !== switchGen) return;
-    const target = run;
-    const dir = runDir;
     setTimeout(async () => {
-      if (gen !== switchGen || !target || run !== target) return;
+      if (gen !== switchGen) return;
       await ensurePhaseTool();
-      const carry = lane === CODE_LANE ? handbackPage : void 0;
-      handbackPage = void 0;
-      const owed = deskBriefing && lane === THINK_LANE && target.verify_batch;
+      const owed = deskBriefing && lane === THINK_LANE && run?.verify_batch;
       deskBriefing = false;
-      if (owed && dir) {
-        const st = target;
+      if (owed && runDir && run) {
+        const st = run;
         const ids = st.verify_batch?.ids ?? [];
-        const d = await readDesk(dir, st.run_id);
+        const d = await readDesk(runDir, st.run_id);
         if (d) {
           pi.sendUserMessage(
             briefings.verifyBatch(st, {
@@ -3553,10 +3499,8 @@ function fadeOrchestrate(pi) {
           return;
         }
       }
-      const text = await (target.state === "repair" ? briefings.repair(target) : role === "think" ? target.state === "planning" ? briefings.plan(target) : briefings.verify(target) : target.gate_last && target.gate_last.passed === false ? briefings.gate(target) : briefings.code(target));
-      pi.sendUserMessage(carry ? `${text}
-
-${carry}` : text);
+      const text = await (run.state === "repair" ? briefings.repair(run) : lane === CODE_LANE && run.gate_last && run.gate_last.passed === false ? briefings.gate(run) : lane === CODE_LANE ? briefings.code(run) : briefings.verify(run));
+      pi.sendUserMessage(text);
     }, 0);
   };
   const panelProvider = (ctx) => {
@@ -3588,7 +3532,7 @@ ${carry}` : text);
     const here = dirname(fileURLToPath(import.meta.url));
     for (const p of [join7(here, "..", "package.json"), join7(here, "package.json")]) {
       try {
-        const raw = JSON.parse(await readFile3(p, "utf8"));
+        const raw = JSON.parse(await readFile2(p, "utf8"));
         if (raw && typeof raw === "object" && "version" in raw && typeof raw.version === "string" && raw.version !== "") return raw.version;
       } catch {
       }
@@ -3599,7 +3543,7 @@ ${carry}` : text);
     const here = dirname(fileURLToPath(import.meta.url));
     for (const p of [join7(here, "index.js"), join7(here, "..", "dist", "index.js")]) {
       try {
-        return createHash("sha256").update(await readFile3(p)).digest("hex");
+        return createHash("sha256").update(await readFile2(p)).digest("hex");
       } catch {
       }
     }
@@ -3973,9 +3917,6 @@ ${SCHEMA_HINT}` : text);
       const active = await readJsonAsync(join7(dir, ACTIVE_FILENAME));
       const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
       if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against \u2014 nothing was written`);
-      if (state && TERMINAL[state.state] === true) {
-        throw new Error(`fade_verify: run ${runId} is ${state.state}, so its desk has no owner to run the verification pass. A request registered here is never answered: it would block for ${Math.round(DESK_WAIT_MS / 1e3)}s and be DEFERRED with nothing judged. Report your slice in your final message; the session that owns live work dispatches its own desk. Nothing was written`);
-      }
       const rows = Array.isArray(params.checks) ? params.checks : [];
       const agent = isWorkerSession(ctx) ? workerName(ctx) : "owner";
       let captured;
@@ -4028,9 +3969,6 @@ ${SCHEMA_HINT}` : text);
       const active = await readJsonAsync(join7(dir, ACTIVE_FILENAME));
       const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
       if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
-      if (state && TERMINAL[state.state] === true) {
-        throw new Error(`fade_verdicts: run ${runId} is ${state.state}, so no session is waiting on its desk; a verdict written into a finished run's desk is read by nobody. Nothing was written`);
-      }
       const label2 = Number(params.batch);
       const epoch = label2 - 1;
       const rows = Array.isArray(params.verdicts) ? params.verdicts : [];
@@ -4113,9 +4051,8 @@ ${SCHEMA_HINT}` : text);
         const paid = cost.count > 0 ? `swaps ${cost.count} \xB7 ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
         const d = runDir ? await readDesk(runDir, run.run_id) : void 0;
         const deskPart = d ? ` \xB7 ${deskLine(d)}` : "";
-        const hostilePart = run.lane_hostile ? ` \xB7 last hostile flip: router ${run.lane_hostile.resident} vs authorized ${run.lane_hostile.authorized}` : "";
         ctx.ui.notify(
-          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid}${deskPart}${hostilePart} \xB7 ${statePath()}`,
+          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid}${deskPart} \xB7 ${statePath()}`,
           "info"
         );
         paint(ctx);
@@ -4316,32 +4253,20 @@ ${SCHEMA_HINT}` : text);
       }
       lockDir = claimDir;
       if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
+      ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
+      engineProofInvalidate();
+      const loaded = await loadLane(THINK_LANE);
+      ctx.ui.setWorkingMessage();
+      if (!loaded.ok) {
+        releaseLock();
+        ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
+        return;
+      }
       const census = await listLanes();
       const resident = census.models.find((m) => m.status === "loaded");
-      if (resident?.id !== THINK_LANE) {
-        const serve = serveVerdict(await laneHealth());
-        const ram = await ramVerdict();
-        if (!serve.serve || !ram.serve) {
-          releaseLock();
-          const alt = resident?.id;
-          ctx.ui.notify(`orchestrate: start refused at ZERO loads \u2014 ${serve.serve ? ram.reason : serve.reason}; ${THINK_LANE} was not loaded. ${alt ? `The whole loop runs on ${alt} at zero swaps: FADE_ORCHESTRATE_THINK_LANE=${alt} FADE_ORCHESTRATE_CODE_LANE=${alt}.` : `The router names no resident entry to run on; point this session at the lane that is (FADE_ORCHESTRATE_THINK_LANE / FADE_ORCHESTRATE_CODE_LANE).`} Nothing written.`, "error");
-          return;
-        }
-        ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
-        engineProofInvalidate();
-        const loaded = await loadLane(THINK_LANE);
-        ctx.ui.setWorkingMessage();
-        if (!loaded.ok) {
-          releaseLock();
-          ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
-          return;
-        }
-      }
-      const landed = resident?.id === THINK_LANE ? census : await listLanes();
-      const landedEntry = landed.models.find((m) => m.status === "loaded");
-      if (!landed.error && landedEntry?.id !== THINK_LANE) {
+      if (!census.error && resident?.id !== THINK_LANE) {
         releaseLock();
-        ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${landedEntry ? landedEntry.id : "none"}; nothing written`, "error");
+        ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
         return;
       }
       const previous = run;
@@ -4380,11 +4305,10 @@ ${SCHEMA_HINT}` : text);
         fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
         return;
       }
-      pi.setThinkingLevel(THINKING.think);
-      laneAuth = { lane: THINK_LANE, at: Date.now() };
+      pi.setThinkingLevel(THINKING[THINK_LANE]);
       paint(ctx);
       startMetricsTimer();
-      await applyToolPolicy("think");
+      await ensurePhaseTool();
       pi.sendUserMessage(await briefings.plan(run));
     }
   });
@@ -4408,17 +4332,17 @@ ${SCHEMA_HINT}` : text);
       run = normalizeRun(state);
       settledNotified = false;
       paint(ctx);
-      if (TERMINAL[state.state] !== true) {
-        startMetricsTimer();
-        if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-          setTimeout(async () => {
-            const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-            if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
-          }, 250);
-          runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
-        } else {
-          runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state`;
-        }
+      startMetricsTimer();
+      if (TERMINAL[state.state] === true) {
+        runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
+      } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+        setTimeout(async () => {
+          const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+          if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
+        }, 250);
+        runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
+      } else {
+        runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state`;
       }
     }
     const line = [chordNote, runNote].filter((n) => n !== void 0).join(" \xB7 ");
@@ -4436,26 +4360,6 @@ ${SCHEMA_HINT}` : text);
     if (!run) return;
     const next = pending;
     pending = void 0;
-    const turnDidWork = turnTools.length > 0;
-    turnTools = [];
-    const hostile = await hostileFlip();
-    if (hostile) {
-      run.lane_hostile = { ...hostile, at: (/* @__PURE__ */ new Date()).toISOString() };
-      const safe = await swapSafe(false);
-      if (!safe.serve) {
-        run.paused = true;
-        pending = { lane: hostile.authorized, phase: "lane_restore" };
-        pushRejection(run, "task", `HOSTILE LANE FLIP: the router holds ${hostile.resident}, this run authorized ${hostile.authorized}; the restore is HELD: ${safe.reason}. The run is PAUSED with the ${hostile.authorized} load OWED \u2014 /orchestrate lanes reset clears the ledger and lands it`);
-        await persist();
-        paint(ctx);
-        ctx.ui.notify(`orchestrate: HOSTILE LANE FLIP \u2014 the router holds ${hostile.resident}, not the ${hostile.authorized} this run authorized; restore HELD (${safe.reason}), ZERO swap paid. Paused with the lane owed: /orchestrate lanes reset lands it.`, "warning");
-        void recordTurn("lane_restore_held");
-        return;
-      }
-      pushRejection(run, "task", `HOSTILE LANE FLIP: the router holds ${hostile.resident}, this run authorized ${hostile.authorized}; the authorized lane lands at this boundary (${safe.reason})`);
-      await persist();
-      ctx.ui.notify(`orchestrate: HOSTILE LANE FLIP \u2014 the router holds ${hostile.resident}, not the ${hostile.authorized} this run authorized; landing ${hostile.authorized} at this boundary`, "warning");
-    }
     if (!next) {
       paint(ctx);
       if (TERMINAL[run.state] === true) {
@@ -4476,33 +4380,6 @@ ${SCHEMA_HINT}` : text);
         return;
       }
       const tier = classifyTurnEnd(run, false);
-      const handbackWanted = tier !== "stall" && turnDidWork && run.lane === THINK_LANE && laneForState(run) === CODE_LANE;
-      let handback = false;
-      if (handbackWanted) {
-        const recentHostile = run.lane_hostile !== void 0 && Date.now() - Date.parse(run.lane_hostile.at) < FLIP_WINDOW_MS;
-        const safe = await swapSafe(recentHostile);
-        if (safe.serve) handback = true;
-        else {
-          pushRejection(run, "protocol", `the ${CODE_LANE} hand-back was HELD at this boundary: ${safe.reason}; the ${THINK_LANE} turn stays resident at ZERO cost (tier ${tier}, round ${run.round} unspent)`);
-          await persist();
-          paint(ctx);
-          ctx.ui.notify(`orchestrate: HAND-BACK HELD \u2014 ${safe.reason}; no swap paid, ${THINK_LANE} stays resident (round ${run.round} unspent)`, "warning");
-        }
-      }
-      const owedLane = handback ? CODE_LANE : hostile !== void 0 && tier !== "stall" ? hostile.authorized : void 0;
-      if (owedLane) {
-        if (handback) {
-          pushRejection(run, "protocol", `the ${THINK_LANE} turn ended with no fade_phase call in state ${run.state}; the ${CODE_LANE} hand-back is owed at this boundary (tier ${tier}, round ${run.round} unspent)`);
-          handbackPage = briefings.nudge(run);
-          ctx.ui.notify(`orchestrate: HAND-BACK \u2014 the ${THINK_LANE} turn ended with no phase; ${CODE_LANE} loads at this boundary (round ${run.round} unspent)`, "warning");
-        }
-        await persist();
-        paint(ctx);
-        settledNotified = false;
-        void recordTurn(handback ? "handback" : "lane_restore");
-        requestLane(owedLane, ctx);
-        return;
-      }
       if (tier === "nudge") {
         pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT})`);
         await persist();
@@ -4596,7 +4473,6 @@ ${SCHEMA_HINT}`);
     return { block: true, reason: `fade_orchestrate: the verifier lane is read-only \u2014 ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
   });
   pi.on("tool_result", async (event, ctx) => {
-    if (run && !isDelegatedSession() && event.isError !== true) turnTools.push(event.toolName ?? "?");
     if (event.toolName !== "task" || !run || !runDir || isDelegatedSession()) return void 0;
     const desk = await readDesk(runDir, run.run_id);
     if (!desk || openRequests(desk).length === 0) return void 0;

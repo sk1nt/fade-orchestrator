@@ -13,7 +13,6 @@
     "test": "npm run test:build && node --test \"test/*.test.mjs\"",
     "test:build": "node test/build.mjs",
     "test:gate": "node test/gate_rig.mjs",
-    "test:lane": "node test/build.mjs && node test/single_lane.mjs",
     "test:rpc": "node test/build.mjs && node test/rpc_rig.mjs",
     "test:pty": "node test/build.mjs && node test/pty_rig.mjs",
     "demo": "node demo/recording.mjs",

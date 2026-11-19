@@ -136,7 +136,7 @@ export function routeFor(desk: { churn: boolean; churn_utc?: string }, flip: { f
 	const guardAt = opts.guardAt ?? FLIP_MIN_SWAPS;
 	if (desk.churn) return { route: "subagent", reason: `the desk has churn declared${desk.churn_utc ? ` since ${desk.churn_utc}` : ""}: batches are answered by a verification subagent on ${VERIFIER_MODEL}, and no lane load is paid`, flips: flip.flips };
 	if (flip.flips >= guardAt) return { route: "subagent", reason: `lane churn began: ${flip.flips} swaps away from the run's lane in the guard window — the verification goes to a subagent on ${VERIFIER_MODEL} (zero router swaps) instead of a lane load`, flips: flip.flips };
-	return { route: "swap", reason: THINK_LANE === CODE_LANE ? `no churn: ${THINK_LANE} runs both roles and is resident, so the whole batch is answered at ZERO lane loads` : `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
+	return { route: "swap", reason: `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
 }
 
 /**
@@ -291,12 +291,9 @@ export function workerAgentMd(agent = WORKER_AGENT): string {
 /** Where the worker definition lands for a run root. */
 export const workerAgentPath = (repo: string, agent = WORKER_AGENT): string => `.omp/agents/${agent}.md`;
 
-/** The one-line cost of a route, for the panel and the ledger. With ONE lane running both roles
- *  the verifier is already the resident entry, so the swap route names ZERO loads, never a load. */
+/** The one-line cost of a route, for the panel and the ledger. */
 export function routeLine(route: RouteDecision): string {
 	return route.route === "subagent"
 		? `verification → ${VERIFIER_AGENT} on ${VERIFIER_MODEL} · zero lane loads`
-		: THINK_LANE === CODE_LANE
-			? `verification → ${THINK_LANE} resident lane · zero lane loads (${THINKING.think} thinking)`
-			: `verification → ${THINK_LANE} lane · one load (${THINKING.think} thinking)`;
+		: `verification → ${THINK_LANE} lane · one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
 }

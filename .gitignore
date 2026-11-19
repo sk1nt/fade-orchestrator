@@ -10,8 +10,3 @@ demo/out/
 
 # dist/index.js is committed on purpose: it is the bundled single-file install form, and CI proves it
 # equals a fresh build of src/.
-# The DS window (~/.omp/agent/ds-window.config.yml, rationale) is a per-machine, per-run lane
-# settings file: it lives in the project layer (<repo>/.omp/config.yml), which is the layer the
-# residency audit reads, and it churns a working tree the moment a run starts. The shipped agent
-# definitions under .omp/agents/ stay tracked; this one file does not.
-.omp/config.yml

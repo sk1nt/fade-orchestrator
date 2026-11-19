@@ -8,18 +8,12 @@
  *   FADE_ORCHESTRATE_PROVIDER default strata-flash
  *   FADE_ORCHESTRATE_THINK_LANE default deepseek   (plans + verifies)
  *   FADE_ORCHESTRATE_CODE_LANE  default flash-next (codes)
- *   FADE_ORCHESTRATE_RAM_MIN_FREE_MIB default 65536 (64 GiB) — the host-RAM floor a pack swap needs
  */
-import { readFile } from "node:fs/promises";
 export const ROUTER = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:18014";
 export const PROVIDER = process.env.FADE_ORCHESTRATE_PROVIDER ?? "strata-flash";
 export const THINK_LANE = process.env.FADE_ORCHESTRATE_THINK_LANE ?? "deepseek";
 export const CODE_LANE = process.env.FADE_ORCHESTRATE_CODE_LANE ?? "flash-next";
-export type LaneRole = "think" | "code";
-/** The thinking level a landing's ROLE gets. Keyed by role, not lane: with one lane running both
- *  roles the lane cannot name the role, and a `{ [THINK_LANE]: "high", [CODE_LANE]: "low" }`
- *  literal is a duplicate key whose value is "low". */
-export const THINKING: Record<LaneRole, "high" | "low"> = { think: "high", code: "low" };
+export const THINKING: Record<string, "high" | "low"> = { [THINK_LANE]: "high", [CODE_LANE]: "low" };
 
 export const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -114,41 +108,6 @@ export function serveVerdict(h: RouterHealth | undefined): ServeVerdict {
 		if (model === "") return { serve: false, reason: "health claims a loaded context that names no model: nothing is serving" };
 	}
 	return { serve: true, reason: `context can serve${model !== "" ? ` (${model}${h.loading === false ? ", idle" : ""})` : ""}${free !== undefined ? `, ${Math.round(free)} MiB free` : ", VRAM not reported"}` };
-}
-
-/**
- * The HOST-RAM floor a pack swap must fit in. A lane swap is a RAM event as much as a VRAM one:
- * the MoE tiers stream the pack through system RAM (flash-next 52.2 GiB, deepseek 120 GiB), and
- * the failure mode this guards is the box running out of it MID-swap — the worst place to find
- * it, because the swap is 13-25 s and 52-130 GiB and the OOM takes the run, the engine and
- * whatever else the box was doing. `MemAvailable` is the kernel's own estimate of what a new
- * allocation can get without swapping, so it is the number asked; an unreadable `/proc` is a
- * MISSING reading, never a zero. The floor is read at CALL time, not at module load: the operator
- * can raise it mid-incident without a restart, and a rig flips it per block. `0` disables it.
- */
-export const ramFloorMib = (): number => Math.max(0, Math.trunc(Number(process.env.FADE_ORCHESTRATE_RAM_MIN_FREE_MIB ?? 65_536)) || 0);
-
-/** `MemAvailable` from `/proc/meminfo`, in MiB; `undefined` when the box does not report it. */
-export async function memAvailableMib(): Promise<number | undefined> {
-	let txt: string;
-	try {
-		txt = await readFile("/proc/meminfo", "utf8");
-	} catch {
-		return undefined;
-	}
-	const kb = Number(/^MemAvailable:\s+(\d+)\s*kB$/m.exec(txt)?.[1] ?? NaN);
-	return Number.isFinite(kb) && kb > 0 ? Math.round(kb / 1024) : undefined;
-}
-
-/** The RAM answer for a pack swap, in the same shape as `serveVerdict`: the reason is the cause. */
-export async function ramVerdict(): Promise<ServeVerdict> {
-	const floor = ramFloorMib();
-	const gib = (mib: number) => `${(mib / 1024).toFixed(0)} GiB`;
-	if (floor === 0) return { serve: true, reason: "RAM floor disabled" };
-	const avail = await memAvailableMib();
-	if (avail === undefined) return { serve: false, reason: `/proc/meminfo reports no MemAvailable with the ${gib(floor)} RAM floor ON: a swap whose headroom cannot be measured is a swap to refuse, not to guess` };
-	if (avail < floor) return { serve: false, reason: `MemAvailable ${gib(avail)} is under the ${gib(floor)} pack floor: a 52-130 GiB swap issued here is the recorded RAM exhaustion` };
-	return { serve: true, reason: `MemAvailable ${gib(avail)}, over the ${gib(floor)} pack floor` };
 }
 
 /**

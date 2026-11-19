@@ -9,7 +9,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rm
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { CODE_LANE, THINK_LANE, msg, type LaneRole } from "./router.ts";
+import { msg } from "./router.ts";
 import { WORKER_AGENT } from "./subagent.ts";
 
 const execFileAsync = promisify(execFile);
@@ -37,26 +37,6 @@ export const MAX_ROUNDS = 6;
 export const MAX_TASKS = 6;
 export const TERMINAL: Record<string, true> = { complete: true, failed: true, stopped: true };
 export const PHASE_FOR_STATE: Record<string, string> = { planning: "planning_done", coding: "coding_done", repair: "coding_done", verifying: "verification_done" };
-/**
- * The lane the run's STATE authorizes for its NEXT turn. The code lane is the run's worker; the
- * thinking lane is a guest whose lease ends at its own turn boundary, so every non-terminal state
- * hands the router back to the coder — with ONE exception: `verifying` is the thinking lane's own
- * work, and handing that boundary to the code lane would put the round's verdict in the hands of
- * the lane that wrote the diff. A terminal state authorizes nothing: its lane stays resident.
- */
-export const laneForState = (st: { state: string }): string => (st.state === "verifying" ? THINK_LANE : CODE_LANE);
-
-/** The phases the THINKING role owns: it plans, it verifies, it re-plans a repair. */
-export const thinkPhase = (state: string | undefined): boolean =>
-	state === "planning" || state === "verifying" || state === "repair";
-
-/** The ROLE a landing answers. Two lanes: the lane names the role. ONE lane running both roles
- *  (`FADE_ORCHESTRATE_THINK_LANE == FADE_ORCHESTRATE_CODE_LANE`, the mode a box with one pack's
- *  worth of RAM runs in): the run's STATE is the only thing that tells the planner/verifier from
- *  the coder, so the coder keeps its writers, `low` and the code briefing, and the verifier keeps
- *  the read-only set, `high` and the verify briefing. Two-lane behaviour is bit-identical. */
-export const landingRole = (state: string | undefined, lane: string): LaneRole =>
-	THINK_LANE === CODE_LANE ? (thinkPhase(state) ? "think" : "code") : (lane === THINK_LANE ? "think" : "code");
 
 /**
  * One rejection: a phase the verifier bounced, a payload the schema refused (a formatting slip,
@@ -674,10 +654,6 @@ export interface RunState {
 	/** The last claim-time probe of the verifier lane: what it asked and what answered. Recorded
 	 *  every time the zero-swap route is taken or refused; the panel and `verifier` print it. */
 	lane_probe?: { ok: boolean; detail: string; at: string; ms: number; skipped?: boolean };
-	/** The last OUTSIDE flip of the router's resident lane: a lane this run never authorized, seen at
-	 *  a turn boundary by the session that holds the router claim. That session lands the lane it
-	 *  authorized; a session holding no claim has no authority over the router and records nothing. */
-	lane_hostile?: { resident: string; authorized: string; at: string };
 }
 
 /**

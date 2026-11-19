@@ -23,7 +23,7 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, laneHealth, listLanes, loadLane, observeSwaps, ramVerdict, residentLane, resetFlipLedger, routerBusy, serveVerdict, type LaneRole, type RouterBusy, type ServeVerdict } from "./router.ts";
+import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
 import {
 	DESK_DEADLINE_MS,
 	DESK_SETTLE_MS,
@@ -56,8 +56,6 @@ import {
 	MAX_TASKS,
 	PLAN_ACT_NOTE,
 	PHASE_FOR_STATE,
-	laneForState,
-	landingRole,
 	STATE_FILENAME,
 	STATE_KEY,
 	SCHEMA_HINT, STALL_SYNTHESIZE_AT, acquireInstanceLock, adaptiveRounds, classifyTurnEnd, coalesceWrite, execGitAsync, instanceLockDir, normalizeRun, parseJson, pushRejection, readInstanceLock, readJsonAsync, refreshChecks, refreshRoot, releaseInstanceLock, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
@@ -179,24 +177,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  judging the other's working tree. */
 	let lockDir: string | undefined;
 	let pending: { lane: string; phase: string } | undefined;
-	/** The lane THIS RUN authorized the router to hold, and the moment it landed. ONLY the run start
-	 *  and `runSwitch` set it, so a resident lane this run never named is an OUTSIDE flip: any other
-	 *  process can `POST /v1/load`, and the router answers it by swapping under the run's feet. The
-	 *  grace window is our OWN swap settling — `/v1/models` keeps naming the lane being unloaded while
-	 *  a swap is in flight, and judging that reading hostile answers our own load with a second
-	 *  13-25 s load. A run adopted from disk carries no authorization of its own: the durable
-	 *  `run.lane` is the fallback, and a session without the router claim never restores. */
-	let laneAuth: { lane: string; at: number } | undefined;
-	/** The protocol page a phase-less thinking-lane turn owed, carried onto the code lane's landing
-	 *  briefing by the hand-back. Consumed by exactly ONE landing. */
-	let handbackPage: string | undefined;
-	/** How long after our own landing a resident-lane reading stays unjudged. A swap is 13-25 s;
-	 *  `0` judges every boundary (the rigs run it there). */
-	const LANE_AUTH_GRACE_MS = Math.max(0, Number(process.env.FADE_ORCHESTRATE_LANE_AUTH_GRACE_MS ?? 60_000));
-	/** The tools THIS turn ANSWERED, successfully. A thinking-lane turn that ran a tool did work, so
-	 *  it may hand the router back; a turn that ends with the lane still thinking gets the free nudge.
-	 *  Consumed by `agent_end`, the boundary that asks the question. */
-	let turnTools: string[] = [];
 	/** The desk batch this session CLAIMED and is answering. The claim is the one-use ticket: it is
 	 *  what makes `fade_verdicts` legal for those ids, and what stops the same batch being answered
 	 *  a second time. `undefined` when no batch is in flight. */
@@ -222,11 +202,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let turnSeq = 0;
 	let turnPhase: string | undefined;
 	let turnSwapMs = 0;
-	/** The writers a `think` landing STRIPPED, remembered so a `code` landing can hand them back.
-	 *  One lane runs both roles, so a `think` landing can find an ALREADY-stripped set (the round-1
-	 *  planner lands twice: the start, then `[c]` re-arms it) — the capture at the strip is the only
-	 *  place the writers survive. It accumulates; the coder's set is the current one plus these. */
-	let strippedWriters: string[] = [];
+	/** The active-tool set captured when the verifier sandbox closed; restored when the code lane loads. */
+	let verifierTools: string[] | undefined;
 	/** The lane churn the flip guard observed, as the surfaces render it. `undefined` when the
 	 *  window is quiet, so a healthy run never advertises a flip. */
 	let flipBadge: FlipBadge | undefined;
@@ -304,24 +281,22 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (rec) await appendTurn(runDir, rec);
 	};
 
-	// The THINKING role's tool set: a `think` landing removes the mutating tools and REMEMBERS them;
-	// a `code` landing is the CURRENT active set plus the writers that were stripped, so the strip is
-	// reversible across any number of think landings — which one lane running both roles needs,
-	// because the coder lands on the set a planner already shrank. With one lane it is the landing's
-	// ROLE, not the lane, that says which set is owed. The `tool_call` hook is the enforcement layer
-	// for anything that still tries.
-	const applyToolPolicy = async (role: LaneRole): Promise<void> => {
+	// The thinking lane's tool set: setActiveTools removes the mutating tools on entry to the
+	// verifier lane and restores the captured set when the code lane loads; the `tool_call` hook
+	// is the enforcement layer for anything that still tries.
+	const applyToolPolicy = async (lane: string): Promise<void> => {
 		const active = pi.getActiveTools();
-		if (role === "think") {
-			const writers = active.filter((t) => MUTATING_TOOLS[t] === true);
-			if (writers.length > 0) strippedWriters = [...new Set([...strippedWriters, ...writers])];
+		if (lane === THINK_LANE) {
+			verifierTools = active;
 			const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true);
 			if (!readOnly.includes("fade_phase")) readOnly.push("fade_phase");
 			if (readOnly.length !== active.length) await pi.setActiveTools(readOnly);
 			return;
 		}
-		const restored = [...new Set([...active, ...strippedWriters])];
-		if (restored.length !== active.length) await pi.setActiveTools(restored);
+		if (verifierTools && verifierTools.length > 0) {
+			if (verifierTools.some((t) => !active.includes(t))) await pi.setActiveTools(verifierTools);
+			verifierTools = undefined;
+		}
 	};
 
 	/**
@@ -607,56 +582,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
 	};
 
-	/**
-	 * The router's resident lane, judged against what THIS RUN authorized. The boundary is where this
-	 * is asked, because the boundary is the single load site: an outside flip is answered by the lane
-	 * the run authorized, paid in the ONE load the boundary already owes, so the flip never sticks.
-	 * `undefined` is nothing to act on: this session holds no router claim (a session that does not
-	 * hold the claim has no authority over the router, and must not write a run it does not own), the
-	 * authorized lane is resident, our own swap is still settling, a swap is in flight (answering that
-	 * with a load is the ping-pong the router client exists to stop), the run is terminal (its lane
-	 * stays resident) or paused (the operator's, or the thrash breaker's), or the router names no
-	 * lane at all.
-	 */
-	const hostileFlip = async (): Promise<{ resident: string; authorized: string } | undefined> => {
-		if (!run || lockDir === undefined || TERMINAL[run.state] === true || run.paused === true) return undefined;
-		const authorized = laneAuth?.lane ?? run.lane;
-		if (laneAuth && Date.now() - laneAuth.at < LANE_AUTH_GRACE_MS) return undefined;
-		if ((await laneHealth())?.loading === true) return undefined;
-		const resident = await residentLane();
-		if (!resident || resident === authorized) return undefined;
-		return { resident, authorized };
-	};
-
-	/**
-	 * The safety question a DISCRETIONARY swap answers BEFORE it is paid: the thinking-lane hand-back
-	 * and the hostile restore. The phase contract's own loads keep `runSwitch`'s gates — the idle gate
-	 * that DEFERS, the thrash breaker, the pre-unload verdict — because a loop that never lands its
-	 * lane is a stalled run. These two loads are the loop's OWN initiative, so a box that cannot take
-	 * them SKIPS them, and a skip costs nothing:
-	 *  - the router IDLE, read ONCE and never polled: a hand-back that has to wait is a hand-back
-	 *    skipped, because the wait is the queue the router answers by swapping BACK — 13-25 s and
-	 *    52-130 GiB per flip, the exact cost this load was adding;
-	 *  - the pre-unload health verdict (`serveVerdict`): VRAM floor, hostile state, swap in flight;
-	 *  - HOST RAM over the pack floor (`ramVerdict`): the swap streams the pack through system RAM and
-	 *    the recorded incident is the box running out of it MID-swap;
-	 *  - a QUIET flip window: once the badge counts flips the churn is measured, and a load from this
-	 *    loop is one more flip of it (the breaker at 4 is too late to save the RAM);
-	 *  - no HOSTILE flip inside the window: the restore is the ONE load that window gets.
-	 */
-	const swapSafe = async (recentHostile: boolean): Promise<ServeVerdict> => {
-		const busy = await routerBusy();
-		if (busy.busy) return { serve: false, reason: `router busy: ${busy.reason}` };
-		const serve = serveVerdict(await laneHealth());
-		if (!serve.serve) return { serve: false, reason: `pre-unload gate: ${serve.reason}` };
-		const ram = await ramVerdict();
-		if (!ram.serve) return { serve: false, reason: ram.reason };
-		const flip = flipState(await residentLane(), FLIP_WINDOW_MS);
-		if (flipGuarded(flip)) return { serve: false, reason: `FLIP GUARD: ${flip.flips} swaps in ${flip.window_s}s naming ${flip.competing.join(", ") || "the other lane"}: this loop adds no load to a window that is already churning` };
-		if (recentHostile) return { serve: false, reason: `a hostile flip was recorded at ${run?.lane_hostile?.at ?? "?"}: the restore is the load this window gets, not a second one` };
-		return { serve: true, reason: `idle router, ${ram.reason}, ${flip.flips} flips in ${flip.window_s}s` };
-	};
-
 	// The lane switch as one callable unit: `agent_end` (the single load site) and the overlay's
 	// v/c keys run the SAME sequence — the idle gate, the thrash breaker, setModel,
 	// setThinkingLevel, the settle-then-load router call, persist, paint, briefing. No
@@ -843,12 +768,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
 			return;
 		}
-		// The landing's ROLE, resolved ONCE here from the run's state and the lane: the planner/
-		// verifier and the coder can share one entry, so the lane alone cannot name the role. The
-		// same `role` decides the thinking level, the tool set and the briefing, and it is captured
-		// with the landing, so a state change during the 0 ms briefing timer cannot flip it mid-brief.
-		const role = landingRole(run?.state, lane);
-		pi.setThinkingLevel(THINKING[role]);
+		pi.setThinkingLevel(THINKING[lane]);
 		// Swap watch: samples /health (phase, percent) while the pack loads, reads the
 		// first-completion and steady decode rates off /metrics, and appends a durable history
 		// row per swap — the measurement record behind residency decisions.
@@ -891,35 +811,22 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
 		}
 		if (run) run.lane = lane;
-		// The run authorized this lane with its own load, so from now on a resident lane that names
-		// anything else came from outside.
-		laneAuth = { lane, at: Date.now() };
 		await persist();
 		paint(ctx);
-		await applyToolPolicy(role);
+		await applyToolPolicy(lane);
 		if (gen !== switchGen) return;
-		const target = run;
-		const dir = runDir;
-		// The briefing belongs to the run THIS switch landed, so the object is captured HERE: a
-		// `stop`/`halt`/`--clear`, a session shutdown, or a superseding run start can clear `run`
-		// before this 0 ms timer fires (the hand-back makes boundaries frequent, so the window is
-		// real), and a briefing built for a run that is gone is an uncaught throw inside a HOST timer.
 		setTimeout(async () => {
-			if (gen !== switchGen || !target || run !== target) return; // the briefing is for the lane that LANDED, never one a newer switch replaced, and never a run that stopped
+			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
 			await ensurePhaseTool();
-			// The hand-back's protocol page rides the ONE code-lane landing it was owed: consumed
-			// here, so a later switch to the same lane never re-briefs a stale miss.
-			const carry = lane === CODE_LANE ? handbackPage : undefined;
-			handbackPage = undefined;
 			// A batch briefing is owed to exactly ONE landing: the switch the desk dispatch asked
 			// for. The flag is consumed here, so a later switch to the same lane re-briefs the
 			// round's own page and never repeats the batch.
-			const owed = deskBriefing && lane === THINK_LANE && target.verify_batch;
+			const owed = deskBriefing && lane === THINK_LANE && run?.verify_batch;
 			deskBriefing = false;
-			if (owed && dir) {
-				const st = target;
+			if (owed && runDir && run) {
+				const st = run;
 				const ids = st.verify_batch?.ids ?? [];
-				const d = await readDesk(dir, st.run_id);
+				const d = await readDesk(runDir, st.run_id);
 				if (d) {
 					pi.sendUserMessage(
 						briefings.verifyBatch(st, {
@@ -933,17 +840,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				}
 			}
 			const text = await (
-				target.state === "repair"
-					? briefings.repair(target)
-					: role === "think"
-						? target.state === "planning"
-							? briefings.plan(target)
-							: briefings.verify(target)
-						: target.gate_last && target.gate_last.passed === false
-							? briefings.gate(target)
-							: briefings.code(target)
+				run!.state === "repair"
+					? briefings.repair(run!)
+					: lane === CODE_LANE && run!.gate_last && run!.gate_last.passed === false
+						? briefings.gate(run!)
+						: lane === CODE_LANE
+							? briefings.code(run!)
+							: briefings.verify(run!)
 			);
-			pi.sendUserMessage(carry ? `${text}\n\n${carry}` : text);
+			pi.sendUserMessage(text);
 		}, 0);
 	};
 
@@ -1515,16 +1420,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const active = await readJsonAsync<{ run_id?: string }>(join(dir, ACTIVE_FILENAME));
 			const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : undefined;
 			if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against — nothing was written`);
-			// A TERMINAL run's desk has no dispatcher, so this is not a late request: it is an
-			// UNANSWERABLE one. `dispatchDeskBatch` refuses a terminal run (index.ts:626) and
-			// `fade_phase` refuses it (index.ts:1163); `state.json` is ONE slot that keeps naming the
-			// last run forever, so a worker spawned in this repo after the run ended would register
-			// into a dead desk, block the whole `DESK_WAIT_MS`, exit DEFERRED with nothing judged, and
-			// leave the request on a desk the next start archives. Refuse at the door, naming the
-			// cause the way `fade_phase` names its own, and write nothing.
-			if (state && TERMINAL[state.state] === true) {
-				throw new Error(`fade_verify: run ${runId} is ${state.state}, so its desk has no owner to run the verification pass. A request registered here is never answered: it would block for ${Math.round(DESK_WAIT_MS / 1000)}s and be DEFERRED with nothing judged. Report your slice in your final message; the session that owns live work dispatches its own desk. Nothing was written`);
-			}
 			const rows: unknown[] = Array.isArray(params.checks) ? params.checks : [];
 			const agent = isWorkerSession(ctx) ? workerName(ctx) : "owner";
 			let captured: { request: VerifyRequest; deduped: boolean } | undefined;
@@ -1592,11 +1487,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const active = await readJsonAsync<{ run_id?: string }>(join(dir, ACTIVE_FILENAME));
 			const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : undefined;
 			if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
-			// The same rule as `fade_verify`: a finished run answers no batch, and a verdict written
-			// into a dead desk is read by no session — the ids it names belong to nobody.
-			if (state && TERMINAL[state.state] === true) {
-				throw new Error(`fade_verdicts: run ${runId} is ${state.state}, so no session is waiting on its desk; a verdict written into a finished run's desk is read by nobody. Nothing was written`);
-			}
 			// The public batch number is the LABEL the briefing and the desk print (1-based); the
 			// desk's internal epoch is 0-based. One conversion at the boundary, so no reader ever
 			// meets two numbering systems for the same batch.
@@ -1714,11 +1604,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// a measured zero for workers that never delegated.
 				const d = runDir ? await readDesk(runDir, run.run_id) : undefined;
 				const deskPart = d ? ` · ${deskLine(d)}` : "";
-				// A router the run does not control is the operator's first question, so the flip the
-				// boundary classified rides on the same line as the claim.
-				const hostilePart = run.lane_hostile ? ` · last hostile flip: router ${run.lane_hostile.resident} vs authorized ${run.lane_hostile.authorized}` : "";
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid}${deskPart}${hostilePart} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid}${deskPart} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
@@ -1969,46 +1856,24 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// now, not two rounds later as a wall of red `blocked` rows: in a non-git root the phase
 			// synthesizer has no git evidence at all, so every task lands `blocked`.
 			if (!(await isGitRepo(repo))) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
-			// The census FIRST — one router read answers both questions the start asks: is the
-			// thinking lane already the resident entry, and after a real load, is the entry that
-			// landed the one the run names?
+			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
+			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
+			// in this run reads a pre-load engine state.
+			engineProofInvalidate();
+			const loaded = await loadLane(THINK_LANE);
+			ctx.ui.setWorkingMessage();
+			if (!loaded.ok) {
+				// A start that never began releases its claim: a preflight failure must not strand
+				// the router behind a run that does not exist.
+				releaseLock();
+				ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
+				return;
+			}
 			const census = await listLanes();
 			const resident = census.models.find((m) => m.status === "loaded");
-			if (resident?.id !== THINK_LANE) {
-				// THE GATE, in front of the loop's ONE ungated load. The start is its biggest swap —
-				// a 120 GiB pack stream on a box with 64 GiB `MemAvailable` is the recorded
-				// exhaustion — so it asks the same `serveVerdict` + `ramVerdict` pair every
-				// discretionary swap asks before a byte of `/v1/load` goes out.
-				const serve = serveVerdict(await laneHealth());
-				const ram = await ramVerdict();
-				if (!serve.serve || !ram.serve) {
-					releaseLock();
-					const alt = resident?.id;
-					ctx.ui.notify(`orchestrate: start refused at ZERO loads — ${serve.serve ? ram.reason : serve.reason}; ${THINK_LANE} was not loaded. ${alt ? `The whole loop runs on ${alt} at zero swaps: FADE_ORCHESTRATE_THINK_LANE=${alt} FADE_ORCHESTRATE_CODE_LANE=${alt}.` : `The router names no resident entry to run on; point this session at the lane that is (FADE_ORCHESTRATE_THINK_LANE / FADE_ORCHESTRATE_CODE_LANE).`} Nothing written.`, "error");
-					return;
-				}
-				ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
-				// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
-				// in this run reads a pre-load engine state.
-				engineProofInvalidate();
-				const loaded = await loadLane(THINK_LANE);
-				ctx.ui.setWorkingMessage();
-				if (!loaded.ok) {
-					// A start that never began releases its claim: a preflight failure must not strand
-					// the router behind a run that does not exist.
-					releaseLock();
-					ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
-					return;
-				}
-			}
-			// A resident THINK_LANE pays NO `POST /v1/load` and NO gate — the gate answers a swap
-			// that is not being made, so the start is zero-swap by construction, and the pre-census
-			// above is already the proof; only a real load re-reads the router to verify it.
-			const landed = resident?.id === THINK_LANE ? census : await listLanes();
-			const landedEntry = landed.models.find((m) => m.status === "loaded");
-			if (!landed.error && landedEntry?.id !== THINK_LANE) {
+			if (!census.error && resident?.id !== THINK_LANE) {
 				releaseLock();
-				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${landedEntry ? landedEntry.id : "none"}; nothing written`, "error");
+				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
 				return;
 			}
 			// `state.json` is ONE slot: this keystroke overwrites the run it adopted, and the finished
@@ -2051,15 +1916,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
 				return;
 			}
-			pi.setThinkingLevel(THINKING.think);
-			laneAuth = { lane: THINK_LANE, at: Date.now() };
+			pi.setThinkingLevel(THINKING[THINK_LANE]);
 			paint(ctx);
 			startMetricsTimer();
-			// The round-1 planner is sandboxed EXACTLY like a round-2+ planner landing: `plan` is not a
-			// write phase, so the THINKING role's tool set is what it lands with. The run is `planning`
-			// on `THINK_LANE`, so that role is `"think"` in both lane modes; its think branch activates
-			// `fade_phase` itself, so no separate `ensurePhaseTool()` call rides alongside it.
-			await applyToolPolicy("think");
+			await ensurePhaseTool();
 			pi.sendUserMessage(await briefings.plan(run));
 		},
 	});
@@ -2093,32 +1953,19 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run = normalizeRun(state);
 			settledNotified = false;
 			paint(ctx);
-			// A FINISHED run is adopted for its RECORDS, and for nothing that acts: the panel's engine
-			// columns, `/orchestrate status|desk|runs` and the archive the next start all read the
-			// adopted run, so `run`/`runDir` stay set. It owns no lane and no protocol — `statusLines`
-			// clears the status row for a terminal run, `fade_phase` refuses it, and the desk verbs
-			// refuse it by name — so it starts NO metrics timer. That tick exists to watch the lane a
-			// LIVE run holds; on a finished run it is a `/health` + `/metrics` read and a
-			// `metrics_state.json` write every `METRICS_INTERVAL_MS`, for the whole life of every
-			// session opened in the repo, against a router the run stopped using (measured on the
-			// operator's box: a run complete for days, its metrics file written minutes ago). The
-			// numbers the panel shows are not lost: `agent_start` reads the router once, and the panel's
-			// own provider refreshes it on open and on every keystroke it takes.
-			// It also says NOTHING at login: the one line is for a run that can still act, and
-			// `/orchestrate status` answers the rest.
-			if (TERMINAL[state.state] !== true) {
-				startMetricsTimer();
-				if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-					// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
-					// same line as everything else the login says.
-					setTimeout(async () => {
-						const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-						if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
-					}, 250);
-					runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
-				} else {
-					runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
-				}
+			startMetricsTimer();
+			if (TERMINAL[state.state] === true) {
+				runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
+			} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
+				// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
+				// same line as everything else the login says.
+				setTimeout(async () => {
+					const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
+					if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
+				}, 250);
+				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
+			} else {
+				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
 			}
 		}
 		const line = [chordNote, runNote].filter((n): n is string => n !== undefined).join(" · ");
@@ -2143,37 +1990,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (!run) return;
 		const next = pending;
 		pending = undefined;
-		// Did THIS turn do work? The hand-back is owed only by a thinking-lane turn that COMPLETED —
-		// a `fade_phase` (the `next` branch, the phase contract) or a tool that ANSWERED (an advisor
-		// call, a check it ran). A turn that ends with the lane still thinking keeps the free in-place
-		// nudge at ZERO loads: forcing a swap for a lane that has not finished is how a hand-back
-		// becomes a 52-130 GiB flip per turn. Consumed here, so the next boundary sees only its own.
-		const turnDidWork = turnTools.length > 0;
-		turnTools = [];
-		// The router answers every process on the box, so the resident lane is READ and JUDGED at the
-		// boundary. A lane this run never authorized is an OUTSIDE flip: it is named, recorded, and
-		// answered by the lane the run authorized — and the restore IS a pack swap, so it is paid only
-		// into an idle router with the RAM headroom to land it. A restore that cannot be paid safely
-		// is HELD, not forced: the run pauses with the lane owed, the cause is surfaced, and the one
-		// verb that lands an owed lane releases it.
-		const hostile = await hostileFlip();
-		if (hostile) {
-			run.lane_hostile = { ...hostile, at: new Date().toISOString() };
-			const safe = await swapSafe(false);
-			if (!safe.serve) {
-				run.paused = true;
-				pending = { lane: hostile.authorized, phase: "lane_restore" };
-				pushRejection(run, "task", `HOSTILE LANE FLIP: the router holds ${hostile.resident}, this run authorized ${hostile.authorized}; the restore is HELD: ${safe.reason}. The run is PAUSED with the ${hostile.authorized} load OWED — /orchestrate lanes reset clears the ledger and lands it`);
-				await persist();
-				paint(ctx);
-				ctx.ui.notify(`orchestrate: HOSTILE LANE FLIP — the router holds ${hostile.resident}, not the ${hostile.authorized} this run authorized; restore HELD (${safe.reason}), ZERO swap paid. Paused with the lane owed: /orchestrate lanes reset lands it.`, "warning");
-				void recordTurn("lane_restore_held");
-				return;
-			}
-			pushRejection(run, "task", `HOSTILE LANE FLIP: the router holds ${hostile.resident}, this run authorized ${hostile.authorized}; the authorized lane lands at this boundary (${safe.reason})`);
-			await persist();
-			ctx.ui.notify(`orchestrate: HOSTILE LANE FLIP — the router holds ${hostile.resident}, not the ${hostile.authorized} this run authorized; landing ${hostile.authorized} at this boundary`, "warning");
-		}
 		if (!next) {
 			paint(ctx);
 			if (TERMINAL[run.state] === true) {
@@ -2200,45 +2016,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// debt: `round`/`max_rounds` never move, and while the offending lane is the resident
 			// one a nudge costs nothing (no swap). Three tiers, counted in `stall_count`.
 			const tier = classifyTurnEnd(run, false);
-			// THE HAND-BACK, behind its gates. The code lane is the run's worker and the thinking lane
-			// a guest, so a COMPLETED thinking-lane turn whose state the coder owns hands the router
-			// back at THIS boundary, and the protocol page for the miss rides the code lane's LANDING
-			// briefing (a nudge on the thinking lane keeps re-briefing a lane that is already resident).
-			// The gates are the point: `swapSafe` must answer idle router + VRAM floor + RAM floor +
-			// quiet flip window, because a hand-back paid into a churning window is the ping-pong that
-			// exhausts the box, and the breaker's count of 4 is far too late to save the RAM. A held
-			// hand-back is the OLD behaviour — deepseek stays resident, zero loads, free nudge.
-			// `verifying` is the one state the thinking lane owns: handing that boundary over would put
-			// the round's verdict in the hands of the lane that wrote the diff. A closed desk batch
-			// claimed above and `coding_done`'s verifier swap are the phases that legitimately ask for
-			// the thinking lane; the stall tier keeps its circuit breaker, which halts at ZERO loads.
-			const handbackWanted = tier !== "stall" && turnDidWork && run.lane === THINK_LANE && laneForState(run) === CODE_LANE;
-			let handback = false;
-			if (handbackWanted) {
-				const recentHostile = run.lane_hostile !== undefined && Date.now() - Date.parse(run.lane_hostile.at) < FLIP_WINDOW_MS;
-				const safe = await swapSafe(recentHostile);
-				if (safe.serve) handback = true;
-				else {
-					pushRejection(run, "protocol", `the ${CODE_LANE} hand-back was HELD at this boundary: ${safe.reason}; the ${THINK_LANE} turn stays resident at ZERO cost (tier ${tier}, round ${run.round} unspent)`);
-					await persist();
-					paint(ctx);
-					ctx.ui.notify(`orchestrate: HAND-BACK HELD — ${safe.reason}; no swap paid, ${THINK_LANE} stays resident (round ${run.round} unspent)`, "warning");
-				}
-			}
-			const owedLane = handback ? CODE_LANE : hostile !== undefined && tier !== "stall" ? hostile.authorized : undefined;
-			if (owedLane) {
-				if (handback) {
-					pushRejection(run, "protocol", `the ${THINK_LANE} turn ended with no fade_phase call in state ${run.state}; the ${CODE_LANE} hand-back is owed at this boundary (tier ${tier}, round ${run.round} unspent)`);
-					handbackPage = briefings.nudge(run);
-					ctx.ui.notify(`orchestrate: HAND-BACK — the ${THINK_LANE} turn ended with no phase; ${CODE_LANE} loads at this boundary (round ${run.round} unspent)`, "warning");
-				}
-				await persist();
-				paint(ctx);
-				settledNotified = false;
-				void recordTurn(handback ? "handback" : "lane_restore");
-				requestLane(owedLane, ctx);
-				return;
-			}
 			if (tier === "nudge") {
 				pushRejection(run, "protocol", `turn ended in state ${run.state} with no fade_phase call (nudge ${run.stall_count}/${STALL_SYNTHESIZE_AT})`);
 				await persist();
@@ -2321,10 +2098,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		requestLane(next.lane, ctx);
 	});
 
-	// Enforcement: the verifier's turn is read-only. An edit/write/apply_patch attempted while the
-	// THINKING role holds the run (the `verifying` state, on the lane that landing is on — with one
-	// lane the verifier and the coder share an entry) is refused with the rule named, so the fix is
-	// DELEGATED back to the coder instead of silently applied by the verifier. The sandbox is the denylist
+	// Enforcement: the verifier lane is read-only. An edit/write/apply_patch attempted while the
+	// thinking lane holds the run is refused with the rule named, so the fix is DELEGATED back
+	// to the coder instead of silently applied by the verifier. The sandbox is the denylist
 	// (`MUTATING_TOOLS`), not an allowlist: a host tool this file has never seen cannot slip a
 	// write past it. `task` is NOT refused — it writes nothing itself, its spawned sessions are
 	// inert by `isDelegatedSession`, and refusing it would only block the coding session that
@@ -2384,10 +2160,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// load from inside a tool result, because a load issued mid-turn is the queued-request pattern
 	// the router answers by swapping BACK.
 	pi.on("tool_result", async (event: { toolName?: string; isError?: boolean }, ctx: ExtensionContext) => {
-		// A tool that ANSWERED is the proof a thinking-lane turn COMPLETED its work: it is what makes
-		// the boundary's hand-back owed at all. An errored tool is not a completion, and the plugin's
-		// own `fade_phase` rejection is not one either.
-		if (run && !isDelegatedSession() && event.isError !== true) turnTools.push(event.toolName ?? "?");
 		if (event.toolName !== "task" || !run || !runDir || isDelegatedSession()) return undefined;
 		const desk = await readDesk(runDir, run.run_id);
 		if (!desk || openRequests(desk).length === 0) return undefined;

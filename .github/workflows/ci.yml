@@ -43,13 +43,6 @@ jobs:
       # ledger and the flip guard.
       - name: Gate rig (fake router, no host needed)
         run: npm run test:gate
-      # The single-lane rig proves the mode a box with one pack's worth of RAM runs in:
-      # `FADE_ORCHESTRATE_THINK_LANE == FADE_ORCHESTRATE_CODE_LANE`, the resident entry. Every
-      # landing then pays ZERO `POST /v1/load`, and it is the landing's ROLE — not the lane — that
-      # chooses the tool set, the thinking level and the briefing, so the coder keeps its writers
-      # and the verifier keeps the read-only set. Host-less, like the gate rig.
-      - name: Single-lane rig (one lane, zero swaps)
-        run: npm run test:lane
       # The shipped status surface is ONE line on the top widget, with the Alt+F panel as the detail
       # screen; the line's placement is load-bearing for the transcript, so a regression fails CI.
       - name: The status line ships on the top widget

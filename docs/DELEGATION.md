@@ -135,21 +135,6 @@ definition the host's `task` tool resolves (`Fade verification subagent. Model: 
 router.` plus the procedure). `verifier show` prints it and whether it is installed, and warns when
 its model resolves to the router.
 
-## One lane: what a `passed` row means then
-
-`FADE_ORCHESTRATE_THINK_LANE == FADE_ORCHESTRATE_CODE_LANE` (the mode a box whose `MemAvailable`
-cannot take the pack swap runs in, see the README's "One lane") removes the swap and, with it, the
-independence: the model that wrote the diff is the model that reads the acceptance command. The desk
-still gates the batch — every worker's request, one pass, verdicts by id, `fade_phase` as the only
-writer — and the landing's role is read from the run's STATE, so the verifier still lands read-only
-at `high` thinking and the coder keeps its writers at `low` (`node test/single_lane.mjs`). What is
-NOT bought is the second model. Read a `passed` row from a single-lane run as **self-verified**:
-the gate output is the evidence, the verdict is the author's. When the off-router route is live
-(`FADE_ORCHESTRATE_VERIFIER_MODEL` at a non-router entry) declare churn and the batch leaves the
-router for an independent pass at zero swaps; when it is down — `:8002` answers nothing while both
-GPUs carry basalt, as measured on this box — say so in the row rather than dressing the self-verdict
-as an independent one.
-
 ### The claim-time lane guard, and what OWED means
 
 A claim is the **unrecoverable act**. `claimBatch` stamps `claimed_batch` on every live request
@@ -184,12 +169,6 @@ generate-time 401, which is why a `GET`-shaped probe is not accepted. The readin
   optimistically from the router's state.
 - A worker blocks for at most `timeout_s` (default 600, cap 1800). It returns `deferred` with the
   batch and queue position; the verdict, whenever it lands, is what unblocks the next round.
-- A **finished run's desk is closed at the door.** `state.json` is one slot that keeps naming the last
-  run, so a worker spawned later registers into *it*. `dispatchDeskBatch` will never claim a batch for
-  a run in `complete`/`failed`/`stopped`, so `fade_verify` refuses that registration **in the same
-  tick**, naming the run and its state, and `fade_verdicts` refuses to answer it. A
-  `DESK_WAIT_MS` timeout is the honest answer for a batch that is **owed**; for a run that has ended
-  there is nothing owed, so the worker is told so immediately and nothing is written.
 - A plain worker's request is not awaited by the batch census; the batch never waits on a worker
   that has no verification to ask for.
 
@@ -202,10 +181,8 @@ generate-time 401, which is why a `GET`-shaped probe is not accepted. The readin
 | `node test/gate_rig.mjs` (block 21) | one worker registering pays **zero** loads while its peer is unregistered; a closed batch pays **exactly one** load for both requests; the briefing carries both check commands; a mid-pass arrival is batch 2; verdicts fan out by id; the three gates refuse by name |
 | `node test/gate_rig.mjs` (block 19b) | the thrash breaker **marks the desk** and routes the batch it halts, at zero loads |
 | `node test/gate_rig.mjs` (block 22) | under churn: zero loads, one claim routed `subagent`, the directive carries the off-router model and every worker's check command, the route **stays** for the next batch, `lanes reset` releases it |
-| `node test/gate_rig.mjs` (block 29) | a finished run is adopted for its **records** and owns nothing: **zero** router reads at login where the live adoption in the same block pays them, no login line, the status row cleared, while `/orchestrate status` and the Alt+F screen keep answering it; `fade_verify` refuses its desk **in 0 ms** by name, `fade_verdicts` writes no `verify/desk.json`, and the block pays **zero** `POST /v1/load` |
 | `node --test test/lane.test.mjs` | the provider scan in BOTH `models.yml` forms (the operator's file is the mapping form — a scan that reads only sequences reports every provider missing and prices a swap on every churn batch), the spec resolution, the completion probe through the lane's own auth path, the unset-header rule, the cache window, the disabled state, and the router-entry refusal at ZERO requests |
 | `node --test test/triage.test.mjs` | the triage prompt carries the gate's own rows, the CLI call is tool-less/one-turn/bounded, every failure path returns an empty note, and a banner before the JSON still decodes |
 | `node test/gate_rig.mjs` (block 27) | claim-time guard: a lane that refuses the completion routes `swap` at ONE load with the probe named in the history; a lane that answers keeps `subagent` at ZERO loads; the owed census names ids and does NOT count judged ones |
 | `node test/gate_rig.mjs` (block 28) | red-gate triage: the advisory line rides the briefing, the gate stays **RED** at zero loads (the exit codes are still the verdict), and a CLI that answers nothing changes nothing |
-| `node test/gate_rig.mjs` (block 30) | the **hand-back**: a thinking-lane turn that ends with no `fade_phase` call lands the code lane at the SAME boundary in ONE load, with the protocol page riding the code lane's landing briefing; the verifier's own state `verifying` pays **ZERO** loads and keeps its lane; a terminal boundary pays ZERO; an outside `POST /v1/load` naming the other lane is classified **HOSTILE** and the claim holder lands the lane it authorized in ONE load, while a session with NO claim pays ZERO and writes NOTHING |
 | live `/orchestrate` run over `omp --mode rpc` | run 1: `scout` registered `V1.1`, the default `task` agent `V1.2`, the read-only `reviewer` registered NOTHING (the gap `fade-worker` closes); run 2: both `fade-worker` workers registered (`registered == expected`) and the ready batch sat unclaimed while the owner blocked in `wait` — the deadlock the tool-call claim closes |

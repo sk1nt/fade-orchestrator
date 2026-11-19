@@ -37,27 +37,6 @@ carries no host-specific code.
   note, and the owed lane stays recorded. `/orchestrate lanes reset` clears this process's ledger,
   unpauses and lands the owed lane in one swap. Lane switches are serialised behind one generation
   token, so a superseded switch sets no pill, no lane and sends no briefing (`test/gate_rig.mjs`).
-- **The code lane owns the router between the thinking lane's turns.** The coder is the run's worker
-  and the thinking lane a guest, so a thinking-lane turn that COMPLETED — one that ANSWERED a tool and
-  then ended with no `fade_phase` call: an advisor call, a phase-less turn, a desk pass that ran on the
-  thinking lane — hands the router back to `FADE_ORCHESTRATE_CODE_LANE` at that SAME `agent_end`, and
-  the protocol page for the miss rides the code lane's landing briefing: a nudge on the thinking lane
-  keeps paying 13-25 s loads to re-brief a lane that is already resident. A turn that answered NO tool
-  is the lane still thinking, and keeps the free in-place nudge at ZERO loads.
-  `verifying` is the ONE state the thinking lane owns, so
-  its boundary pays ZERO loads — handing it to the lane that wrote the diff would be
-  self-verification — and a terminal boundary leaves its lane resident. The **router claim is the
-  authority**: the resident lane is read and judged at every boundary, and a lane this run never
-  authorized (any other process on the box can `POST /v1/load`) is classified **HOSTILE LANE FLIP**
-  — named on the status line, in the notify and in the ledger — and answered by the lane the run
-  authorized, paid in the ONE load the boundary already owes, so the flip never sticks. A session
-  holding no claim has no authority over the router: it pays no restore and writes nothing.
-  Both of those are **pack swaps** — 13-25 s and 52-130 GiB — so they pass the gates the loop obeys,
-  the router idle, the pre-unload health line, the **host-RAM floor**
-  (`FADE_ORCHESTRATE_RAM_MIN_FREE_MIB`) and a quiet flip window — and a refusal is a HOLD, never a
-  forced swap: the lane that is resident stays resident at ZERO cost, the round is UNSPENT, the cause
-  rides the ledger, the notify and the row; a restore that cannot be paid PAUSES the run with the lane
-  owed, and `/orchestrate lanes reset` lands it (`node test/gate_rig.mjs` blocks 30 and 31).
 - **Pre-swap gate.** `coding_done` runs every planned check on the code lane *before* the verifier
   swap is issued. A red gate keeps the coding lane resident (0 s), records a rejection, and sends
   the failing output back as the next briefing. The checks run as child processes **off the event
@@ -166,7 +145,7 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_ROUTER` | `http://127.0.0.1:18014` | basalt router base URL |
 | `FADE_ORCHESTRATE_LOCK_DIR` | `~/.local/state/fade-orchestrator` | the base of the **router claim**: one file per router (`<router-slug>/orchestrator.lock`), holding the owning pid, run id, repo, host and start time. A run claims its router at the keystroke and releases it at `halt`/`stop`/completion/preflight failure; a second session on the same router is refused before any lane load or state write, and the refusal, `/orchestrate status` and the screen all name the holder **with the age of the claim** (`· held 12h00m`), which is the "is this a session that never ended?" reading. Set it to move the whole plane (rigs, containers, a read-only home) |
 | `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
-| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane). Set it equal to `FADE_ORCHESTRATE_CODE_LANE` for the **single-lane** mode: zero pack swaps, zero RAM events, and the landing's role read from the run's state (see "One lane") |
+| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane) |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements |
 | `FADE_ORCHESTRATE_KEY` | `alt+f` | the screen's key. The host binds `alt+f` to `tui.editor.cursorWordRight`, so `registerShortcut` is **refused** for it and the extension takes the raw byte: `onTerminalInput` consumes `ESC f` (`1b 66`). No host binding is moved; [`docs/OVERLAY.md`](docs/OVERLAY.md) carries the chord history and the list of free single-alt chords |
 | `FADE_ORCHESTRATE_FALLBACK_KEY` | `alt+shift+i` | the companion chord (ESC + uppercase `I`), registered where the host's probe reports it free. It opens the screen when `FADE_ORCHESTRATE_KEY` names a chord the host holds |
@@ -182,8 +161,6 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | the pre-unload floor. Free VRAM under it, a zero/negative reading, an error state, a loaded context naming no model, a swap in flight, or no answer at all refuses the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
 | `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the gate reports the health line seen when the window ends |
 | `FADE_ORCHESTRATE_FLIP_WINDOW_MS` / `_FLIP_MIN_SWAPS` / `_FLIP_BREAKER_AT` | `120000` / `2` / `4` | the flip window, the count that badges it, and the count that halts the loop. At the breaker a switch issues no `setModel` and no `POST /v1/load`, the run pauses with the flips named, and `/orchestrate lanes reset` clears the ledger and lands the owed lane |
-| `FADE_ORCHESTRATE_RAM_MIN_FREE_MIB` | `65536` | the **host-RAM floor** a lane swap must fit in: a swap is 13-25 s and 52-130 GiB, and the worst moment is MID-swap, with the incoming pack streaming through RAM while the lane being unloaded is still resident (on this box 22 GiB of the deepseek pack is `/dev/shm` tmpfs). Below the floor — or on an unreadable `/proc/meminfo` — the loop issues NO `POST /v1/load` for the hand-back, the hostile restore, and the **start's** preflight load (`/orchestrate <goal>` refuses at zero loads, names the cause, prints the resident-lane recipe and writes nothing), and the cause (`MemAvailable … under the 64 GiB pack floor`) is named on the row, the notify and the ledger. A swap that is not being made is never asked: a thinking lane that is already resident starts with no gate and no load. `0` disables (`node test/gate_rig.mjs` block 31, `node test/single_lane.mjs`) |
-| `FADE_ORCHESTRATE_LANE_AUTH_GRACE_MS` | `60000` | how long after the run's OWN landing the resident-lane reading stays unjudged: `/v1/models` keeps naming the lane being unloaded while a swap is in flight, so judging that reading hostile answers our own load with a second 13-25 s load. `0` judges every boundary (the rigs) |
 | `FADE_ORCHESTRATE_SWITCH_GLYPH` | U+F051F | the icon on the model-switch row, in the same Nerd Font private-use family as the status glyph; an empty value removes it and its space (`test/ui_status.test.mjs`) |
 | `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so the keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call, and a lane load drops the cache. Measured on this box (1103 processes): one walk 2-4 ms, so the TTL is what keeps that out of the panel's refresh path |
 | `FADE_ORCHESTRATE_LEDGER_MAX_BYTES` | `8388608` | the turn ledger's size cap: past it, `metrics.jsonl` rotates to `metrics.jsonl.1` (the older `.1` is replaced) and the append starts a fresh file. `0` disables rotation; `readTurns` reads the current file only, so the rotated-out tail is a postmortem file (`node --test test/history.test.mjs`) |
@@ -212,8 +189,7 @@ listener sees the byte gets a login clause: once per process, on the run's own l
 never prints a key that opens nothing.
 
 - `/orchestrate [--rounds N] [--demo-redact] <goal>` — start a run. It claims the router first (one orchestrator per router: the router carries one resident lane, one live-turn ledger and one flip guard, so two runs on one router would each gate the other's working tree). A claim held by a live pid refuses, naming the pid, run, repo and host; a claim whose owner died is reclaimed. Then it preflights the router: the think lane must load.
-- `/orchestrate status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]` — `status` ends with the swap cost this run paid (`swaps 3 · 41.2s paid`, or `0 swaps`), and its rejections carry the boundary's lane decisions in the operator's words: `last hostile flip: router deepseek vs authorized flash-next`, and a held swap as `protocol: the flash-next hand-back was HELD at this boundary: MemAvailable 65 GiB is under the 8192 GiB pack floor … (tier nudge, round 1 unspent)`; `runs` prints the archived finished runs, newest first; `moe` prints the per-class record (`ci: 3 swaps · 2/3 warm · profile /var/basalt-profiles/flash-next.prof`), the `gpu` split for both lanes, and the build line (`engine 0.4.0 · ext 0.1.0 · bundle 1a2b3c4d`, every missing piece named)
-- `/orchestrate lanes reset` — the release a guard names. It clears THIS process's flip ledger, unpauses the run, and lands the lane the run is OWED — the lane it authorized, or the lane a gate held back — in one swap. It is how the loop resumes on a lane a side-channel took (`/orchestrate status` names what is owed); `/orchestrate halt` is the stop, which leaves the lane where it is.
+- `/orchestrate status | overlay | runs | moe | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]` — `status` ends with the swap cost this run paid (`swaps 3 · 41.2s paid`, or `0 swaps`); `runs` prints the archived finished runs, newest first; `moe` prints the per-class record (`ci: 3 swaps · 2/3 warm · profile /var/basalt-profiles/flash-next.prof`), the `gpu` split for both lanes, and the build line (`engine 0.4.0 · ext 0.1.0 · bundle 1a2b3c4d`, every missing piece named)
 - `/orchestrate handover` — send the condensed digest now (any time, mid-run).
 - `/lanes` — live router census (both entries' status + `/health`).
 
@@ -322,47 +298,6 @@ throughput decision. The **expert slots** row prints the engine's own `spill`, a
 `POST /v1/load {"model":"<alias>"}` and clients wait through them, so an A/B is one request, not a
 restart. Full numbers, method and the reproduce commands: [`docs/quant-choice.md`](docs/quant-choice.md).
 
-The same arithmetic is a **survival** number on a box that runs both lanes: `MemAvailable` measures
-66 GiB idle and 32 GiB under load here, the deepseek pack is 120 GiB and flash-next 52 GiB, and 22 GiB
-of the deepseek pack lives in `/dev/shm` as tmpfs. A lane swap is a host-RAM event as much as a VRAM
-one, and the peak is MID-swap — the pack streaming in while the lane being unloaded is still resident —
-so a swap the loop only *chooses* to pay (the hand-back, the restore of an outside flip) is refused
-below `FADE_ORCHESTRATE_RAM_MIN_FREE_MIB` (default 65536 MiB = 64 GiB, the recorded pack-swap need)
-with the cause named on the row, the notify and the ledger, at ZERO loads and with the round unspent.
-
-## One lane: the mode a box that cannot take the swap runs in
-
-Two lanes is the design, not a requirement: the loop only needs the two ROLES, and one entry can
-play both. Point both at the resident entry —
-
-```bash
-FADE_ORCHESTRATE_THINK_LANE=flash-next FADE_ORCHESTRATE_CODE_LANE=flash-next omp
-```
-
-— and every lane boundary answers `already resident; no swap issued`, so the run pays **zero
-`POST /v1/load`**, zero 13-25 s stalls and zero RAM events for its whole life: the mode a box with
-one pack's worth of `MemAvailable` runs in (the arithmetic above says the two packs never coexist,
-so the preflight load at `/orchestrate <goal>` is the swap that box cannot take).
-
-The keystroke asks that question BEFORE the byte: the start's preflight reads the router's census,
-and when the thinking lane is not the resident entry it runs the same `serveVerdict` + `ramVerdict`
-pair every discretionary swap runs. A red answer releases the router claim and refuses at ZERO loads
-with the cause and the recipe above in one line — `MemAvailable 59 GiB is under the 64 GiB pack
-floor … The whole loop runs on flash-next at zero swaps:
-FADE_ORCHESTRATE_THINK_LANE=flash-next FADE_ORCHESTRATE_CODE_LANE=flash-next` — and writes neither
-`state.json` nor `ACTIVE.json`. With the thinking lane already resident the whole gate-and-load block
-is skipped: no gate latency, no census re-read, no load.
-
-Because one entry now carries both roles, the landing's ROLE is read from the run's **state**, never
-from the lane name: `planning`/`verifying`/`repair` land as the thinking role (read-only tool set,
-`high` thinking, the plan/verify briefing) and `coding` lands as the coder (writers restored, `low`,
-the code/gate briefing). Two-lane runs resolve off the lane exactly as before. The cost is named
-plainly: the verifier is the model that wrote the diff, so a slice's `passed` row is self-verified —
-the independent verdict needs the off-router route (`FADE_ORCHESTRATE_VERIFIER_MODEL` at a model that
-is NOT a router entry, `/orchestrate verifier install`), which costs zero swaps by construction.
-`node test/single_lane.mjs` proves the whole round at zero loads, writers included
-(`npm run test:lane`).
-
 ## Fast handover
 
 A new lane, and a session that resumes after a restart, both start with no conversation: the
@@ -398,19 +333,10 @@ npm run test:gate        # the gate rig — a host-less CI gate (fake pi + stub 
                          # run, the fast path, the
                          # --demo-redact surface, the top-widget surface, the verification desk
                          # (zero loads while a batch is open, ONE load per closed batch, verdicts
-                         # by id), the churn route to a non-router model at zero loads, the
-                         # thinking→code hand-back at one load, the HOSTILE outside flip (the owner
-                         # lands its authorized lane; a session with no claim pays zero), and the
-                         # hand-back's gates: a turn that answered NO tool pays zero, and a busy
-                         # router, a host-RAM floor above `MemAvailable` or a churning window each
-                         # HOLD the swap at zero loads with the cause named, and the release lands it
+                         # by id), and the churn route to a non-router model at zero loads
 node test/load_hostile.mjs # the pre-unload gate against a hostile /health (error state,
                          # zero/low VRAM, no model, swap in flight, unreachable): ZERO
                          # POST /v1/load with the class named
-npm run test:lane       # the single-lane rig (fake pi + stub router, `THINK_LANE == CODE_LANE`):
-                         # a whole round at ZERO `POST /v1/load` — the planner read-only at `high`,
-                         # the coder with its writers restored at `low` and its `edit` NOT blocked,
-                         # the verifier read-only at `high` on the VERIFY briefing, the round accepted
 npm run test:pty         # the pty rig — host-only, needs the omp CLI and tmux: the real
                          # terminal, the live extension, FADE_ORCHESTRATE_LIVE_SMOKE=1
 node test/rpc_rig.mjs    # the rpc rig — host-only, needs the omp CLI: headless proof through
