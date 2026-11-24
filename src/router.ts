@@ -8,7 +8,16 @@
  *   FADE_ORCHESTRATE_PROVIDER default strata-flash
  *   FADE_ORCHESTRATE_THINK_LANE default deepseek   (plans + verifies)
  *   FADE_ORCHESTRATE_CODE_LANE  default flash-next (codes)
+ *   FADE_ORCHESTRATE_SWAP_CMD default /home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh
  */
+import { exec } from "node:child_process";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+const execC = promisify(exec);
+
 export const ROUTER = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:18014";
 export const PROVIDER = process.env.FADE_ORCHESTRATE_PROVIDER ?? "strata-flash";
 export const THINK_LANE = process.env.FADE_ORCHESTRATE_THINK_LANE ?? "deepseek";
@@ -16,6 +25,29 @@ export const CODE_LANE = process.env.FADE_ORCHESTRATE_CODE_LANE ?? "flash-next";
 export const THINKING: Record<string, "high" | "low"> = { [THINK_LANE]: "high", [CODE_LANE]: "low" };
 
 export const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * The swap plane. `POST /v1/load` is no longer sent from here: every pack swap rides
+ * `basalt-ctl.sh` — the fleet gate (VRAM floor, dwell window, circuit, breaker), the minted
+ * approval nonce, and the service lease the census audits. The plugin's own pre-unload gate
+ * stays as the first defense (a hostile `/health` spawns nothing), and the ctl gate is the
+ * authoritative one. Rigs point this at a stub over their fake router, keeping the
+ * "exactly ONE / ZERO POST /v1/load" proofs honest.
+ */
+export const SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "/home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh";
+
+/** Run the swap command to completion (240 s bound, same as the old direct POST). A kill on
+ * timeout is reported as rc 124, never thrown, so the caller's detail names the stage. */
+async function runSwap(command: string): Promise<{ code: number; stdout: string; stderr: string }> {
+	try {
+		const { stdout, stderr } = await execC(command, { timeout: 240_000, maxBuffer: 1 << 20 });
+		return { code: 0, stdout, stderr };
+	} catch (err: unknown) {
+		const e = err as { code?: number; killed?: boolean; stdout?: string; stderr?: string };
+		const code = e?.code ?? (e?.killed ? 124 : 1);
+		return { code, stdout: e?.stdout ?? "", stderr: e?.stderr ?? "" };
+	}
+}
 
 export type RouterLane = { id: string; status: string };
 
@@ -166,14 +198,17 @@ export async function loadLane(lane: string, opts: { lease?: boolean } = {}): Pr
 		return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}
 	try {
-		const r = await fetch(`${ROUTER}/v1/load`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ model: lane, ...(opts.lease ? { lease: true, owner: "fade_orchestrate" } : {}) }),
-			signal: AbortSignal.timeout(240_000),
-		});
-		const text = await r.text();
-		return { ok: r.ok, detail: `http ${r.status} ${text.length > 300 ? `${text.slice(0, 300)}...` : text}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+		// One swap, one lease: the ctl script gates, mints, grants, burns, loads, and the minted
+		// approval nonce rides the service lease the census audits.
+		const dir = await mkdtemp(join(tmpdir(), "fade-swap-"));
+		const jobPath = join(dir, "job.json");
+		await writeFile(jobPath, JSON.stringify({ schema: "farol.job/1", engagement: "ENG-LOCAL-GPU", run: `omp-${Date.now()}`, task: "lane-swap", data_class: "internal", model: lane, swap: true }));
+		const { code, stdout, stderr } = await runSwap(`${SWAP_CMD} '${jobPath}'`);
+		const final = stdout.trim().split("\n").pop() ?? "";
+		const text = `${stdout}${stderr}`.replace(/\s+/g, " ").trim();
+		const ok = code === 0 && final === lane;
+		return { ok, detail: ok ? `swap via ctl: ${lane}${flipNote(flip)}` : `swap ctl refused rc=${code}: ${text.length > 300 ? `${text.slice(0, 300)}...` : text}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	} catch (e) {
 		return { ok: false, detail: `${msg(e)}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}

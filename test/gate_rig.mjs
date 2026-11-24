@@ -208,6 +208,9 @@ const server = http.createServer(async (req, res) => {
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 process.env.FADE_ORCHESTRATE_ROUTER = `http://127.0.0.1:${server.address().port}`;
+// The swap seam: the plugin routes lane loads through the swap command; the rig answers its
+// POSTs on the fake router, so every "exactly ONE / ZERO POST /v1/load" check stays honest.
+process.env.FADE_ORCHESTRATE_SWAP_CMD = `node ${new URL("./swap_stub.mjs", import.meta.url).pathname}`;
 process.env.FADE_ORCHESTRATE_HEADLESS = "1";
 
 // The idle gate and the THRASH BREAKER are configuration, so the rig runs their windows in

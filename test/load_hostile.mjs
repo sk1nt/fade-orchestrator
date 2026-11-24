@@ -55,6 +55,9 @@ const server = createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 process.env.FADE_ORCHESTRATE_ROUTER = `http://127.0.0.1:${port}`;
+// The swap seam: hostile refusals must spawn NOTHING; the healthy case's POST lands on the
+// fake router through the stub, so the load counter keeps its meaning.
+process.env.FADE_ORCHESTRATE_SWAP_CMD = `node ${new URL("./swap_stub.mjs", import.meta.url).pathname}`;
 process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB = "4096";
 process.env.FADE_ORCHESTRATE_SETTLE_POLL_MS = "20";
 process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS = "60";
