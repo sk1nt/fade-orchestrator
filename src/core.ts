@@ -659,6 +659,17 @@ export interface RunState {
 	 *  `/orchestrate status` answers "did that thinking call cost a swap?" with a fact: an in-process
 	 *  call NEVER swaps, so its cost is the elapsed line alone. */
 	lane_call?: { ok: boolean; cls: string; model: string; endpoint: string; ms: number; at: string; chars: number; detail: string };
+	/** The supervisor lane lease this run holds — the single authority over
+	 *  :18014. `lease_state` is `held` (this run may swap under its token),
+	 *  `deferred` (a peer session holds the lease: this run shares the resident
+	 *  coder and never swaps), `released`, or `refused`. `lease_token` is a write
+	 *  capability and is NEVER rendered; the surfaces show holder / granted_ttl_s
+	 *  / hint only (the daemon masks its side the same way). */
+	lease_state?: "held" | "deferred" | "released" | "refused";
+	lease_token?: string;
+	lease_holder?: string;
+	lease_granted_ttl_s?: number;
+	lease_hint?: string;
 }
 
 /**

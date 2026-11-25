@@ -1,0 +1,22 @@
+# The DS window, scoped to THIS repo (= the run root, since /orchestrate takes repo from ctx.cwd).
+# Rationale and measurements: ~/.omp/agent/ds-window.config.yml
+#
+# These six features resolve through GLOBAL roles naming the coder pack (default/smol =
+# flash-next, judge/slow/plan = flash-next:high, vision = flash-next). Any of them can fire
+# while a run holds the thinking lane and flip the router off deepseek: 19.6 s out, 17.6 s
+# back, plus a >1 min context reload. The loop cannot prevent them - the flip guard records
+# each, refuses to pay the reload, and halts the run at 4 swaps in the window.
+#
+# Delete this file when no run is live: `rm .omp/config.yml`. It is git-ignored.
+compaction:
+  midTurnEnabled: false
+find:
+  enabled: "off"
+images:
+  describeForTextModels: false
+recap:
+  enabled: false
+mnemopi:
+  autoRetain: false
+autolearn:
+  enabled: false
