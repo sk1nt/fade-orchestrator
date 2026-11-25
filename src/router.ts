@@ -92,8 +92,10 @@ export async function laneHealth(): Promise<RouterHealth | undefined> {
  *    cannot serve the next lane (the hung-context and half-dead-CUDA class surfaces here);
  *  * `no model` — `loaded: true` while `model` names nothing: a context that claims to be loaded
  *    and cannot say what it loaded is not serving;
- *  * `zero VRAM` / `below the floor` — reported free VRAM at or under zero, or under
- *    `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` (default 8192): no pack lands there;
+ *  * `zero VRAM` — reported free VRAM at or under zero: the CUDA context is dead (the recorded
+ *    half-dead shape) and no pack lands there. A *low* reading is NOT a refusal by default — see
+ *    `VRAM_MIN_FREE_MIB`: a controlled swap unloads the resident pack FIRST, so the free VRAM
+ *    measured while the old pack is still resident is never the room the next pack gets;
  *  * `swap in flight` — `loading: true` at the END of the settle window. The ping-pong this
  *    gate exists to stop (journal: `swap: flash-next ready in 16.4 s`, then `(1 waiting)`,
  *    `(3 waiting)`) is exactly a second load queued behind a running one.
@@ -103,8 +105,13 @@ export interface ServeVerdict {
 	reason: string;
 }
 
-/** Reported free VRAM below this is not a context a pack can land in. */
-export const VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 8192);
+/** Reported free VRAM below this is not a context a pack can land in. The default is ZERO — and
+ *  zero is the honest default: `POST /v1/load` UNLOADS the resident pack before loading the next
+ *  one, so the free VRAM measured with flash-next (52.2 GiB) still resident says nothing about
+ *  the room the DS4 tier will get after the unload. A floor measured pre-unload refuses every
+ *  controlled hand-back on a box that has the room. The lever stays: set
+ *  `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` to arm a floor for a router that keeps old contexts. */
+export const VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 0);
 
 /** Every state the health line reports (`status` and `state` can both ride): a hostile one is a
  *  hostile line, so a healthy `status` never masks a `state` of `cuda_fatal`. */
@@ -173,12 +180,13 @@ export const SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?
  *    row (`verification_done needs_repair` → code, next round's `planning_done` → code), and
  *    a second load of a resident pack re-reads 52 GiB for nothing.
  *  * the router's own `/health` line is read FIRST (`serveVerdict`), and a context that cannot
- *    serve — unreachable, an error state, a loaded context naming no model, zero/low free VRAM,
+ *    serve — unreachable, an error state, a loaded context naming no model, a dead zero-VRAM context,
  *    a swap still in flight — is REFUSED with the class named, and `/v1/load` is never sent.
  */
 // `lease: true` asks the router for the DURABLE load: the lane stays resident until
 // `releaseLease`, and a request naming any other model is refused (409) instead of swapping
-// the lane out — the run's advisory lane runs its full turn.
+// the lane out — the run's advisory lane runs its full turn. The request rides the swap job
+// and `basalt-ctl.sh` puts it in the load body, so the gate and the lease are taken together.
 export async function loadLane(lane: string, opts: { lease?: boolean } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
 	const t0 = Date.now();
 	// Settle any in-flight swap FIRST and keep the health line the window ended on — that
@@ -198,12 +206,11 @@ export async function loadLane(lane: string, opts: { lease?: boolean } = {}): Pr
 		return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}
 	try {
-			body: JSON.stringify({ model: lane, ...(opts.lease ? { lease: true, owner: "fade_orchestrate" } : {}) }),
 		// One swap, one lease: the ctl script gates, mints, grants, burns, loads, and the minted
 		// approval nonce rides the service lease the census audits.
 		const dir = await mkdtemp(join(tmpdir(), "fade-swap-"));
 		const jobPath = join(dir, "job.json");
-		await writeFile(jobPath, JSON.stringify({ schema: "farol.job/1", engagement: "ENG-LOCAL-GPU", run: `omp-${Date.now()}`, task: "lane-swap", data_class: "internal", model: lane, swap: true }));
+		await writeFile(jobPath, JSON.stringify({ schema: "farol.job/1", engagement: "ENG-LOCAL-GPU", run: `omp-${Date.now()}`, task: "lane-swap", data_class: "internal", model: lane, swap: true, ...(opts.lease ? { lease: true } : {}) }));
 		const { code, stdout, stderr } = await runSwap(`${SWAP_CMD} '${jobPath}'`);
 		const final = stdout.trim().split("\n").pop() ?? "";
 		const text = `${stdout}${stderr}`.replace(/\s+/g, " ").trim();

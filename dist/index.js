@@ -37,7 +37,7 @@ async function laneHealth() {
     return void 0;
   }
 }
-var VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 8192);
+var VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 0);
 var healthStates = (h) => ["status", "state"].map((k) => typeof h[k] === "string" && h[k].length > 0 ? h[k].toLowerCase() : void 0).filter((v) => v !== void 0);
 var vramFreeMib = (h) => {
   const direct = finite(h.vram_free_mib) ?? finite(h.free_vram_mib);
@@ -198,16 +198,10 @@ var flipGuarded = (f) => f.flips >= FLIP_MIN_SWAPS;
 var flipBreaker = (f) => f.flips >= FLIP_BREAKER_AT;
 var flipNote = (f) => flipGuarded(f) ? ` \u2014 FLIP GUARD: ${f.flips} swaps in ${f.window_s}s, requests naming ${f.competing.join(", ") || "the other lane"}` : "";
 
-// src/desk.ts
-import { join as join2 } from "node:path";
-
-// src/core.ts
-import { execFile, execFileSync } from "node:child_process";
+// src/lane.ts
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
-import { isAbsolute, join } from "node:path";
 
 // src/subagent.ts
 var VERIFIER_AGENT = process.env.FADE_ORCHESTRATE_VERIFIER_AGENT ?? "fade-verifier";
@@ -381,10 +375,398 @@ function routeLine(route) {
   return route.route === "subagent" ? `verification \u2192 ${VERIFIER_AGENT} on ${VERIFIER_MODEL} \xB7 zero lane loads` : `verification \u2192 ${THINK_LANE} lane \xB7 one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
 }
 
-// src/core.ts
+// src/lane.ts
 var execFileAsync = promisify(execFile);
+var PROBE_TIMEOUT_MS = Number(process.env.FADE_ORCHESTRATE_LANE_PROBE_TIMEOUT_MS ?? 8e3);
+var PROBE_CACHE_MS = Number(process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS ?? 15e3);
+var strip = (v) => {
+  const t = v.trim();
+  if (t.startsWith('"') && t.endsWith('"') && t.length > 1) return t.slice(1, -1).replace(/\\"/g, '"');
+  if (t.startsWith("'") && t.endsWith("'") && t.length > 1) return t.slice(1, -1);
+  return t;
+};
+var unquoteKey = (k) => k.replace(/^["']|["']$/g, "");
+function parseProviderBlocks(yml) {
+  const lines = yml.split("\n");
+  const start = lines.findIndex((l) => /^providers:\s*$/.test(l));
+  if (start < 0) return [];
+  const blocks = [];
+  let current;
+  let entryIndent = -1;
+  let sub;
+  for (let i = start + 1; i < lines.length; i++) {
+    const raw = lines[i];
+    if (/^\s*#/.test(raw) || raw.trim() === "") continue;
+    const indent = raw.length - raw.trimStart().length;
+    if (indent === 0) break;
+    const body = raw.trim();
+    const dash = /^-\s*([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
+    const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
+    const bare = /^-\s*(.+)$/.exec(body);
+    const key = dash ? dash[1] : kv ? kv[1] : "";
+    const value = strip(dash ? dash[2] ?? "" : kv ? kv[2] ?? "" : bare ? bare[1] : "");
+    const opensProvider = kv && value === "" && key !== "models" && key !== "headers" && key !== "compat" && (entryIndent < 0 || indent <= entryIndent) || dash && key === "id" && value !== "" && (entryIndent < 0 || indent <= entryIndent);
+    if (opensProvider) {
+      entryIndent = indent;
+      current = { id: unquoteKey(dash ? value : key), api: "openai-completions", headers: {}, models: [] };
+      blocks.push(current);
+      sub = void 0;
+      continue;
+    }
+    if (!current) continue;
+    if (sub && indent > sub.indent) {
+      if (sub.name === "models") {
+        if (bare) {
+          const id = unquoteKey(strip(/^-\s*(?:id:\s*)?(.+)$/.exec(body)?.[1] ?? ""));
+          if (id && id !== "[]") current.models.push(id);
+        }
+      } else {
+        const hk = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(body.replace(/^-\s*/, ""));
+        if (hk) current.headers[unquoteKey(hk[1])] = strip(hk[2] ?? "");
+      }
+      continue;
+    }
+    if (!kv) continue;
+    sub = void 0;
+    if (value === "") {
+      const next = lines.slice(i + 1).find((l) => l.trim() !== "" && !/^\s*#/.test(l));
+      const nextIndent = next ? next.length - next.trimStart().length : -1;
+      if (nextIndent > indent && (key === "models" || key === "headers")) sub = { name: key, indent };
+      continue;
+    }
+    if (key === "baseUrl") current.baseUrl = value;
+    else if (key === "api") current.api = value;
+    else if (key === "apiKey") current.apiKey = value;
+    else if (key === "authHeader") current.authHeader = value === "true";
+  }
+  return blocks;
+}
+function splitSpec(spec) {
+  const i = spec.indexOf("/");
+  return i < 0 ? { provider: "", model: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
+}
+function resolveLaneSpec(spec, yml, env) {
+  const { provider, model } = splitSpec(spec);
+  const fromEnv = env.FADE_ORCHESTRATE_VERIFIER_BASE_URL?.trim();
+  if (fromEnv) {
+    return {
+      spec: {
+        spec,
+        provider,
+        model,
+        baseUrl: fromEnv.replace(/\/$/, ""),
+        api: env.FADE_ORCHESTRATE_VERIFIER_API?.trim() || "openai-completions",
+        apiKey: env.FADE_ORCHESTRATE_VERIFIER_API_KEY?.trim() || void 0,
+        authHeader: true,
+        headers: {},
+        source: "env"
+      }
+    };
+  }
+  if (!yml) return { error: `${spec}: no baseUrl and no ~/.omp/agent/models.yml, so the verifier lane cannot be resolved, let alone proved live (set FADE_ORCHESTRATE_VERIFIER_BASE_URL to a real server)` };
+  const want = provider || void 0;
+  const blocks = parseProviderBlocks(yml);
+  const block = blocks.find((b) => want ? b.id === want : b.models.includes(model));
+  if (!block) return { error: `${spec}: provider ${want ?? "(any)"} is not in models.yml` };
+  if (!block.baseUrl) return { error: `${spec}: provider ${block.id} declares no baseUrl` };
+  if (block.models.length > 0 && !block.models.includes(model)) {
+    return { error: `${spec}: provider ${block.id} advertises ${block.models.slice(0, 6).join(", ")}${block.models.length > 6 ? ", \u2026" : ""}, not ${model}` };
+  }
+  const key = block.apiKey ?? "";
+  const isCmd = key.startsWith("!");
+  return {
+    spec: {
+      spec,
+      provider: block.id,
+      model,
+      baseUrl: block.baseUrl.replace(/\/$/, ""),
+      api: block.api ?? "openai-completions",
+      apiKey: isCmd ? void 0 : key || void 0,
+      apiKeyCommand: isCmd ? key.slice(1).trim() : void 0,
+      authHeader: block.authHeader === true,
+      headers: block.headers,
+      source: "models.yml"
+    }
+  };
+}
+function substituteEnv(value, env) {
+  let missing = false;
+  const out = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, a, b) => {
+    const v = env[a ?? b];
+    if (v === void 0 || v === "") missing = true;
+    return v ?? "";
+  });
+  return missing ? void 0 : out;
+}
+function fieldOf(payload, key) {
+  return key in payload ? Reflect.get(payload, key) : void 0;
+}
+function advertisedIds(payload) {
+  if (!payload || typeof payload !== "object") return [];
+  const data = fieldOf(payload, "data");
+  if (!Array.isArray(data)) return [];
+  const ids = [];
+  for (const m of data) {
+    if (!m || typeof m !== "object") continue;
+    const id = fieldOf(m, "id") ?? fieldOf(m, "model");
+    if (typeof id === "string" && id !== "") ids.push(id);
+  }
+  return ids;
+}
+function answered(status, payload) {
+  if (status !== 200 || !payload || typeof payload !== "object") return false;
+  for (const key of ["choices", "content", "output"]) {
+    const v = fieldOf(payload, key);
+    if (v !== void 0) return Array.isArray(v) && v.length > 0;
+  }
+  return true;
+}
+var completionRequest = (api, model) => api === "anthropic-messages" ? { path: "/messages", body: { model, max_tokens: 1, messages: [{ role: "user", content: "ping" }] } } : { path: "/chat/completions", body: { model, max_tokens: 1, temperature: 0, stream: false, messages: [{ role: "user", content: "ping" }] } };
+async function runKeyCommand(command, runShell, timeoutMs) {
+  const shell = runShell ?? (async (cmd, ms) => {
+    const r = await execFileAsync("/bin/bash", ["-lc", cmd], { timeout: ms, maxBuffer: 1 << 20, encoding: "utf8" });
+    return { code: 0, out: r.stdout };
+  });
+  try {
+    const r = await shell(command, timeoutMs);
+    const key = r.out.trim();
+    if (r.code !== 0) return { detail: `the lane's key command exited ${r.code}` };
+    if (!key) return { detail: "the lane's key command printed no key" };
+    return { key, detail: "key ok" };
+  } catch (e) {
+    return { detail: `the lane's key command failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+async function probeLane(spec, deps = {}) {
+  const env = deps.env ?? process.env;
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const now = deps.now ?? Date.now;
+  const t0 = now();
+  const timeoutMs = PROBE_TIMEOUT_MS;
+  let note = "";
+  const fail = (detail) => ({ ok: false, detail: `${detail}${note}`, at: t0, ms: now() - t0 });
+  const headers = { "content-type": "application/json" };
+  if (spec.apiKeyCommand) {
+    const k = await runKeyCommand(spec.apiKeyCommand, deps.runShell, timeoutMs);
+    if (!k.key) return fail(k.detail);
+    if (spec.authHeader) headers.authorization = `Bearer ${k.key}`;
+    else headers["x-api-key"] = k.key;
+  } else if (spec.apiKey) {
+    if (spec.authHeader) headers.authorization = `Bearer ${spec.apiKey}`;
+    else headers["x-api-key"] = spec.apiKey;
+  }
+  const dropped = [];
+  for (const [name, decl] of Object.entries(spec.headers)) {
+    const v = substituteEnv(decl, env);
+    if (v === void 0) dropped.push(`${name}: ${decl}`);
+    else headers[name] = v;
+  }
+  if (dropped.length > 0) note = `; sent without ${dropped.join(", ")}`;
+  try {
+    const r = await fetchImpl(`${spec.baseUrl}/models`, { method: "GET", headers, signal: AbortSignal.timeout(timeoutMs) });
+    if (r.ok) {
+      const ids = advertisedIds(await r.json().catch(() => null));
+      if (ids.length > 0 && !ids.includes(spec.model)) return fail(`${spec.baseUrl}/models advertises ${ids.slice(0, 6).join(", ")} \u2014 not ${spec.model}`);
+    }
+  } catch {
+  }
+  const { path, body } = completionRequest(spec.api, spec.model);
+  let res;
+  try {
+    res = await fetchImpl(`${spec.baseUrl}${path}`, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    return fail(`${spec.baseUrl}${path} refused: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    const shown2 = payload !== null ? JSON.stringify(payload).slice(0, 160) : await res.text().then((t) => t.slice(0, 160)).catch(() => "");
+    return fail(`${spec.baseUrl}${path} \u2192 http ${res.status} for model ${spec.model}: ${shown2}`);
+  }
+  if (!answered(res.status, payload)) return fail(`${spec.baseUrl}${path} \u2192 http 200 with no completion for model ${spec.model}`);
+  return { ok: true, detail: `${spec.baseUrl}${path} answered model ${spec.model}${note}`, at: t0, ms: now() - t0 };
+}
+var cache = /* @__PURE__ */ new Map();
+function readModelsYml(env = process.env) {
+  const home = env.HOME;
+  if (!home) return null;
+  try {
+    return readFileSync(`${home}/.omp/agent/models.yml`, "utf8");
+  } catch {
+    return null;
+  }
+}
+async function probeVerifierLane(deps = {}) {
+  const env = deps.env ?? process.env;
+  const model = env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
+  const now = deps.now ?? Date.now;
+  const ttl = Number(env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS ?? PROBE_CACHE_MS);
+  if (ttl <= 0) return { ok: true, skipped: true, detail: "probing disabled (FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS=0)", at: now(), ms: 0 };
+  const hit = cache.get(model);
+  if (hit && now() - hit.at < ttl) return hit;
+  if (isRouterModel(model)) return { ok: false, detail: `${model} is a ROUTER entry: probing it pays the very swap the subagent route exists to avoid, so the zero-swap route is refused`, at: now(), ms: 0 };
+  const resolved = resolveLaneSpec(model, deps.yml !== void 0 ? deps.yml : readModelsYml(env), env);
+  if ("error" in resolved) {
+    const miss = { ok: false, detail: resolved.error, at: now(), ms: 0 };
+    cache.set(model, miss);
+    return miss;
+  }
+  const r = await probeLane(resolved.spec, { ...deps, env });
+  cache.set(model, r);
+  return r;
+}
+function probeLabel(r) {
+  const age = Math.round((Date.now() - r.at) / 1e3 * 10) / 10;
+  return r.skipped ? r.detail : `${r.detail} (${Math.round(r.ms)}ms, read ${age}s ago)`;
+}
+
+// src/thinklane.ts
+var THINK_MODEL = process.env.FADE_ORCHESTRATE_THINK_MODEL ?? `${PROVIDER}/${THINK_LANE}`;
+var ASK_TIMEOUT_MS = Number(process.env.FADE_ORCHESTRATE_THINK_TIMEOUT_MS ?? 18e4);
+var ASK_MAX_TOKENS = Number(process.env.FADE_ORCHESTRATE_THINK_MAX_TOKENS ?? 2048);
+var THINK_PROBE_CACHE_MS = Number(process.env.FADE_ORCHESTRATE_THINK_PROBE_CACHE_MS ?? 15e3);
+var isRouterEndpoint = (baseUrl) => baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "").toLowerCase() === ROUTER.replace(/\/+$/, "").toLowerCase();
+var field = (o, k) => o && typeof o === "object" ? Reflect.get(o, k) : void 0;
+var textOfContent = (content) => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((p) => typeof field(p, "text") === "string" ? field(p, "text") : "").join("");
+  return "";
+};
+function answerText(api, payload) {
+  if (api === "anthropic-messages") {
+    const parts = field(payload, "content");
+    return { text: Array.isArray(parts) ? textOfContent(parts) : "", reasoning: 0 };
+  }
+  const choices = field(payload, "choices");
+  const first = Array.isArray(choices) && choices.length > 0 ? choices[0] : void 0;
+  const message = field(first, "message");
+  const content = textOfContent(field(message, "content"));
+  const reasoning = field(message, "reasoning_content");
+  const finish = field(first, "finish_reason");
+  return {
+    text: content,
+    reasoning: typeof reasoning === "string" ? reasoning.length : 0,
+    ...typeof finish === "string" ? { finish } : {}
+  };
+}
+function resolveAskSpec(model, deps = {}) {
+  const env = deps.env ?? process.env;
+  const { FADE_ORCHESTRATE_VERIFIER_BASE_URL: _b, FADE_ORCHESTRATE_VERIFIER_API: _a, FADE_ORCHESTRATE_VERIFIER_API_KEY: _k, ...rest } = env;
+  return resolveLaneSpec(model, deps.yml !== void 0 ? deps.yml : readModelsYml(env), rest);
+}
+async function authHeaders(spec, env, deps) {
+  const headers = { "content-type": "application/json" };
+  if (spec.apiKeyCommand) {
+    const k = await runKeyCommand(spec.apiKeyCommand, deps.runShell, 8e3);
+    if (!k.key) return { headers: {}, note: `the lane's key command refused: ${k.detail}` };
+    if (spec.authHeader) headers.authorization = `Bearer ${k.key}`;
+    else headers["x-api-key"] = k.key;
+  } else if (spec.apiKey) {
+    if (spec.authHeader) headers.authorization = `Bearer ${spec.apiKey}`;
+    else headers["x-api-key"] = spec.apiKey;
+  }
+  const dropped = [];
+  for (const [name, decl] of Object.entries(spec.headers)) {
+    const v = substituteEnv(decl, env);
+    if (v === void 0) dropped.push(`${name}: ${decl}`);
+    else headers[name] = v;
+  }
+  return { headers, note: dropped.length > 0 ? `; sent without ${dropped.join(", ")}` : "" };
+}
+async function askLane(model, prompt, opts = {}, deps = {}) {
+  const env = deps.env ?? process.env;
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const now = deps.now ?? Date.now;
+  const t0 = now();
+  const timeoutMs = opts.timeoutMs ?? ASK_TIMEOUT_MS;
+  const finish = (r) => ({ ...r, ms: now() - t0, at: t0 });
+  const resolved = resolveAskSpec(model, deps);
+  if ("error" in resolved) {
+    return finish({ ok: false, text: "", cls: "spec_unresolved", endpoint: "", model, detail: resolved.error });
+  }
+  const spec = resolved.spec;
+  const endpoint = `${spec.baseUrl}${completionRequest(spec.api, spec.model).path}`;
+  if (isRouterEndpoint(spec.baseUrl)) {
+    const resident = deps.resident !== void 0 ? deps.resident : await (deps.lanes ?? residentLane)();
+    if (resident !== spec.model) {
+      return finish({
+        ok: false,
+        text: "",
+        cls: "lane_not_resident",
+        endpoint,
+        model: spec.model,
+        detail: `${spec.model} is NOT the resident lane on the router (${ROUTER}; resident ${resident ?? "unknown"}) \u2014 the router answers a request naming a non-resident model by SWAPPING the lane, so this in-process call sends zero bytes. Point FADE_ORCHESTRATE_THINK_MODEL at the resident entry, at a provider on its own port, or take the swap route the authorized loop pays.`
+      });
+    }
+  }
+  const { headers, note } = await authHeaders(spec, env, deps);
+  if (spec.apiKeyCommand && !headers.authorization && !headers["x-api-key"]) {
+    return finish({ ok: false, text: "", cls: "endpoint_unreachable", endpoint, model: spec.model, detail: `${note.replace(/^; /, "")} \u2014 no request sent to ${endpoint}` });
+  }
+  const base = completionRequest(spec.api, spec.model).body;
+  const messages = [];
+  if (opts.system) messages.push({ role: "system", content: opts.system });
+  messages.push({ role: "user", content: prompt });
+  const body = {
+    ...base,
+    model: spec.model,
+    max_tokens: opts.maxTokens ?? ASK_MAX_TOKENS,
+    messages
+  };
+  if (spec.api === "anthropic-messages") {
+    if (opts.system) body.system = opts.system;
+  } else {
+    body.temperature = opts.temperature ?? 0;
+    body.stream = false;
+    if (opts.thinking) body.reasoning_effort = opts.thinking;
+  }
+  let res;
+  try {
+    res = await fetchImpl(endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    const name = e instanceof Error ? e.name : "";
+    const line = e instanceof Error ? e.message : String(e);
+    if (name === "TimeoutError" || name === "AbortError") {
+      return finish({ ok: false, text: "", cls: "timeout", endpoint, model: spec.model, detail: `${endpoint} answered no completion in ${Math.round(timeoutMs / 1e3)}s \u2014 the lane is busy, loading, or wedged; no load and no swap was issued` });
+    }
+    return finish({ ok: false, text: "", cls: "endpoint_unreachable", endpoint, model: spec.model, detail: `${endpoint} refused: ${line} \u2014 an endpoint on its own port does not move the router's lane; nothing was loaded${note}` });
+  }
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    const shown2 = payload !== null ? JSON.stringify(payload).slice(0, 200) : await res.text().then((t) => t.slice(0, 200)).catch(() => "");
+    return finish({ ok: false, text: "", cls: "http_error", endpoint, model: spec.model, detail: `${endpoint} \u2192 http ${res.status} for model ${spec.model}: ${shown2}${note}` });
+  }
+  const { text, reasoning, finish: stop } = answerText(spec.api, payload);
+  if (text.trim() === "") {
+    const why = reasoning > 0 ? `: ${reasoning} chars of REASONING and NO answer text \u2014 the budget was spent inside the thinking channel${stop === "length" ? " (finish_reason length)" : ""}; raise max_tokens (FADE_ORCHESTRATE_THINK_MAX_TOKENS) for this lane` : `: ${payload !== null ? JSON.stringify(payload).slice(0, 200) : "no json"}`;
+    return finish({ ok: false, text: "", cls: "no_completion", endpoint, model: spec.model, detail: `${endpoint} \u2192 http 200 with NO completion text for model ${spec.model}${stop ? ` (finish_reason ${stop})` : ""}${why}${note}` });
+  }
+  return finish({
+    ok: true,
+    text,
+    cls: "ok",
+    endpoint,
+    model: spec.model,
+    detail: `${endpoint} answered model ${spec.model}: ${text.length} chars${reasoning > 0 ? ` (+${reasoning} reasoning)` : ""}${stop === "length" ? " \xB7 TRUNCATED at the token budget (finish_reason length) \u2014 raise max_tokens" : ""}${note}`,
+    ...reasoning > 0 ? { reasoning_chars: reasoning } : {}
+  });
+}
+function askLabel(r) {
+  return `${r.model} ${r.ok ? `answered ${r.text.length} chars in ${(r.ms / 1e3).toFixed(1)}s` : `REFUSED ${r.cls}`} \xB7 ${r.endpoint || "no endpoint resolved"}`;
+}
+
+// src/desk.ts
+import { join as join2 } from "node:path";
+
+// src/core.ts
+import { execFile as execFile2, execFileSync } from "node:child_process";
+import { promisify as promisify2 } from "node:util";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync as readFileSync2, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
+import { isAbsolute, join } from "node:path";
+var execFileAsync2 = promisify2(execFile2);
 async function execGitAsync(repo, args, opts = {}) {
-  const { stdout } = await execFileAsync("git", ["-C", repo, ...args], {
+  const { stdout } = await execFileAsync2("git", ["-C", repo, ...args], {
     timeout: opts.timeout ?? 5e3,
     maxBuffer: opts.maxBuffer ?? 1 << 20,
     encoding: "utf8"
@@ -522,7 +904,7 @@ async function runGate(checks, cwd, onCheck) {
     }
     let out = "";
     try {
-      const r = await execFileAsync("/bin/bash", ["-lc", cmd], { cwd, timeout: Math.min(12e4, remaining), maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
+      const r = await execFileAsync2("/bin/bash", ["-lc", cmd], { cwd, timeout: Math.min(12e4, remaining), maxBuffer: 8 * 1024 * 1024, encoding: "utf8" });
       out = r.stdout;
     } catch (e) {
       const err = e;
@@ -784,7 +1166,7 @@ function writeJson(path, value) {
 var LOCK_FILENAME = "orchestrator.lock";
 function readInstanceLock(dir) {
   try {
-    const raw = JSON.parse(readFileSync(join(dir, LOCK_FILENAME), "utf8"));
+    const raw = JSON.parse(readFileSync2(join(dir, LOCK_FILENAME), "utf8"));
     return raw && typeof raw === "object" ? raw : void 0;
   } catch {
     return void 0;
@@ -1393,253 +1775,6 @@ async function awaitVerdict(dir, runId, id, opts = {}) {
     }
     await sleep(pollMs);
   }
-}
-
-// src/lane.ts
-import { execFile as execFile2 } from "node:child_process";
-import { readFileSync as readFileSync2 } from "node:fs";
-import { promisify as promisify2 } from "node:util";
-var execFileAsync2 = promisify2(execFile2);
-var PROBE_TIMEOUT_MS = Number(process.env.FADE_ORCHESTRATE_LANE_PROBE_TIMEOUT_MS ?? 8e3);
-var PROBE_CACHE_MS = Number(process.env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS ?? 15e3);
-var strip = (v) => {
-  const t = v.trim();
-  if (t.startsWith('"') && t.endsWith('"') && t.length > 1) return t.slice(1, -1).replace(/\\"/g, '"');
-  if (t.startsWith("'") && t.endsWith("'") && t.length > 1) return t.slice(1, -1);
-  return t;
-};
-var unquoteKey = (k) => k.replace(/^["']|["']$/g, "");
-function parseProviderBlocks(yml) {
-  const lines = yml.split("\n");
-  const start = lines.findIndex((l) => /^providers:\s*$/.test(l));
-  if (start < 0) return [];
-  const blocks = [];
-  let current;
-  let entryIndent = -1;
-  let sub;
-  for (let i = start + 1; i < lines.length; i++) {
-    const raw = lines[i];
-    if (/^\s*#/.test(raw) || raw.trim() === "") continue;
-    const indent = raw.length - raw.trimStart().length;
-    if (indent === 0) break;
-    const body = raw.trim();
-    const dash = /^-\s*([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
-    const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
-    const bare = /^-\s*(.+)$/.exec(body);
-    const key = dash ? dash[1] : kv ? kv[1] : "";
-    const value = strip(dash ? dash[2] ?? "" : kv ? kv[2] ?? "" : bare ? bare[1] : "");
-    const opensProvider = kv && value === "" && key !== "models" && key !== "headers" && key !== "compat" && (entryIndent < 0 || indent <= entryIndent) || dash && key === "id" && value !== "" && (entryIndent < 0 || indent <= entryIndent);
-    if (opensProvider) {
-      entryIndent = indent;
-      current = { id: unquoteKey(dash ? value : key), api: "openai-completions", headers: {}, models: [] };
-      blocks.push(current);
-      sub = void 0;
-      continue;
-    }
-    if (!current) continue;
-    if (sub && indent > sub.indent) {
-      if (sub.name === "models") {
-        if (bare) {
-          const id = unquoteKey(strip(/^-\s*(?:id:\s*)?(.+)$/.exec(body)?.[1] ?? ""));
-          if (id && id !== "[]") current.models.push(id);
-        }
-      } else {
-        const hk = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(body.replace(/^-\s*/, ""));
-        if (hk) current.headers[unquoteKey(hk[1])] = strip(hk[2] ?? "");
-      }
-      continue;
-    }
-    if (!kv) continue;
-    sub = void 0;
-    if (value === "") {
-      const next = lines.slice(i + 1).find((l) => l.trim() !== "" && !/^\s*#/.test(l));
-      const nextIndent = next ? next.length - next.trimStart().length : -1;
-      if (nextIndent > indent && (key === "models" || key === "headers")) sub = { name: key, indent };
-      continue;
-    }
-    if (key === "baseUrl") current.baseUrl = value;
-    else if (key === "api") current.api = value;
-    else if (key === "apiKey") current.apiKey = value;
-    else if (key === "authHeader") current.authHeader = value === "true";
-  }
-  return blocks;
-}
-function splitSpec(spec) {
-  const i = spec.indexOf("/");
-  return i < 0 ? { provider: "", model: spec } : { provider: spec.slice(0, i), model: spec.slice(i + 1) };
-}
-function resolveLaneSpec(spec, yml, env) {
-  const { provider, model } = splitSpec(spec);
-  const fromEnv = env.FADE_ORCHESTRATE_VERIFIER_BASE_URL?.trim();
-  if (fromEnv) {
-    return {
-      spec: {
-        spec,
-        provider,
-        model,
-        baseUrl: fromEnv.replace(/\/$/, ""),
-        api: env.FADE_ORCHESTRATE_VERIFIER_API?.trim() || "openai-completions",
-        apiKey: env.FADE_ORCHESTRATE_VERIFIER_API_KEY?.trim() || void 0,
-        authHeader: true,
-        headers: {},
-        source: "env"
-      }
-    };
-  }
-  if (!yml) return { error: `${spec}: no baseUrl and no ~/.omp/agent/models.yml, so the verifier lane cannot be resolved, let alone proved live (set FADE_ORCHESTRATE_VERIFIER_BASE_URL to a real server)` };
-  const want = provider || void 0;
-  const blocks = parseProviderBlocks(yml);
-  const block = blocks.find((b) => want ? b.id === want : b.models.includes(model));
-  if (!block) return { error: `${spec}: provider ${want ?? "(any)"} is not in models.yml` };
-  if (!block.baseUrl) return { error: `${spec}: provider ${block.id} declares no baseUrl` };
-  if (block.models.length > 0 && !block.models.includes(model)) {
-    return { error: `${spec}: provider ${block.id} advertises ${block.models.slice(0, 6).join(", ")}${block.models.length > 6 ? ", \u2026" : ""}, not ${model}` };
-  }
-  const key = block.apiKey ?? "";
-  const isCmd = key.startsWith("!");
-  return {
-    spec: {
-      spec,
-      provider: block.id,
-      model,
-      baseUrl: block.baseUrl.replace(/\/$/, ""),
-      api: block.api ?? "openai-completions",
-      apiKey: isCmd ? void 0 : key || void 0,
-      apiKeyCommand: isCmd ? key.slice(1).trim() : void 0,
-      authHeader: block.authHeader === true,
-      headers: block.headers,
-      source: "models.yml"
-    }
-  };
-}
-function substituteEnv(value, env) {
-  let missing = false;
-  const out = value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, a, b) => {
-    const v = env[a ?? b];
-    if (v === void 0 || v === "") missing = true;
-    return v ?? "";
-  });
-  return missing ? void 0 : out;
-}
-function fieldOf(payload, key) {
-  return key in payload ? Reflect.get(payload, key) : void 0;
-}
-function advertisedIds(payload) {
-  if (!payload || typeof payload !== "object") return [];
-  const data = fieldOf(payload, "data");
-  if (!Array.isArray(data)) return [];
-  const ids = [];
-  for (const m of data) {
-    if (!m || typeof m !== "object") continue;
-    const id = fieldOf(m, "id") ?? fieldOf(m, "model");
-    if (typeof id === "string" && id !== "") ids.push(id);
-  }
-  return ids;
-}
-function answered(status, payload) {
-  if (status !== 200 || !payload || typeof payload !== "object") return false;
-  for (const key of ["choices", "content", "output"]) {
-    const v = fieldOf(payload, key);
-    if (v !== void 0) return Array.isArray(v) && v.length > 0;
-  }
-  return true;
-}
-var completionRequest = (api, model) => api === "anthropic-messages" ? { path: "/messages", body: { model, max_tokens: 1, messages: [{ role: "user", content: "ping" }] } } : { path: "/chat/completions", body: { model, max_tokens: 1, temperature: 0, stream: false, messages: [{ role: "user", content: "ping" }] } };
-async function runKeyCommand(command, runShell, timeoutMs) {
-  const shell = runShell ?? (async (cmd, ms) => {
-    const r = await execFileAsync2("/bin/bash", ["-lc", cmd], { timeout: ms, maxBuffer: 1 << 20, encoding: "utf8" });
-    return { code: 0, out: r.stdout };
-  });
-  try {
-    const r = await shell(command, timeoutMs);
-    const key = r.out.trim();
-    if (r.code !== 0) return { detail: `the lane's key command exited ${r.code}` };
-    if (!key) return { detail: "the lane's key command printed no key" };
-    return { key, detail: "key ok" };
-  } catch (e) {
-    return { detail: `the lane's key command failed: ${e instanceof Error ? e.message : String(e)}` };
-  }
-}
-async function probeLane(spec, deps = {}) {
-  const env = deps.env ?? process.env;
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const now = deps.now ?? Date.now;
-  const t0 = now();
-  const timeoutMs = PROBE_TIMEOUT_MS;
-  let note = "";
-  const fail = (detail) => ({ ok: false, detail: `${detail}${note}`, at: t0, ms: now() - t0 });
-  const headers = { "content-type": "application/json" };
-  if (spec.apiKeyCommand) {
-    const k = await runKeyCommand(spec.apiKeyCommand, deps.runShell, timeoutMs);
-    if (!k.key) return fail(k.detail);
-    if (spec.authHeader) headers.authorization = `Bearer ${k.key}`;
-    else headers["x-api-key"] = k.key;
-  } else if (spec.apiKey) {
-    if (spec.authHeader) headers.authorization = `Bearer ${spec.apiKey}`;
-    else headers["x-api-key"] = spec.apiKey;
-  }
-  const dropped = [];
-  for (const [name, decl] of Object.entries(spec.headers)) {
-    const v = substituteEnv(decl, env);
-    if (v === void 0) dropped.push(`${name}: ${decl}`);
-    else headers[name] = v;
-  }
-  if (dropped.length > 0) note = `; sent without ${dropped.join(", ")}`;
-  try {
-    const r = await fetchImpl(`${spec.baseUrl}/models`, { method: "GET", headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (r.ok) {
-      const ids = advertisedIds(await r.json().catch(() => null));
-      if (ids.length > 0 && !ids.includes(spec.model)) return fail(`${spec.baseUrl}/models advertises ${ids.slice(0, 6).join(", ")} \u2014 not ${spec.model}`);
-    }
-  } catch {
-  }
-  const { path, body } = completionRequest(spec.api, spec.model);
-  let res;
-  try {
-    res = await fetchImpl(`${spec.baseUrl}${path}`, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
-  } catch (e) {
-    return fail(`${spec.baseUrl}${path} refused: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  const payload = await res.json().catch(() => null);
-  if (!res.ok) {
-    const shown2 = payload !== null ? JSON.stringify(payload).slice(0, 160) : await res.text().then((t) => t.slice(0, 160)).catch(() => "");
-    return fail(`${spec.baseUrl}${path} \u2192 http ${res.status} for model ${spec.model}: ${shown2}`);
-  }
-  if (!answered(res.status, payload)) return fail(`${spec.baseUrl}${path} \u2192 http 200 with no completion for model ${spec.model}`);
-  return { ok: true, detail: `${spec.baseUrl}${path} answered model ${spec.model}${note}`, at: t0, ms: now() - t0 };
-}
-var cache = /* @__PURE__ */ new Map();
-function readModelsYml(env = process.env) {
-  const home = env.HOME;
-  if (!home) return null;
-  try {
-    return readFileSync2(`${home}/.omp/agent/models.yml`, "utf8");
-  } catch {
-    return null;
-  }
-}
-async function probeVerifierLane(deps = {}) {
-  const env = deps.env ?? process.env;
-  const model = env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
-  const now = deps.now ?? Date.now;
-  const ttl = Number(env.FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS ?? PROBE_CACHE_MS);
-  if (ttl <= 0) return { ok: true, skipped: true, detail: "probing disabled (FADE_ORCHESTRATE_LANE_PROBE_CACHE_MS=0)", at: now(), ms: 0 };
-  const hit = cache.get(model);
-  if (hit && now() - hit.at < ttl) return hit;
-  if (isRouterModel(model)) return { ok: false, detail: `${model} is a ROUTER entry: probing it pays the very swap the subagent route exists to avoid, so the zero-swap route is refused`, at: now(), ms: 0 };
-  const resolved = resolveLaneSpec(model, deps.yml !== void 0 ? deps.yml : readModelsYml(env), env);
-  if ("error" in resolved) {
-    const miss = { ok: false, detail: resolved.error, at: now(), ms: 0 };
-    cache.set(model, miss);
-    return miss;
-  }
-  const r = await probeLane(resolved.spec, { ...deps, env });
-  cache.set(model, r);
-  return r;
-}
-function probeLabel(r) {
-  const age = Math.round((Date.now() - r.at) / 1e3 * 10) / 10;
-  return r.skipped ? r.detail : `${r.detail} (${Math.round(r.ms)}ms, read ${age}s ago)`;
 }
 
 // src/triage.ts
@@ -3826,7 +3961,9 @@ ${SCHEMA_HINT}` : text);
         verdictNote = `; desk batch ${claimed.batch + 1} answered for ${fan.length} worker request(s) (${fan.filter((f) => f.accepted).length} accepted)`;
       }
       classifyTurnEnd(run, true);
-      if (applied.nextState === "complete" || applied.nextState === "failed") releaseLock();
+      if (applied.nextState === "complete" || applied.nextState === "failed") {
+        releaseLock();
+      }
       let checkpointNote = "";
       if (params.phase === "verification_done" && applied.nextState === "complete") {
         const st = run;
@@ -4023,294 +4160,328 @@ ${SCHEMA_HINT}` : text);
   if (!hostConflict(FALLBACK_KEY)) {
     registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
   }
-  pi.registerCommand("orchestrate", {
-    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
-    handler: async (args, ctx) => {
-      let raw = args.trim();
-      const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
-      if (demo) {
-        const off = demo[1] === "off" || demo[1] === "0";
-        if (off) delete process.env.FADE_ORCHESTRATE_REDACT;
-        else process.env.FADE_ORCHESTRATE_REDACT = "1";
-        raw = raw.replace(demo[0], " ").replace(/\s+/g, " ").trim();
-        paint(ctx);
-        ctx.ui.notify(`orchestrate: demo redaction ${off ? "OFF" : "ON"} \u2014 the row, pill and panel mask the account, host, home and repo path (display only)`, "info");
-        if (raw === "") return;
-      }
-      const first = raw.split(/\s+/)[0] ?? "";
-      if (first === "status") {
-        if (!run) {
-          ctx.ui.notify("orchestrate: no run active", "info");
-          return;
-        }
-        const done = run.tasks.filter((t) => t.status === "passed").length;
-        const claim2 = readInstanceLock(instanceLockDir(ROUTER));
-        const started = claim2 && Number.isFinite(Date.parse(claim2.started)) ? Date.parse(claim2.started) : NaN;
-        const held = Number.isFinite(started) ? ` \xB7 held ${formatElapsed(Math.max(0, (Date.now() - started) / 1e3))}` : "";
-        const cost = runDir ? summarizeSwaps(await readSwaps(runDir), run.run_id) : { count: 0, total_elapsed_s: 0 };
-        const paid = cost.count > 0 ? `swaps ${cost.count} \xB7 ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
-        const d = runDir ? await readDesk(runDir, run.run_id) : void 0;
-        const deskPart = d ? ` \xB7 ${deskLine(d)}` : "";
-        ctx.ui.notify(
-          `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid}${deskPart} \xB7 ${statePath()}`,
-          "info"
-        );
-        paint(ctx);
-        return;
-      }
-      if (first === "runs") {
-        const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
-        const archived = await listRuns(dir);
-        if (archived.length === 0) {
-          ctx.ui.notify(`orchestrate: no archived runs in ${join7(dir, RUNS_DIRNAME)}`, "info");
-          return;
-        }
-        for (const r of archived.slice(0, 5)) {
-          ctx.ui.notify(`run ${r.run_id}: ${r.state} \xB7 ${r.rounds} rounds \xB7 ${r.tasks_passed}/${r.tasks_total} tasks \xB7 ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
-        }
-        if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join7(dir, RUNS_DIRNAME)}`, "info");
-        return;
-      }
-      if (first === "moe") {
-        const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
-        for (const c of classWarmth(await readSwaps(dir))) {
-          ctx.ui.notify(`orchestrate: ${c.cls}: ${c.swaps} swaps \xB7 ${c.warm}/${c.swaps} warm \xB7 profile ${c.profile ?? "none named"}`, "info");
-        }
-        const snap = await fetchMetrics() ?? metrics;
-        if (snap) metrics = snap;
-        for (const r of moeBalanceRows([THINK_LANE, CODE_LANE], {
-          ...process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {},
-          healthByLane: snap?.loaded ? { [snap.loaded]: { spill_experts: snap.spill_experts, spill_total: snap.spill_total, spill_bytes_gb: snap.spill_bytes_gb, slots: snap.slots } } : {}
-        })) {
-          ctx.ui.notify(`orchestrate: ${r.label} \xB7 ${r.value}`, "info");
-        }
-        ctx.ui.notify(`orchestrate: ${versionLine(snap?.engine_version, await packageVersion(), await bundleHash())}`, "info");
-        return;
-      }
-      if (first === "desk") {
-        const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
-        const st = run ?? await readJsonAsync(join7(dir, STATE_FILENAME));
-        if (!st) {
-          ctx.ui.notify(`orchestrate: no run in ${dir}, so there is no desk`, "info");
-          return;
-        }
-        const d = await readDesk(dir, st.run_id);
-        if (!d) {
-          ctx.ui.notify(`orchestrate: no desk file at ${deskPath(dir)} \u2014 no worker has registered a verification request for ${st.run_id}`, "info");
-          return;
-        }
-        const ready = readyToAddress(d, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
-        ctx.ui.notify(`orchestrate: ${deskLine(d)} \xB7 batch ${d.epoch + 1} open since ${d.open_utc}${d.sealed_utc ? ` \xB7 sealed ${d.sealed_utc}` : " \xB7 NOT sealed"} \xB7 ${ready.reason}`, "info");
-        const owed = owedRequests(d);
-        if (owed.length > 0) ctx.ui.notify(`orchestrate: ${owed.length} request(s) CLAIMED with NO verdict \u2014 owed: ${owed.map((r) => r.id).join(", ")}. Nothing re-opens a claimed batch (desk.ts:214), so the run completes over them and the slices behind them are UNVERIFIED; answer them with fade_verdicts`, "error");
-        for (const r of d.requests.slice(-8)) {
-          ctx.ui.notify(`  ${r.id} [batch ${r.batch + 1}] ${r.agent}${r.task_id ? `/${r.task_id}` : ""}: ${r.objective.slice(0, 70)} \u2192 ${r.verdict ? r.verdict.accepted ? "ACCEPTED" : "needs_repair" : r.claimed_batch !== void 0 ? "claimed, verdict owed" : "collecting"}`, "info");
-        }
-        for (const a of d.addressed.slice(-4)) ctx.ui.notify(`  batch ${a.batch + 1} addressed ${a.at} routed ${a.routed}: ${a.ids.join(", ")}`, "info");
-        if (d.churn) ctx.ui.notify(`orchestrate: CHURN ROUTE in force${d.churn_utc ? ` since ${d.churn_utc}` : ""} \u2014 batches go to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}; /orchestrate lanes reset hands them back to the lane`, "warning");
-        return;
-      }
-      if (first === "verifier") {
-        const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
-        const abs = join7(ctx.cwd, verifierAgentPath(ctx.cwd));
-        const absWorker = join7(ctx.cwd, workerAgentPath(ctx.cwd));
-        if (sub === "install") {
-          try {
-            mkdirSync2(join7(ctx.cwd, ".omp", "agents"), { recursive: true });
-            writeFileSync2(abs, verifierAgentMd());
-            writeFileSync2(absWorker, workerAgentMd());
-          } catch (e) {
-            ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
-            return;
-          }
-          const warn = isRouterModel(VERIFIER_MODEL) ? ` WARNING: ${VERIFIER_MODEL} is a ROUTER entry \u2014 a subagent on it pays the very swap this agent exists to avoid; point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1)` : "";
-          ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) and ${workerAgentPath(ctx.cwd)} (inherits the code lane; its tools carry fade_verify) \u2014 the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
-          return;
-        }
-        const installed = existsSync(abs);
-        const installedWorker = existsSync(absWorker);
-        ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} \xB7 model ${VERIFIER_MODEL} \xB7 ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
-        ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} \xB7 inherits the code lane \xB7 ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} \u2014 a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
-        if (installed) ctx.ui.notify(`orchestrate: ${readFileSync4(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
-        const probe = await probeVerifierLane();
-        ctx.ui.notify(`orchestrate: verifier lane ${VERIFIER_MODEL} claim-time probe: ${probeLabel(probe)}`, probe.ok ? "info" : "error");
-        return;
-      }
-      if (first === "overlay") {
-        await openPanelGuarded(ctx);
-        return;
-      }
-      if (first === "handover") {
-        if (!run) {
-          ctx.ui.notify("orchestrate: no run active", "info");
-          return;
-        }
-        pi.sendUserMessage(await handoverText(run));
-        ctx.ui.notify("orchestrate: condensed handover sent", "info");
-        return;
-      }
-      if (first === "lanes" || first === "lane") {
-        if ((raw.split(/\s+/)[1] ?? "") !== "reset") {
-          ctx.ui.notify("orchestrate: `/orchestrate lanes reset` clears the flip ledger and lands the owed lane", "warning");
-          return;
-        }
-        if (!run) {
-          ctx.ui.notify("orchestrate: no run active", "info");
-          return;
-        }
-        const owed = pending;
-        pending = void 0;
-        resetFlipLedger();
-        flipBadge = void 0;
-        if (run?.run_id && runDir) {
-          const d = await readDesk(runDir, run.run_id);
-          if (d?.churn) {
-            await writeJsonAsync(deskPath(runDir), setChurn(d, false));
-            ctx.ui.notify(`orchestrate: churn route cleared \u2014 verification batches answer on the ${THINK_LANE} lane again`, "info");
-          }
-        }
-        run.paused = false;
-        run.operator_note = void 0;
-        const wanted = owed?.lane ?? run.lane;
-        ctx.ui.notify(`orchestrate: flip ledger cleared; landing ${wanted}`, "info");
-        await persist();
-        paint(ctx);
-        void requestLane(wanted, ctx);
-        return;
-      }
-      if (first === "skip" || first === "verify" || first === "reset" || first === "pause" || first === "halt" || first === "code") {
-        if (!run) {
-          ctx.ui.notify("orchestrate: no run active", "info");
-          return;
-        }
-        const dir = first === "skip" ? actSkip(run, raw.split(/\s+/)[1]) : first === "verify" ? actVerify(run) : first === "reset" ? actReset(run) : first === "pause" ? actPause(run, raw.split(/\s+/).slice(1).join(" ") || void 0) : first === "halt" ? actHalt(run) : actCode(run);
-        await persist();
-        paint(ctx);
-        ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
-        if (!run.paused && pending) {
-          const deferred = pending;
-          pending = void 0;
-          requestLane(deferred.lane, ctx);
-        }
-        if (dir.next) requestLane(dir.next, ctx);
-        return;
-      }
-      if (first === "stop") {
-        if (!run) {
-          ctx.ui.notify("orchestrate: no run active", "info");
-          return;
-        }
-        if (TERMINAL[run.state] !== true) {
-          run.state = "stopped";
-          if (runDir) writeJson(statePath(), run);
-        }
-        releaseLock();
-        pending = void 0;
-        clearSurface(ctx);
-        ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
-        if (raw.includes("--clear")) {
-          try {
-            unlinkSync2(join7(runDir, ACTIVE_FILENAME));
-          } catch {
-          }
-          run = void 0;
-        }
-        return;
-      }
-      if (isDelegatedSession()) {
-        ctx.ui.notify("orchestrate: this is a delegated (subagent) session \u2014 the run belongs to the session that started it, so /orchestrate <goal> is refused here", "warning");
-        return;
-      }
-      if (run && TERMINAL[run.state] !== true) {
-        ctx.ui.notify(`orchestrate: run ${run.run_id} is still ${run.state}; /orchestrate stop first`, "warning");
-        return;
-      }
-      let rounds = DEFAULT_ROUNDS;
-      let goal = raw;
-      const roundsMatch = /^--rounds\s+(\S+)\s*/.exec(raw);
-      if (roundsMatch) {
-        rounds = Number(roundsMatch[1]);
-        if (!Number.isInteger(rounds) || rounds < 1 || rounds > MAX_ROUNDS) {
-          ctx.ui.notify(`orchestrate: --rounds takes a whole number 1..${MAX_ROUNDS}`, "warning");
-          return;
-        }
-        goal = raw.slice(roundsMatch[0].length).trim();
-      }
-      if (goal === "" || goal.startsWith("--")) {
-        ctx.ui.notify("orchestrate: usage /orchestrate [--rounds N] <goal>", "warning");
-        return;
-      }
-      const runId = `${(/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
-      const repo = ctx.cwd;
-      const claimDir = instanceLockDir(ROUTER);
-      const claim = acquireInstanceLock(claimDir, { run_id: runId, repo });
-      if (!claim.ok) {
-        ctx.ui.notify(
-          `orchestrate: the router ${ROUTER} is claimed by pid ${claim.holder.pid} \u2014 run ${claim.holder.run_id} in ${claim.holder.repo} on ${claim.holder.host}${claim.stale ? "; its owner died in the same instant as the reclaim, so that instance holds the router" : ""}. End that run (\`/orchestrate stop\` there) or point this session at another router (FADE_ORCHESTRATE_ROUTER / FADE_ORCHESTRATE_LOCK_DIR). Nothing was written.`,
-          "error"
-        );
-        return;
-      }
-      lockDir = claimDir;
-      if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
-      ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
-      engineProofInvalidate();
-      const loaded = await loadLane(THINK_LANE);
-      ctx.ui.setWorkingMessage();
-      if (!loaded.ok) {
-        releaseLock();
-        ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
-        return;
-      }
-      const census = await listLanes();
-      const resident = census.models.find((m) => m.status === "loaded");
-      if (!census.error && resident?.id !== THINK_LANE) {
-        releaseLock();
-        ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
-        return;
-      }
-      const previous = run;
-      runDir = join7(repo, "var", "omp-orchestrate");
-      if (previous && TERMINAL[previous.state] === true) {
-        const archived = await archiveRun(join7(previous.repo || repo, "var", "omp-orchestrate"), previous);
-        if (archived) ctx.ui.notify(`orchestrate: the finished run ${previous.run_id} is archived at ${archived}`, "info");
-      }
-      run = {
-        key: STATE_KEY,
-        run_id: runId,
-        goal,
-        repo,
-        max_rounds: rounds,
-        round: 1,
-        state: "planning",
-        lane: THINK_LANE,
-        checks: [],
-        tasks: [],
-        phases: [],
-        repair_tasks: [],
-        rejection_history: [],
-        schema_retries: 0,
-        started_utc: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      settledNotified = false;
-      await writeJsonAsync(join7(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
-      await persist();
-      const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
-      if (!model) {
-        fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
-        return;
-      }
-      const switched = await pi.setModel(model);
-      if (switched !== true && switched?.switched !== true) {
-        fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
-        return;
-      }
-      pi.setThinkingLevel(THINKING[THINK_LANE]);
+  const orchestrateCommand = async (args, ctx) => {
+    let raw = args.trim();
+    const demo = /(?:^|\s)--demo-redact(?:=(on|off|1|0))?(?=\s|$)/.exec(raw);
+    if (demo) {
+      const off = demo[1] === "off" || demo[1] === "0";
+      if (off) delete process.env.FADE_ORCHESTRATE_REDACT;
+      else process.env.FADE_ORCHESTRATE_REDACT = "1";
+      raw = raw.replace(demo[0], " ").replace(/\s+/g, " ").trim();
       paint(ctx);
-      startMetricsTimer();
-      await ensurePhaseTool();
-      pi.sendUserMessage(await briefings.plan(run));
+      ctx.ui.notify(`orchestrate: demo redaction ${off ? "OFF" : "ON"} \u2014 the row, pill and panel mask the account, host, home and repo path (display only)`, "info");
+      if (raw === "") return;
     }
+    const first = raw.split(/\s+/)[0] ?? "";
+    if (first === "status") {
+      if (!run) {
+        ctx.ui.notify("orchestrate: no run active", "info");
+        return;
+      }
+      const done = run.tasks.filter((t) => t.status === "passed").length;
+      const claim2 = readInstanceLock(instanceLockDir(ROUTER));
+      const started = claim2 && Number.isFinite(Date.parse(claim2.started)) ? Date.parse(claim2.started) : NaN;
+      const held = Number.isFinite(started) ? ` \xB7 held ${formatElapsed(Math.max(0, (Date.now() - started) / 1e3))}` : "";
+      const cost = runDir ? summarizeSwaps(await readSwaps(runDir), run.run_id) : { count: 0, total_elapsed_s: 0 };
+      const paid = cost.count > 0 ? `swaps ${cost.count} \xB7 ${cost.total_elapsed_s.toFixed(1)}s paid` : "0 swaps";
+      const d = runDir ? await readDesk(runDir, run.run_id) : void 0;
+      const deskPart = d ? ` \xB7 ${deskLine(d)}` : "";
+      const call = run.lane_call ? ` \xB7 in-process ${run.lane_call.model} ${run.lane_call.ok ? `answered ${run.lane_call.chars} chars` : `refused ${run.lane_call.cls}`} \xB7 ${(run.lane_call.ms / 1e3).toFixed(1)}s` : " \xB7 no in-process call";
+      ctx.ui.notify(
+        `orchestrate ${run.run_id}: ${run.state} \xB7 lane ${run.lane} \xB7 round ${run.round}/${run.max_rounds} \xB7 tasks ${done}/${run.tasks.length} \xB7 phases ${run.phases.length} \xB7 router claim ${lockDir ? `this run (pid ${process.pid})` : claim2 ? `pid ${claim2.pid} \xB7 ${claim2.run_id} \xB7 ${claim2.repo} \xB7 ${claim2.host}` : "free"}${held} \xB7 ${paid}${deskPart}${call} \xB7 ${statePath()}`,
+        "info"
+      );
+      paint(ctx);
+      return;
+    }
+    if (first === "runs") {
+      const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
+      const archived = await listRuns(dir);
+      if (archived.length === 0) {
+        ctx.ui.notify(`orchestrate: no archived runs in ${join7(dir, RUNS_DIRNAME)}`, "info");
+        return;
+      }
+      for (const r of archived.slice(0, 5)) {
+        ctx.ui.notify(`run ${r.run_id}: ${r.state} \xB7 ${r.rounds} rounds \xB7 ${r.tasks_passed}/${r.tasks_total} tasks \xB7 ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
+      }
+      if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join7(dir, RUNS_DIRNAME)}`, "info");
+      return;
+    }
+    if (first === "moe") {
+      const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
+      for (const c of classWarmth(await readSwaps(dir))) {
+        ctx.ui.notify(`orchestrate: ${c.cls}: ${c.swaps} swaps \xB7 ${c.warm}/${c.swaps} warm \xB7 profile ${c.profile ?? "none named"}`, "info");
+      }
+      const snap = await fetchMetrics() ?? metrics;
+      if (snap) metrics = snap;
+      for (const r of moeBalanceRows([THINK_LANE, CODE_LANE], {
+        ...process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {},
+        healthByLane: snap?.loaded ? { [snap.loaded]: { spill_experts: snap.spill_experts, spill_total: snap.spill_total, spill_bytes_gb: snap.spill_bytes_gb, slots: snap.slots } } : {}
+      })) {
+        ctx.ui.notify(`orchestrate: ${r.label} \xB7 ${r.value}`, "info");
+      }
+      ctx.ui.notify(`orchestrate: ${versionLine(snap?.engine_version, await packageVersion(), await bundleHash())}`, "info");
+      return;
+    }
+    if (first === "desk") {
+      const dir = runDir ?? join7(ctx.cwd, "var", "omp-orchestrate");
+      const st = run ?? await readJsonAsync(join7(dir, STATE_FILENAME));
+      if (!st) {
+        ctx.ui.notify(`orchestrate: no run in ${dir}, so there is no desk`, "info");
+        return;
+      }
+      const d = await readDesk(dir, st.run_id);
+      if (!d) {
+        ctx.ui.notify(`orchestrate: no desk file at ${deskPath(dir)} \u2014 no worker has registered a verification request for ${st.run_id}`, "info");
+        return;
+      }
+      const ready = readyToAddress(d, Date.now(), { settleMs: DESK_SETTLE_MS, deadlineMs: DESK_DEADLINE_MS });
+      ctx.ui.notify(`orchestrate: ${deskLine(d)} \xB7 batch ${d.epoch + 1} open since ${d.open_utc}${d.sealed_utc ? ` \xB7 sealed ${d.sealed_utc}` : " \xB7 NOT sealed"} \xB7 ${ready.reason}`, "info");
+      const owed = owedRequests(d);
+      if (owed.length > 0) ctx.ui.notify(`orchestrate: ${owed.length} request(s) CLAIMED with NO verdict \u2014 owed: ${owed.map((r) => r.id).join(", ")}. Nothing re-opens a claimed batch (desk.ts:214), so the run completes over them and the slices behind them are UNVERIFIED; answer them with fade_verdicts`, "error");
+      for (const r of d.requests.slice(-8)) {
+        ctx.ui.notify(`  ${r.id} [batch ${r.batch + 1}] ${r.agent}${r.task_id ? `/${r.task_id}` : ""}: ${r.objective.slice(0, 70)} \u2192 ${r.verdict ? r.verdict.accepted ? "ACCEPTED" : "needs_repair" : r.claimed_batch !== void 0 ? "claimed, verdict owed" : "collecting"}`, "info");
+      }
+      for (const a of d.addressed.slice(-4)) ctx.ui.notify(`  batch ${a.batch + 1} addressed ${a.at} routed ${a.routed}: ${a.ids.join(", ")}`, "info");
+      if (d.churn) ctx.ui.notify(`orchestrate: CHURN ROUTE in force${d.churn_utc ? ` since ${d.churn_utc}` : ""} \u2014 batches go to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}; /orchestrate lanes reset hands them back to the lane`, "warning");
+      return;
+    }
+    if (first === "think") {
+      const parts = raw.split(/\s+/);
+      const named = parts[1]?.includes("/") === true;
+      const target = named ? parts[1] : THINK_MODEL;
+      const prompt = (named ? parts.slice(2) : parts.slice(1)).join(" ").trim();
+      if (!prompt) {
+        ctx.ui.notify(`orchestrate: usage /orchestrate think [provider/model] <prompt> \u2014 one completion, in process, on the resident lane (default ${THINK_MODEL}); no load, no swap, no lane change`, "info");
+        return;
+      }
+      ctx.ui.setWorkingMessage(`fade_orchestrate: one in-process completion from ${target}\u2026`);
+      const called = await askLane(target, prompt);
+      ctx.ui.setWorkingMessage();
+      if (run) {
+        run.lane_call = { ok: called.ok, cls: called.cls, model: called.model, endpoint: called.endpoint, ms: called.ms, at: (/* @__PURE__ */ new Date()).toISOString(), chars: called.text.length, detail: called.detail };
+        await persist();
+      }
+      if (!called.ok) {
+        ctx.ui.notify(`orchestrate: in-process ${called.cls} \u2014 ${called.detail}`, "error");
+        paint(ctx);
+        return;
+      }
+      const shown2 = called.text.split(/\r?\n/);
+      for (const line of shown2.slice(0, 12)) ctx.ui.notify(`  ${line}`, "info");
+      if (shown2.length > 12) ctx.ui.notify(`  \u2026 ${shown2.length - 12} more line(s) of the answer elided`, "info");
+      ctx.ui.notify(`orchestrate: ${askLabel(called)}`, "info");
+      paint(ctx);
+      return;
+    }
+    if (first === "verifier") {
+      const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
+      const abs = join7(ctx.cwd, verifierAgentPath(ctx.cwd));
+      const absWorker = join7(ctx.cwd, workerAgentPath(ctx.cwd));
+      if (sub === "install") {
+        if (isRouterModel(VERIFIER_MODEL)) {
+          ctx.ui.notify(`orchestrate: verifier install REFUSED: ${VERIFIER_MODEL} is a basalt ROUTER entry \u2014 the advisor is pinned OFF the router. Point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1) and re-run.`, "error");
+          return;
+        }
+        try {
+          mkdirSync2(join7(ctx.cwd, ".omp", "agents"), { recursive: true });
+          writeFileSync2(abs, verifierAgentMd());
+          writeFileSync2(absWorker, workerAgentMd());
+        } catch (e) {
+          ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
+          return;
+        }
+        ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}, pinned off the router) and ${workerAgentPath(ctx.cwd)} (inherits the code lane; its tools carry fade_verify) \u2014 the host discovers agent definitions per session, so a live session needs /new to see it`, "info");
+        return;
+      }
+      const installed = existsSync(abs);
+      const installedWorker = existsSync(absWorker);
+      ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} \xB7 model ${VERIFIER_MODEL} \xB7 ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
+      ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} \xB7 inherits the code lane \xB7 ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} \u2014 a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
+      if (installed) ctx.ui.notify(`orchestrate: ${readFileSync4(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
+      const probe = await probeVerifierLane();
+      ctx.ui.notify(`orchestrate: verifier lane ${VERIFIER_MODEL} claim-time probe: ${probeLabel(probe)}`, probe.ok ? "info" : "error");
+      return;
+    }
+    if (first === "overlay") {
+      await openPanelGuarded(ctx);
+      return;
+    }
+    if (first === "handover") {
+      if (!run) {
+        ctx.ui.notify("orchestrate: no run active", "info");
+        return;
+      }
+      pi.sendUserMessage(await handoverText(run));
+      ctx.ui.notify("orchestrate: condensed handover sent", "info");
+      return;
+    }
+    if (first === "lanes" || first === "lane") {
+      if ((raw.split(/\s+/)[1] ?? "") !== "reset") {
+        ctx.ui.notify("orchestrate: `/orchestrate lanes reset` clears the flip ledger and lands the owed lane", "warning");
+        return;
+      }
+      if (!run) {
+        ctx.ui.notify("orchestrate: no run active", "info");
+        return;
+      }
+      const owed = pending;
+      pending = void 0;
+      resetFlipLedger();
+      flipBadge = void 0;
+      if (run?.run_id && runDir) {
+        const d = await readDesk(runDir, run.run_id);
+        if (d?.churn) {
+          await writeJsonAsync(deskPath(runDir), setChurn(d, false));
+          ctx.ui.notify(`orchestrate: churn route cleared \u2014 verification batches answer on the ${THINK_LANE} lane again`, "info");
+        }
+      }
+      run.paused = false;
+      run.operator_note = void 0;
+      const wanted = owed?.lane ?? run.lane;
+      ctx.ui.notify(`orchestrate: flip ledger cleared; landing ${wanted}`, "info");
+      await persist();
+      paint(ctx);
+      void requestLane(wanted, ctx);
+      return;
+    }
+    if (first === "skip" || first === "verify" || first === "reset" || first === "pause" || first === "halt" || first === "code") {
+      if (!run) {
+        ctx.ui.notify("orchestrate: no run active", "info");
+        return;
+      }
+      const dir = first === "skip" ? actSkip(run, raw.split(/\s+/)[1]) : first === "verify" ? actVerify(run) : first === "reset" ? actReset(run) : first === "pause" ? actPause(run, raw.split(/\s+/).slice(1).join(" ") || void 0) : first === "halt" ? actHalt(run) : actCode(run);
+      await persist();
+      paint(ctx);
+      ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
+      if (!run.paused && pending) {
+        const deferred = pending;
+        pending = void 0;
+        requestLane(deferred.lane, ctx);
+      }
+      if (dir.next) requestLane(dir.next, ctx);
+      return;
+    }
+    if (first === "stop") {
+      if (!run) {
+        ctx.ui.notify("orchestrate: no run active", "info");
+        return;
+      }
+      if (TERMINAL[run.state] !== true) {
+        run.state = "stopped";
+        if (runDir) writeJson(statePath(), run);
+      }
+      releaseLock();
+      pending = void 0;
+      ctx.ui.notify(`orchestrate: stopped; resident lane left as ${run.lane}; state ${statePath()}`, "info");
+      if (raw.includes("--clear")) {
+        try {
+          unlinkSync2(join7(runDir, ACTIVE_FILENAME));
+        } catch {
+        }
+        run = void 0;
+      }
+      return;
+    }
+    if (isDelegatedSession()) {
+      ctx.ui.notify("orchestrate: this is a delegated (subagent) session \u2014 the run belongs to the session that started it, so /orchestrate <goal> is refused here", "warning");
+      return;
+    }
+    if (run && TERMINAL[run.state] !== true) {
+      ctx.ui.notify(`orchestrate: run ${run.run_id} is still ${run.state}; /orchestrate stop first`, "warning");
+      return;
+    }
+    let rounds = DEFAULT_ROUNDS;
+    let goal = raw;
+    const roundsMatch = /^--rounds\s+(\S+)\s*/.exec(raw);
+    if (roundsMatch) {
+      rounds = Number(roundsMatch[1]);
+      if (!Number.isInteger(rounds) || rounds < 1 || rounds > MAX_ROUNDS) {
+        ctx.ui.notify(`orchestrate: --rounds takes a whole number 1..${MAX_ROUNDS}`, "warning");
+        return;
+      }
+      goal = raw.slice(roundsMatch[0].length).trim();
+    }
+    if (goal === "" || goal.startsWith("--")) {
+      ctx.ui.notify("orchestrate: usage /orchestrate [--rounds N] <goal>", "warning");
+      return;
+    }
+    const runId = `${(/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\..*/, "Z").replace("T", "T")}-${Math.random().toString(36).slice(2, 6)}`;
+    const repo = ctx.cwd;
+    const claimDir = instanceLockDir(ROUTER);
+    const claim = acquireInstanceLock(claimDir, { run_id: runId, repo });
+    if (!claim.ok) {
+      ctx.ui.notify(
+        `orchestrate: the router ${ROUTER} is claimed by pid ${claim.holder.pid} \u2014 run ${claim.holder.run_id} in ${claim.holder.repo} on ${claim.holder.host}${claim.stale ? "; its owner died in the same instant as the reclaim, so that instance holds the router" : ""}. End that run (\`/orchestrate stop\` there) or point this session at another router (FADE_ORCHESTRATE_ROUTER / FADE_ORCHESTRATE_LOCK_DIR). Nothing was written.`,
+        "error"
+      );
+      return;
+    }
+    lockDir = claimDir;
+    if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
+    ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
+    const loaded = await loadLane(THINK_LANE);
+    if (!loaded.ok) {
+      releaseLock();
+      ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
+      return;
+    }
+    const census = await listLanes();
+    const resident = census.models.find((m) => m.status === "loaded");
+    if (!census.error && resident?.id !== THINK_LANE) {
+      releaseLock();
+      ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
+      return;
+    }
+    const previous = run;
+    runDir = join7(repo, "var", "omp-orchestrate");
+    if (previous && TERMINAL[previous.state] === true) {
+      const archived = await archiveRun(join7(previous.repo || repo, "var", "omp-orchestrate"), previous);
+      if (archived) ctx.ui.notify(`orchestrate: the finished run ${previous.run_id} is archived at ${archived}`, "info");
+    }
+    run = {
+      key: STATE_KEY,
+      run_id: runId,
+      goal,
+      repo,
+      max_rounds: rounds,
+      round: 1,
+      state: "planning",
+      lane: THINK_LANE,
+      checks: [],
+      tasks: [],
+      phases: [],
+      repair_tasks: [],
+      rejection_history: [],
+      schema_retries: 0,
+      started_utc: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    settledNotified = false;
+    await writeJsonAsync(join7(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+    await persist();
+    const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
+    if (!model) {
+      fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
+      return;
+    }
+    const switched = await pi.setModel(model);
+    if (switched !== true && switched?.switched !== true) {
+      fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
+      return;
+    }
+    pi.setThinkingLevel(THINKING[THINK_LANE]);
+    paint(ctx);
+    startMetricsTimer();
+    await ensurePhaseTool();
+    pi.sendUserMessage(await briefings.plan(run));
+  };
+  pi.registerCommand("orchestrate", {
+    description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | think [model] <prompt> | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+    handler: orchestrateCommand
+  });
+  pi.registerCommand("plan", {
+    description: `/plan [--rounds N] <goal> \u2014 load ${THINK_LANE} (DS4) and plan: DS4 stays resident for the whole planning turn; the only hand-back is the \`planning_done\` phase act`,
+    handler: orchestrateCommand
   });
   pi.on("session_start", async (_event, ctx) => {
     if (isDelegatedSession()) return;

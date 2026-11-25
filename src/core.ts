@@ -654,6 +654,11 @@ export interface RunState {
 	/** The last claim-time probe of the verifier lane: what it asked and what answered. Recorded
 	 *  every time the zero-swap route is taken or refused; the panel and `verifier` print it. */
 	lane_probe?: { ok: boolean; detail: string; at: string; ms: number; skipped?: boolean };
+	/** The last IN-PROCESS lane call (thinklane.ts): the model and endpoint it named, how it ended,
+	 *  the class of a refusal, the elapsed ms and the answer's size. Recorded by the verb so
+	 *  `/orchestrate status` answers "did that thinking call cost a swap?" with a fact: an in-process
+	 *  call NEVER swaps, so its cost is the elapsed line alone. */
+	lane_call?: { ok: boolean; cls: string; model: string; endpoint: string; ms: number; at: string; chars: number; detail: string };
 }
 
 /**

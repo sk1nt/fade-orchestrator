@@ -31,13 +31,40 @@ carries no host-specific code.
   the queued requests name — measured live as a 0–2 s ping-pong. `loadLane` settles an in-flight
   swap first and returns without reloading the resident pack, so a load the resident entry already
   covers never re-reads 52 GiB.
-- **Durable load (lane lease).** `loadLane(lane, { lease: true })` asks the router to pin the lane
-  for the run: a request naming any other model answers 409 instead of queueing, so the resident
-  pack survives the whole advisory turn — the ping-pong above is ended at the router, not only
-  avoided client-side. The run acquires the lease at preflight and on every `switchLane`, and hands
-  it back at every end — complete, failed, stopped — where the router lands its **default** lane
-  (the code lane), so a finished run never pins the box. Release is best-effort: a dead router
-  answers `ok: false`, the run's end never dies on it (`test/lease.test.mjs`).
+- **Planning residency, hand-back at the boundary.** `/plan <goal>` (the planning entry, same
+  handler as `/orchestrate`) loads the thinking lane (DS4) first, and DS4 stays resident through
+  the whole planning turn: the phase state machine authorizes every lane load, and the only
+  planning hand-back is the `planning_done` phase act, which lands the code lane. `coding_done`
+  pays the DS4 load for the verification turn and DS stays through it. Terminal states hand the
+  lane back to the code lane at the turn boundary (a quiet `setModel` + load, no briefing), `/orchestrate
+  stop` does the same at the keystroke, and a **non-run session** whose turn ran on the thinking
+  lane hands back at its `agent_end`; delegated sessions never touch the lane. Nothing inside this
+  plugin swaps the thinking lane out mid-turn: loads ride the single `agent_end` site, after the
+  turn is closed.
+- **The advisor is pinned OFF the router.** The desk verifier (`FADE_ORCHESTRATE_VERIFIER_MODEL`,
+  default `ninfer-local/coder-gpu1`) pays ZERO lane loads; naming a basalt router entry is refused
+  twice — `verifier install` refuses to write it, and the claim-time probe (`probeVerifierLane`)
+  refuses the route, falling back to the authorized swap path. An advisor never requests a DS4
+  load. Red-gate triage is a tool-less external CLI (`grok`) on its own model; it never touches
+  the router.
+
+  The plugin's own thinking call is **in process**. One completion the plugin issues itself
+  (`thinklane.ts`, `/orchestrate think`) never touches the lane: no `setModel`, no load, no briefing,
+  no swap row — its only cost is the decode. The rule that keeps that honest is RESIDENCY: a request
+  naming a model the router does NOT hold is answered by the router swapping the lane (13-25 s per
+  direction, 52.2 GiB / 242.1 GiB), so `askLane` refuses it as `lane_not_resident` with **zero bytes
+  sent**, and `probeThink` refuses to prove such a lane for the same reason. An endpoint on its own
+  port is a different server and is always served — and on this box the DeepSeek-V4.1 server
+  (`basalt-deepseek`, `:18016`) claims BOTH cards and is systemd `Conflicts=` with the resident
+  `:18014` lane, so "its own port" isolates the router, it does not coexist with the Flash-Next pack.
+  A `lane_not_resident` or `endpoint_unreachable` line is that topology being named, not a bug to fix
+  by loading DS4 mid-session.
+- **No pre-unload VRAM floor by default.** A controlled swap unloads the resident pack FIRST, so
+  free VRAM measured with the old pack resident is not the room the next pack gets — a floor
+  measured there refuses every hand-back on a box that has the room. The lever
+  (`FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB`) stays for routers that keep old contexts; it is armed by
+  the operator, off by default. The dead-context classes (unreachable, error state, zero VRAM,
+  loaded-naming-no-model, swap in flight) and the idle/busy/flip guards stay.
 - **Lane thrash breaker.** Swaps the router reports away from the run's lane are counted in a
   window. Past `FADE_ORCHESTRATE_FLIP_BREAKER_AT` (4) the loop stops paying: no `setModel`, no
   `POST /v1/load`, the run pauses with the flips, the window and the competing entry in its operator
@@ -175,6 +202,9 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_VERIFIER_MODEL` | `ninfer-local/coder-gpu1` | the churn route's model. It **must not** resolve to the router: a router entry is a lane load behind the guard, which is the cost the route exists to pay zero of. On this box `@gpu1`, `@slow`, `@task` and `@judge` all resolve to the router entry, so a bare alias is a refusal, not a preference |
 | `FADE_ORCHESTRATE_LANE_PROBE_TIMEOUT_MS` / `_LANE_PROBE_CACHE_MS` | `8000` / `15000` | the **claim-time verifier-lane probe**. Before the desk claims a batch for the zero-swap `subagent` route, the lane must answer ONE 1-token completion through its own auth path: its provider key is a command, so a reachable port and a 200 on `/v1/models` can coexist with a generate-time 401, and a claimed batch has **no reclaim path** (`desk.ts:214`) — the batch is owed for the whole run, and each re-registering worker adds another owed request (`desk.ts:285` dedupes only unclaimed ones). A refusal does not claim: the batch takes the `swap` route, the probe is in the operator line, the rejection history and `state.lane_probe`. The reading is cached for `_CACHE_MS`; `0` disables probing (the rigs) and is reported as `skipped`, never as a pass. A **router entry is never probed**: a completion to it pays the swap the route exists to avoid |
 | `FADE_ORCHESTRATE_VERIFIER_BASE_URL` / `_VERIFIER_API_KEY` / `_VERIFIER_API` | unset | point the probe at an explicit endpoint — a rig's stub lane, or a host with no `~/.omp/agent/models.yml`. When set, the spec's provider part is ignored and the scan is skipped |
+| `FADE_ORCHESTRATE_THINK_MODEL` | `strata-flash/deepseek` | the lane `/orchestrate think` calls by default. A **router** entry is served only while it IS the resident lane (else `lane_not_resident`, zero bytes sent); a provider on its own port is always served. The `FADE_ORCHESTRATE_VERIFIER_*` overrides deliberately do NOT move this lane — one lever per lane, so a reading names the server that answered |
+| `FADE_ORCHESTRATE_THINK_TIMEOUT_MS` / `_THINK_MAX_TOKENS` | `180000` / `2048` | one in-process request's window and budget: the window is the 13-25 s swap the call replaces, with slack for a 60-90 tok/s SSD-tier decode. A budget spent inside the thinking channel answers with a **null content** and `finish_reason: length` (measured at 24 tokens on the live lane) — the refusal names the reasoning length and points at this lever, never a silent empty success |
+| `FADE_ORCHESTRATE_THINK_PROBE_CACHE_MS` | `15000` | the in-process lane probe's cache window; `0` disables probing and that answer carries `skipped`, so a disabled probe is never read as a proved lane |
 | `FADE_ORCHESTRATE_GATE_TRIAGE` / `_GATE_TRIAGE_BIN` / `_GATE_TRIAGE_TIMEOUT_MS` | set / `grok` / `45000` | red-gate **triage**: after a red pre-swap gate, ONE bounded `--disallowed-tools '*'` CLI call names the probable cause from the tails the gate already captured, as one advisory line on the briefing and the tool's answer. Zero authority: the verdict stays the checks' exit codes, no lane load is paid, the advisory agent cannot touch the tree, and a timeout / missing binary / cancelled turn ships the briefing unchanged (`0` disables) |
 | `FADE_ORCHESTRATE_VERIFIER_AGENT` | `fade-verifier` | the verification subagent's name: the `task` call's `agent`, and the file `/orchestrate verifier install` writes at `.omp/agents/<name>.md` |
 
@@ -242,6 +272,7 @@ recorded on the desk batch and in the run's rejection history, holds for every l
 run, and is released by `/orchestrate lanes reset`.
 
 - `/orchestrate desk` — the queue: batch epoch, open / awaiting-verdict / answered counts, churn state, verifier model.
+- `/orchestrate think [provider/model] <prompt>` — ONE in-process completion: the plugin's own request to the endpoint the provider plane resolves, the answer printed, the endpoint and elapsed named. No `setModel`, no `POST /v1/load`, no lane change in any branch; naming a non-resident router entry refuses as `lane_not_resident`, a dead endpoint names `endpoint_unreachable`, a budget spent thinking names `no_completion` with the reasoning length. The last call lands on `state.lane_call` and `/orchestrate status` prints it, in words (`no in-process call`) when there was none. Measured on the live box, three runs: the resident lane answered in **0.1-1.0 s** (5 answer chars + 109-118 reasoning; the slow run queued behind the session's own traffic on the lane), the owed DS lane refused in **4-5 ms** with zero bytes sent, `:18016` down as `endpoint_unreachable`, the router's resident entry identical before and after — `node test/build.mjs && node test/thinklane_live.mjs` prints `PROOF PASS`.
 - `/orchestrate verifier install` — write TWO definitions in one act: `.omp/agents/fade-verifier.md` (the batch judge, pinned to a non-router model) and `.omp/agents/fade-worker.md` (the worker, whose `tools:` line carries `fade_verify`). `verifier show` prints both and says which are installed.
 - `fade_verdicts {batch, verdicts}` — the desk write for a verifier that runs **outside** the phase protocol (the subagent): post the verdicts by id, fan them out, unblock the workers.
 

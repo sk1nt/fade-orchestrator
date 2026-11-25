@@ -10,7 +10,7 @@ outranks one that would only be nicer to read. Every proposal below obeys the re
 ([`OVERLAY.md`](OVERLAY.md)): a number nobody measured is NAMED, never printed as a zero — so
 each one states what its row prints when the measurement is missing.
 
-Five proposals are open. Four features the sweep found as gaps are IMPLEMENTED, shipped alongside
+Five proposals are open. Five features the sweep found as gaps are IMPLEMENTED, shipped alongside
 this document, and are listed last so the ranking does not read as a wish list that never shipped.
 
 ## 1. `/orchestrate gate` — price the tree without paying a lane load
@@ -232,3 +232,41 @@ The screen said what the last swaps cost and never what THIS run paid. `swapSumm
 
 and it rides as the first row of the LANE SWAPS block (the `swapBlock` in `src/panel.ts`), above the
 per-swap rows, which are unchanged. Accepted by: `node --test test/panel_data.test.mjs`.
+
+## 10. The in-process lane call — IMPLEMENTED
+
+The gap: every thinking act the session took was a lane BOUNDARY — `setModel` plus `POST /v1/load`,
+13-25 s per direction, the flip guard halting the loop at `FLIP_BREAKER_AT` swaps inside
+`FLIP_WINDOW_MS`. The plugin had no way to ask a model ONE question: every completion it wanted was
+a lane load. `src/thinklane.ts` is that client — one completion the plugin issues itself, resolved
+from the provider plane exactly the way the claim-time probe resolves it (`resolveLaneSpec`,
+`runKeyCommand`, `completionRequest` in `src/lane.ts`), with no load call and no `setModel` anywhere
+in the file. The rule that keeps that honest:
+
+```ts
+	if (isRouterEndpoint(spec.baseUrl)) {
+		const resident = deps.resident !== undefined ? deps.resident : await (deps.lanes ?? residentLane)();
+		if (resident !== spec.model) {
+			return finish({ ok: false, text: "", cls: "lane_not_resident", endpoint, model: spec.model, detail: … });
+```
+
+…because the router answers a request naming a model it does not hold by SWAPPING the lane, so the
+refusal sends ZERO bytes and names the way out. An endpoint on its own port is a different server and
+is always served; on this box `basalt-deepseek` (`:18016`, the 242.1 GiB pack, both cards, systemd
+`Conflicts=` with the resident `:18014`) cannot coexist with the Flash-Next pack, so a
+`lane_not_resident` / `endpoint_unreachable` line IS the topology, named. The classes are closed:
+`lane_not_resident`, `endpoint_unreachable`, `timeout`, `http_error`, `no_completion`,
+`spec_unresolved`. A token budget spent inside the thinking channel answers with a NULL `content` and
+`finish_reason: length` (measured on the live lane at 24 tokens) — the refusal names the reasoning
+length and the lever to raise, never a silent empty success.
+
+The operator surface is `/orchestrate think [provider/model] <prompt>`: the answer printed with the
+endpoint and the elapsed, `state.lane_call` as the record, and the `status` line naming it — in words
+(`no in-process call`) when none happened, because a measurement-free zero is never printed.
+
+Accepted by: `node --test test/thinklane.test.mjs` (19 cases, every path asserting no `/v1/load` byte
+reached the seam) and the live rig `node test/build.mjs && node test/thinklane_live.mjs`, which on
+this box printed `PROOF PASS · in-process ok in 1.0s, owed lane refused as lane_not_resident, own
+port endpoint_unreachable, lane flash-next unmoved` (the resident call measured 0.1-1.0 s and the
+refusal 4-5 ms across three runs; the lane was `flash-next` before and after every one, with
+`loading: false` and no `swap` in the health line).

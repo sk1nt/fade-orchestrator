@@ -262,20 +262,26 @@ const pi = {
     if (HOST_TABLE.has(String(key))) throw new Error(`Extension shortcut conflicts with built-in shortcut: ${key}`);
     shortcuts[key] = opts;
   },
-  setModel: async () => ({ switched: true }),
+  setModel: async (model) => {
+    modelCalls.push(model);
+    return { switched: true };
+  },
   setThinkingLevel: () => {},
   getActiveTools: () => activeTools,
   setActiveTools: (t) => void (activeTools = t),
   sendUserMessage: (t) => void sent.push(t),
 };
 const notes = [];
+/** Every `pi.setModel` call, in order: the hand-back cases name the model the plugin chose. */
+const modelCalls = [];
 /** Every `setWorkingMessage` call, in order: the gate names the row it is RUNNING, so the rig can
  *  prove the operator watches progress instead of a frozen terminal. `null` is the clear. */
 const working = [];
 const ctx = {
   hasUI: false,
   cwd: repo,
-  modelRegistry: { find: () => ({ id: "stub" }) },
+  model: undefined,
+  modelRegistry: { find: (provider, id) => ({ id, provider, name: id }) },
   getContextUsage: () => ({ tokens: 41234, contextWindow: 1048576, percent: 3.9, baselineSource: "test" }),
   abort: () => {},
   isIdle: () => true,
@@ -677,6 +683,15 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	const tagList = execFileSync("git", ["-C", repo, "tag", "-l"], { encoding: "utf8" });
 	ok("the checkpoint tag exists in the repo", tagList.includes("omp-ckpt/GATE1/T1-passed"), tagList.trim().split("\n").join(","));
 	ok("the run completes", s.state === "complete", s.state);
+	// The hand-back: DS's role is done, so the lane returns to the code lane at the boundary —
+	// one setModel + one quiet load, no briefing sent for a lane nobody asked about.
+	const loadBase = loads();
+	const sentBase = sent.length;
+	await hooks.agent_end({}, ctx);
+	const landed = await settleLoads(loadBase, 1);
+	ok("a completed run hands the lane back to the code lane", landed >= 1 && loads() - loadBase === 1, `${loads() - loadBase}`);
+	ok("the completed run's hand-back is a setModel naming flash-next", modelCalls.at(-1)?.id === "flash-next", JSON.stringify(modelCalls.at(-1)));
+	ok("the completed run's hand-back carries no briefing", sent.length === sentBase, `${sent.length - sentBase}`);
 }
 
 // 15. A delegated (subagent) session NEVER drives the loop. It shares the cwd, so an unguarded
@@ -1181,7 +1196,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const statusNote = notes.join("\n");
   ok("status names the claim as this process's", statusNote.includes(`router claim this run (pid ${process.pid})`), statusNote.slice(0, 240));
   ok("status names how long the router has been claimed", /router claim this run \(pid \d+\) · held \d+m\d{2}s/.test(statusNote), statusNote.slice(0, 240));
+  const beforeStop = loads();
   await commands.orchestrate.handler("stop --clear", ctx);
+  // The stop is the end of the run's role, so it hands the lane back: let that quiet load land
+  // before the next block bills `/orchestrate moe` for zero.
+  await settleLoads(beforeStop, 1);
   ok("`stop` releases the claim, so the next session is not refused", !existsSync(claimFile), claimFile);
 }
 
@@ -1560,6 +1579,49 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   delete process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN;
   delete process.env.STUB_PROMPT_LOG;
   delete process.env.STUB_ARGS_LOG;
+}
+
+// 29. THE NON-RUN HAND-BACK. A plain session whose turn ran on the thinking lane hands the lane
+//     back to the code lane at the boundary — one `setModel` + one quiet load, no briefing. A
+//     session already on the code lane pays nothing, and a delegated session never touches a lane.
+{
+  const stopBase = loads();
+  await commands.orchestrate.handler("stop --clear", ctx); // leave no run: the no-run path
+  await settleLoads(stopBase, 1); // a stop hands the lane back; that load lands before the cases
+  delete process.env.PI_SESSION_FILE;
+  const rt = await import("../.test-build/router.mjs");
+  rt.resetFlipLedger();
+
+  // (a) the thinking lane is the session's model: one setModel + one load, no message sent
+  resident = "deepseek";
+  ctx.model = { id: "deepseek", provider: "strata-flash" };
+  const b1 = loads();
+  const m1 = modelCalls.length;
+  const s1 = sent.length;
+  await hooks.agent_end({}, ctx);
+  const got1 = await settleLoads(b1, 1);
+  ok("a non-run session on the thinking lane hands back with one load", got1 >= 1 && loads() - b1 === 1, `${loads() - b1}`);
+  ok("the non-run hand-back is a setModel naming flash-next", modelCalls.length === m1 + 1 && modelCalls.at(-1)?.id === "flash-next", JSON.stringify(modelCalls.slice(m1)));
+  ok("the non-run hand-back sends no briefing", sent.length === s1, `${sent.length - s1}`);
+
+  // (b) the code lane is already the session's model: nothing is sent
+  ctx.model = { id: "flash-next", provider: "strata-flash" };
+  const b2 = loads();
+  const m2 = modelCalls.length;
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 100));
+  ok("a session on the code lane pays zero setModel and zero loads", modelCalls.length === m2 && loads() === b2, `models=${modelCalls.length - m2} loads=${loads() - b2}`);
+
+  // (c) a delegated session never touches the lane, even on the thinking model
+  const nested = join(repo, "sessions", "2030-01-01T09-11-28-519Z_01a1de79-d407-740b-a74e-ce2c57a1c556", "Worker.jsonl");
+  process.env.PI_SESSION_FILE = nested;
+  ctx.model = { id: "deepseek", provider: "strata-flash" };
+  const b3 = loads();
+  const m3 = modelCalls.length;
+  await hooks.agent_end({}, ctx);
+  await new Promise((r) => setTimeout(r, 100));
+  ok("a delegated session issues no hand-back", modelCalls.length === m3 && loads() === b3, `models=${modelCalls.length - m3} loads=${loads() - b3}`);
+  delete process.env.PI_SESSION_FILE;
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

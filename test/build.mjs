@@ -44,6 +44,7 @@ export function buildTestBundle() {
     "src/panel.ts",
     "src/runs.ts",
     "src/router.ts",
+    "src/thinklane.ts",
     "--bundle",
     "--format=esm",
     "--platform=node",

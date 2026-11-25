@@ -23,7 +23,8 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, releaseLease, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
+import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
+import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 import {
 	DESK_DEADLINE_MS,
 	DESK_SETTLE_MS,
@@ -404,16 +405,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		lockDir = undefined;
 	};
 
-	/** Hand the router lease back at every end of a run: the router lands its DEFAULT lane
-	 *  (flash-next) on release, so no finished run pins the box to the run's lane. Best-effort —
-	 *  a dead router must never take a run's end down with it. */
-	const endLease = (lane: string | null | undefined, ctx: ExtensionContext): void => {
-		if (!lane) return;
-		void releaseLease(lane).then((r) => {
-			if (!r.ok) ctx.ui.notify(`orchestrate: lane lease release failed: ${r.detail}`, "warning");
-		});
-	};
-
 	/**
 	 * The ON-DISK run, for the verifier sandbox, which asks on EVERY tool call. `readFileSync` +
 	 * `JSON.parse` there parsed the whole state per call, on the host's loop. The file's
@@ -557,7 +548,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run.state = "failed";
 			run.reason = reason;
 			releaseLock();
-			endLease(run.lane, ctx);
 			void persist().catch(warnWrite(ctx, "fail"));
 			paint(ctx);
 		}
@@ -609,9 +599,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 */
 	let switchGen = 0;
 	let switchChain: Promise<void> = Promise.resolve();
-	const requestLane = (lane: string, ctx: ExtensionContext): void => {
+	const requestLane = (lane: string, ctx: ExtensionContext, quiet = false): void => {
 		const gen = ++switchGen;
-		switchChain = switchChain.then(() => (gen === switchGen ? runSwitch(lane, ctx, gen) : undefined)).catch(() => undefined);
+		switchChain = switchChain.then(() => (gen === switchGen ? runSwitch(lane, ctx, gen, quiet) : undefined)).catch(() => undefined);
 	};
 
 	/**
@@ -712,7 +702,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		return `; OWED ${owed.length} unjudged verification request(s): ${ids} — those slices are UNVERIFIED`;
 	};
 
-	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number): Promise<void> => {
+	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number, quiet = false): Promise<void> => {
 		const model = ctx.modelRegistry.find(PROVIDER, lane);
 		if (!model) {
 			fail(ctx, `model ${PROVIDER}/${lane} is not in the registry`);
@@ -803,7 +793,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			paint(ctx);
 		});
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
-		const loaded = await loadLane(lane, { lease: true });
+		const loaded = await loadLane(lane);
 		if (gen !== switchGen) {
 			// The pill, the row and the briefing belong to the switch that superseded this one; the
 			// watch is the only thing here that outlives the call, so it is the thing cancelled.
@@ -828,6 +818,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (gen !== switchGen) return;
 		setTimeout(async () => {
 			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
+			// A QUIET switch carries no briefing: the hand-back lands a lane the operator did not ask
+			// about, and a page sent for it would be a queued request naming the lane just left.
+			if (quiet) return;
 			await ensurePhaseTool();
 			// A batch briefing is owed to exactly ONE landing: the switch the desk dispatch asked
 			// for. The flag is consumed here, so a later switch to the same lane re-briefs the
@@ -1304,7 +1297,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// starts without a manual release. Owner-only: an adopted run holds no claim of its own.
 			if (applied.nextState === "complete" || applied.nextState === "failed") {
 				releaseLock();
-				endLease(run.lane, ctx);
 			}
 			let checkpointNote = "";
 			if (params.phase === "verification_done" && applied.nextState === "complete") {
@@ -1577,9 +1569,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		registerChord(FALLBACK_KEY, "fade orchestrator panel: tasks, phases, engine metrics, swap history (s/v/r/p/c/h)");
 	}
 
-	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
-		handler: async (args, ctx) => {
+	// ONE handler, TWO commands. `/plan <goal>` is the PLANNING entry point: it starts the run,
+	// whose first act loads THINK_LANE (DS4), and DS4 stays resident through the whole planning
+	// turn — the loop issues lane loads ONLY at turn boundaries, and in `planning` state the only
+	// authorized hand-back is the `planning_done` phase act, which lands the code lane. No
+	// setModel, no `POST /v1/load`, no side-channel flip is issued before the plan lands.
+	const orchestrateCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
 			// `--demo-redact`: a DISPLAY-only switch, stripped from the args before the verb is
 			// read. `/orchestrate --demo-redact <goal>` starts a screenshot-safe run, the bare
 			// form flips the switch, and `--demo-redact=off` (or `=0`) turns it back. The durable
@@ -1618,8 +1613,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// a measured zero for workers that never delegated.
 				const d = runDir ? await readDesk(runDir, run.run_id) : undefined;
 				const deskPart = d ? ` · ${deskLine(d)}` : "";
+				// The last IN-PROCESS lane call, when one happened: the model and endpoint it named
+				// and how it ended. An in-process call never issues `POST /v1/load` and never calls
+				// `setModel`, so this line's cost is the elapsed reading alone — a run that made none
+				// says so in words, never a bare zero.
+				const call = run.lane_call ? ` · in-process ${run.lane_call.model} ${run.lane_call.ok ? `answered ${run.lane_call.chars} chars` : `refused ${run.lane_call.cls}`} · ${(run.lane_call.ms / 1000).toFixed(1)}s` : " · no in-process call";
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid}${deskPart} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid}${deskPart}${call} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
@@ -1688,6 +1688,41 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				if (d.churn) ctx.ui.notify(`orchestrate: CHURN ROUTE in force${d.churn_utc ? ` since ${d.churn_utc}` : ""} — batches go to the ${VERIFIER_AGENT} subagent on ${VERIFIER_MODEL}; /orchestrate lanes reset hands them back to the lane`, "warning");
 				return;
 			}
+			if (first === "think") {
+				// ONE IN-PROCESS COMPLETION. The plugin sends the request itself and returns the
+				// text: no `setModel`, no `POST /v1/load`, no lane change, in any branch. The
+				// residency rule lives in the client (thinklane.ts) — a call naming a model the
+				// router does not hold is refused with ZERO bytes sent, because the router answers
+				// such a request by swapping the lane, and that 13-25 s is the cost this path exists
+				// to avoid. `think <prompt>` uses FADE_ORCHESTRATE_THINK_MODEL;
+				// `think <provider/model> <prompt>` names the lane for this one call.
+				const parts = raw.split(/\s+/);
+				const named = parts[1]?.includes("/") === true;
+				const target = named ? parts[1]! : THINK_MODEL;
+				const prompt = (named ? parts.slice(2) : parts.slice(1)).join(" ").trim();
+				if (!prompt) {
+					ctx.ui.notify(`orchestrate: usage /orchestrate think [provider/model] <prompt> — one completion, in process, on the resident lane (default ${THINK_MODEL}); no load, no swap, no lane change`, "info");
+					return;
+				}
+				ctx.ui.setWorkingMessage(`fade_orchestrate: one in-process completion from ${target}…`);
+				const called = await askLane(target, prompt);
+				ctx.ui.setWorkingMessage();
+				if (run) {
+					run.lane_call = { ok: called.ok, cls: called.cls, model: called.model, endpoint: called.endpoint, ms: called.ms, at: new Date().toISOString(), chars: called.text.length, detail: called.detail };
+					await persist();
+				}
+				if (!called.ok) {
+					ctx.ui.notify(`orchestrate: in-process ${called.cls} — ${called.detail}`, "error");
+					paint(ctx);
+					return;
+				}
+				const shown = called.text.split(/\r?\n/);
+				for (const line of shown.slice(0, 12)) ctx.ui.notify(`  ${line}`, "info");
+				if (shown.length > 12) ctx.ui.notify(`  … ${shown.length - 12} more line(s) of the answer elided`, "info");
+				ctx.ui.notify(`orchestrate: ${askLabel(called)}`, "info");
+				paint(ctx);
+				return;
+			}
 			if (first === "verifier") {
 				// The verification agent: the definition that makes a churn-free verification possible,
 				// because the host pins a `task` agent's model from its front matter. `install` writes
@@ -1697,6 +1732,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				const abs = join(ctx.cwd, verifierAgentPath(ctx.cwd));
 				const absWorker = join(ctx.cwd, workerAgentPath(ctx.cwd));
 				if (sub === "install") {
+					// THE ADVISOR PIN. An advisor on a ROUTER entry pays the 13-25 s pack swap and can
+					// load the THINKING lane — the exact churn the subagent route exists to make
+					// impossible. Install REFUSES it, and the claim-time probe (`probeVerifierLane`,
+					// lane.ts) refuses the route the same way, so an advisor can never reach the
+					// router from this plugin; verification swaps stay with the authorized loop.
+					if (isRouterModel(VERIFIER_MODEL)) {
+						ctx.ui.notify(`orchestrate: verifier install REFUSED: ${VERIFIER_MODEL} is a basalt ROUTER entry — the advisor is pinned OFF the router. Point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1) and re-run.`, "error");
+						return;
+					}
 					// TWO definitions, one act: the verifier (pinned off the router) and the WORKER
 					// (whose `tools:` line carries fade_verify, which is what lets it register at all).
 					try {
@@ -1707,8 +1751,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 						ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
 						return;
 					}
-					const warn = isRouterModel(VERIFIER_MODEL) ? ` WARNING: ${VERIFIER_MODEL} is a ROUTER entry — a subagent on it pays the very swap this agent exists to avoid; point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1)` : "";
-					ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}) and ${workerAgentPath(ctx.cwd)} (inherits the code lane; its tools carry fade_verify) — the host discovers agent definitions per session, so a live session needs /new to see it${warn}`, warn === "" ? "info" : "warning");
+					ctx.ui.notify(`orchestrate: wrote ${verifierAgentPath(ctx.cwd)} (model ${VERIFIER_MODEL}, pinned off the router) and ${workerAgentPath(ctx.cwd)} (inherits the code lane; its tools carry fade_verify) — the host discovers agent definitions per session, so a live session needs /new to see it`, "info");
 					return;
 				}
 				const installed = existsSync(abs);
@@ -1815,10 +1858,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					if (runDir) writeJson(statePath(), run);
 				}
 				releaseLock();
-				endLease(run.lane, ctx);
 				pending = undefined;
-				clearSurface(ctx);
-				ctx.ui.notify(`orchestrate: stopped; lane lease released, the router lands its default lane; state ${statePath()}`, "info");
+				// The hand-back: a stop is the end of the run's role, so the thinking lane is not left
+				// resident. Quiet — no briefing for a lane nobody asked for.
+				const handBack = run.lane === THINK_LANE;
+				if (handBack) requestLane(CODE_LANE, ctx, true);
+				ctx.ui.notify(`orchestrate: stopped; ${handBack ? `handing the lane back to ${CODE_LANE}` : `resident lane left as ${run.lane}`}; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
 					try {
 						unlinkSync(join(runDir!, ACTIVE_FILENAME));
@@ -1874,8 +1919,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
 			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
 			// in this run reads a pre-load engine state.
-			engineProofInvalidate();
-			const loaded = await loadLane(THINK_LANE, { lease: true });
+			const loaded = await loadLane(THINK_LANE);
 			if (!loaded.ok) {
 				// A start that never began releases its claim: a preflight failure must not strand
 				// the router behind a run that does not exist.
@@ -1935,7 +1979,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			startMetricsTimer();
 			await ensurePhaseTool();
 			pi.sendUserMessage(await briefings.plan(run));
-		},
+	};
+	pi.registerCommand("orchestrate", {
+		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | think [model] <prompt> | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+		handler: orchestrateCommand,
+	});
+	pi.registerCommand("plan", {
+		description: `/plan [--rounds N] <goal> — load ${THINK_LANE} (DS4) and plan: DS4 stays resident for the whole planning turn; the only hand-back is the \`planning_done\` phase act`,
+		handler: orchestrateCommand,
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -2001,7 +2052,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (!run) return;
+		if (!run) {
+			// THE NON-RUN HAND-BACK. A session whose turn ran on the thinking lane hands the lane
+			// back at the boundary: one `setModel` + load, no briefing, no run state. The forward
+			// direction is the host resolving the thinking-lane role; the reverse is here. Delegated
+			// sessions never touch the lane — their parent's run owns it.
+			if (!isDelegatedSession() && ctx.model?.provider === PROVIDER && ctx.model.id === THINK_LANE) requestLane(CODE_LANE, ctx, true);
+			return;
+		}
 		const next = pending;
 		pending = undefined;
 		if (!next) {
@@ -2012,6 +2070,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					ctx.ui.notify(briefings.final(run), "info");
 				}
 				void recordTurn(run.state);
+				// DS's role is done: hand the lane back instead of leaving the thinking lane resident.
+				if (run.lane === THINK_LANE) requestLane(CODE_LANE, ctx, true);
 				return;
 			}
 			if (run.paused === true) {

@@ -270,7 +270,10 @@ function answered(status: number, payload: unknown): boolean {
 	return true;
 }
 
-const completionRequest = (api: string, model: string): { path: string; body: Record<string, string | number | boolean | object[]> } =>
+/** The completion request's shape per api family. The probe sends a 1-token ping; the in-process
+ *  client (thinklane.ts) takes the SAME path and body and fills in the real prompt, so a lane that
+ *  answers the probe answers the call — one request shape, no second convention. */
+export const completionRequest = (api: string, model: string): { path: string; body: Record<string, string | number | boolean | object[]> } =>
 	api === "anthropic-messages"
 		? { path: "/messages", body: { model, max_tokens: 1, messages: [{ role: "user", content: "ping" }] } }
 		: { path: "/chat/completions", body: { model, max_tokens: 1, temperature: 0, stream: false, messages: [{ role: "user", content: "ping" }] } };
