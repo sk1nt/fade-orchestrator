@@ -23,7 +23,7 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan } from "./router.ts";
+import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan } from "./router.ts";
 import { acquireLease, releaseLease, renewLease, leaseLine, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 import {
@@ -183,6 +183,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  attributes the lease to. LEASE_TTL_S is the ask; the daemon clamps to its max. */
 	let leaseToken: string | undefined;
 	let leaseSession = "";
+	/** The single-turn mint: a load that carries no run lease (the overlay keys, the
+	 *  hand-back, a review/escalation turn) acquires for the length of ONE pack load plus
+	 *  slack and releases it in the same call (`loadLane`'s `finally`). The daemon clamps
+	 *  the ask to its ceiling; the release is the guarantee, the TTL is the backstop for a
+	 *  caller that dies mid-swap. */
+	const LEASE_MINT_TTL_S = Number(process.env.FADE_ORCHESTRATE_LEASE_MINT_TTL_S ?? 300);
+	/** The lease identity of a turn that belongs to no run: the daemon names the holder
+	 *  session on a refusal, and an empty string there is a lease nobody can trace. */
+	const SELF_SESSION = `omp-pid-${process.pid}`;
 	const LEASE_TTL_S = Number(process.env.FADE_ORCHESTRATE_LEASE_TTL_S ?? 1800);
 	let pending: { lane: string; phase: string } | undefined;
 	/** The desk batch this session CLAIMED and is answering. The claim is the one-use ticket: it is
@@ -419,10 +428,14 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  way, so a resumed run never re-releases a stale one. */
 	const releaseLaneLease = (): void => {
 		const tok = leaseToken;
+		const sid = leaseSession;
 		leaseToken = undefined;
+		// The session the lease was attributed to goes with the token: a mint by a turn that
+		// belongs to no run must present its own identity, not a finished run's id.
+		leaseSession = "";
 		if (run) run.lease_state = "released";
 		if (!tok) return;
-		void releaseLease(tok, leaseSession)
+		void releaseLease(tok, sid)
 			.then((v) => {
 				if (run) run.lease_hint = v.token_hint ?? run.lease_hint;
 			})
@@ -635,23 +648,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 * that never lands its lane is a stalled run — and the call site records that decision in
 	 * `rejection_history`.
 	 */
-	const gateRouterIdle = async (lane: string, ctx: ExtensionContext): Promise<{ waited_ms: number; polls: number; over_budget: boolean; last: RouterBusy }> => {
-		const t0 = Date.now();
-		const budget_s = Math.round(GATE_BUDGET_MS / 1000);
-		const poll_s = Math.round(GATE_POLL_MS / 1000);
-		let polls = 0;
-		let last = await routerBusy();
-		while (last.busy) {
-			polls += 1;
-			const waited = Date.now() - t0;
-			if (waited >= GATE_BUDGET_MS) return { waited_ms: waited, polls, over_budget: true, last };
-			if (polls === 1) ctx.ui.notify(`fade_orchestrate: the ${lane} load is DEFERRED — ${last.reason}; retrying every ${poll_s}s up to ${budget_s}s`, "warning");
-			ctx.ui.setWorkingMessage(`fade_orchestrate: ${lane} load deferred ${Math.round(waited / 1000)}s/${budget_s}s — ${last.reason}`);
-			await new Promise((r) => setTimeout(r, GATE_POLL_MS));
-			last = await routerBusy();
-		}
-		return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
-	};
+	// The gate is the router module question with the UI effects injected: the
+	// residency answer can clear it at zero cost, and the suite counts the polls
+	// and the DEFERRED notify.
+	const gateRouterIdle = (lane: string, ctx: ExtensionContext): Promise<IdleGateResult> =>
+		gateLaneIdle(lane, {
+			busy: routerBusy,
+			residency: () => supervisorResident(lane, leaseSession || SELF_SESSION),
+			deferred: (m: string) => ctx.ui.notify(m, "warning"),
+			progress: (m: string) => ctx.ui.setWorkingMessage(m),
+			budgetMs: GATE_BUDGET_MS,
+			pollMs: GATE_POLL_MS,
+		});
 
 	// The lane switch as one callable unit: `agent_end` (the single load site) and the overlay's
 	// v/c keys run the SAME sequence — the idle gate, the thrash breaker, setModel,
@@ -869,7 +877,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				})
 			: undefined;
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
-		const loaded = await loadLane(lane, { leaseToken, sessionId: leaseSession });
+		// A switch that carries no run lease mints its own and releases it in the same
+		// call: the supervisor is the single authority over :18014, so a non-run turn
+		// never swaps behind its back on the ctl fleet gate, and never leaves the lane
+		// claimed after the turn ends.
+		const loaded = await loadLane(lane, { leaseToken, sessionId: leaseSession || SELF_SESSION, ...(leaseToken ? {} : { mintLease: { ttlSec: LEASE_MINT_TTL_S } }) });
 		if (gen !== switchGen) {
 			// The pill, the row and the briefing belong to the switch that superseded this one; the
 			// watch is the only thing here that outlives the call, so it is the thing cancelled.
@@ -2016,13 +2028,22 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
 				return;
 			}
-			const census = await listLanes();
-			const resident = census.models.find((m) => m.status === "loaded");
-			if (!census.error && resident?.id !== THINK_LANE) {
-				releaseLock();
-				releaseLaneLease();
-				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
-				return;
+			// The lease is held from the acquire through the preflight: a refusal, a throw, an
+			// early return — the burst releases it, so the lane is never pinned by a run that
+			// never started. `burstLive` flips only when the run is created.
+			let burstLive = false;
+			try {
+				const census = await listLanes();
+				const resident = census.models.find((m) => m.status === "loaded");
+				if (!census.error && resident?.id !== THINK_LANE) {
+					releaseLock();
+					releaseLaneLease();
+					ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
+					return;
+				}
+				burstLive = true;
+			} finally {
+				if (!burstLive) releaseLaneLease();
 			}
 			// `state.json` is ONE slot: this keystroke overwrites the run it adopted, and the finished
 			// one is then unanswerable. Archive a TERMINAL previous run into ITS repo's `runs/` dir

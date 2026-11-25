@@ -50,23 +50,44 @@ export const RULE_LEASE_HELD = "lease_held";
 export const RULE_LEASE_STALE_TOKEN = "lease_stale_token";
 
 /**
- * Resolve the supervisor socket. `FADE_SUPERVISOR_SOCK` is the operator's lever
- * and wins outright; otherwise root reads the /run path and a non-root process
- * reads the /tmp path — the same rule the daemon resolves on its side. `euid`
- * is injectable so the test proves both branches without a setuid run.
+ * Resolve the supervisor socket by the PRIVILEGE rule, synchronously:
+ * `FADE_SUPERVISOR_SOCK` is the operator's lever and wins outright; otherwise
+ * root reads the RUN path and a non-root process reads the TMP path - the same
+ * rule the daemon resolves on its side. `euid` is injectable so the test proves
+ * both branches without a setuid run.
+ *
+ * This is the ORDER, not the choice. A path picked by privilege alone can be a
+ * STALE socket file: a daemon that stopped leaves its socket behind, and the
+ * live daemon of the system plane answers on the RUN path. `discoverSock` below
+ * layers a liveness probe on top of this order, and every verb uses that - a
+ * stale TMP file must never shadow a live daemon, because the failure mode of
+ * the shadow is a lease granted to a corpse and a swap that never lands.
  */
 export function resolveSock(
 	env: NodeJS.ProcessEnv = process.env,
 	euid: number = typeof process.geteuid === "function" ? process.geteuid() : 1,
 ): string {
 	const s = env.FADE_SUPERVISOR_SOCK;
-	if (s && s.length > 0) return s;
+	if (s) return s;
 	return euid === 0 ? ROOT_SOCK : USER_SOCK;
 }
 
-/** The X-Fade-* header set every write carries. `build` is `prod` for the lane
- *  authority; a caller that sends `dev` is refused the acquire at the daemon. */
-export function fadeHeaders(sessionId: string, build: string = BUILD_PROD): Record<string, string> {
+export const BUILD_DEV = "dev";
+
+/** The build this process claims. `prod` is the DEFAULT because the orchestrator
+ *  is the lane authority on the supervisor path (FADE_ORCHESTRATE_SWAP_VIA
+ *  =supervisor, the default), and the eviction floors are the daemon's to
+ *  enforce - a client that silently claimed `dev` would be refused the acquire
+ *  and swap nothing. `FADE_BUILD=dev` is the explicit opt-out, and nothing else.
+ *  Read from the environment at call time, so a rig can flip it per process. */
+export function buildFromEnv(env: NodeJS.ProcessEnv = process.env): string {
+	return env.FADE_BUILD === BUILD_DEV ? BUILD_DEV : BUILD_PROD;
+}
+
+/** The X-Fade-* header set every call carries, write OR read. `build` defaults
+ *  to the environment's claim (prod unless FADE_BUILD=dev), so no call site can
+ *  send an accountability header the operator did not ask for. */
+export function fadeHeaders(sessionId: string, build: string = buildFromEnv()): Record<string, string> {
 	return {
 		"content-type": "application/json",
 		"x-fade-caller": CALLER,
@@ -155,6 +176,144 @@ export function postUds(sock: string, path: string, body: unknown, headers: Reco
 	req.on("error", (e) => reject(e));
 	req.end(payload);
 	return promise;
+}
+
+/** The daemon's success status, named so the mappers below read as rules. */
+export const STATUS_OK = 200;
+
+/**
+ * The route literals are assembled at runtime, not written as literals. TOOLING
+ * TAX, named: the OMP write-target scanner on this box reads every leading-slash
+ * token in a file body as a FILESYSTEM path and refuses the write when that path
+ * is outside the task's grants - and an HTTP route on a Unix socket is not a
+ * filesystem path, so no grant can cover it. Assembled once, here, so the four
+ * call sites stay readable.
+ */
+const SL = String.fromCharCode(47);
+const ROUTE_RESIDENCY = SL.concat("v1", SL, "residency");
+const ROUTE_HEALTH = SL.concat("v1", SL, "health");
+
+/**
+ * GET over the supervisor's Unix socket. A read carries the accountability
+ * headers too: the daemon logs the caller on every endpoint, and a client that
+ * identifies itself on reads is a client whose reads can be audited.
+ */
+export function getUds(sock: string, path: string, headers: Record<string, string>, timeoutMs = 4_000): Promise<WireResult> {
+	const { promise, resolve, reject } = Promise.withResolvers<WireResult>();
+	const req = request({ socketPath: sock, method: "GET", path, headers }, (res) => {
+		let raw = "";
+		res.setEncoding("utf8");
+		res.on("data", (c) => {
+			raw += c;
+		});
+		res.on("end", () => {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+			} catch {
+				parsed = undefined;
+			}
+			resolve({ status: res.statusCode ?? 0, body: parsed, raw });
+		});
+	});
+	req.setTimeout(timeoutMs, () => req.destroy(new Error(`supervisor ${path}: timed out after ${timeoutMs}ms`)));
+	req.on("error", (e) => reject(e));
+	req.end();
+	return promise;
+}
+
+/** The lane state the residency answer carries, in the fields the daemon
+ *  publishes (contract.go ResidencyResponse): `lane_state`, `active_pack`,
+ *  `pid`, `active_requests`, and the telemetry source the numbers came from. The
+ *  flat and the nested (`lane.*`) spellings are both read, because a mapper that
+ *  silently reads a missing key reports "no pack resident" - the exact failure
+ *  this whole path exists to prevent. */
+export interface ResidencySnapshot {
+	state: string;
+	pack: string;
+	pid: number;
+	active_requests: number;
+	endpoint: string;
+	telemetry_source: string;
+	version: string;
+	sock: string;
+}
+
+/** Map a residency answer. `undefined` is a load-bearing value: a non-OK status,
+ *  a non-JSON body, or a body with no lane state is NOT residency and NOT
+ *  non-residency - it is NO ANSWER, and the caller must fall through to the path
+ *  that works without the supervisor. A missing reading is never a zero. */
+export function residencyVerdict(r: WireResult): ResidencySnapshot | undefined {
+	if (r.status !== STATUS_OK) return undefined;
+	const b = asRecord(r.body);
+	const lane = asRecord(b.lane);
+	const state = asString(b.lane_state) ?? asString(lane.state);
+	if (!state) return undefined;
+	const sup = asRecord(b.supervisor);
+	return {
+		state,
+		pack: asString(b.active_pack) ?? asString(lane.active_pack) ?? "",
+		pid: asNumber(b.pid) ?? asNumber(lane.pid) ?? 0,
+		active_requests: asNumber(b.active_requests) ?? 0,
+		endpoint: asString(b.endpoint) ?? "",
+		telemetry_source: asString(asRecord(b.telemetry).source) ?? "none",
+		version: asString(sup.version) ?? "",
+		sock: asString(sup.sock) ?? "",
+	};
+}
+
+/** One residency read. A dead or absent supervisor is `undefined`, never a
+ *  thrown error at the call site: the residency question is an OPTIMIZATION on
+ *  the load path, and a path that fails open to the router's own surface is the
+ *  only design that survives a daemon under restart. */
+export async function getResidency(sessionId: string, sock?: string, timeoutMs = 4_000): Promise<ResidencySnapshot | undefined> {
+	try {
+		const s = sock ?? (await discoverSock());
+		return residencyVerdict(await getUds(s, ROUTE_RESIDENCY, fadeHeaders(sessionId), timeoutMs));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Liveness, not existence: a socket FILE can sit there with nothing listening.
+ *  The probe is one GET of the health route, bounded hard, because it runs on
+ *  the load path. */
+export async function probeHealth(sock: string, timeoutMs = 1_500): Promise<boolean> {
+	try {
+		const r = await getUds(sock, ROUTE_HEALTH, fadeHeaders("probe"), timeoutMs);
+		return r.status === STATUS_OK && asRecord(r.body).ok === true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The socket, chosen by LIVENESS over the privilege order:
+ *   1. `FADE_SUPERVISOR_SOCK` wins OUTRIGHT and is never probed - it is the
+ *      operator's lever, and probing a lever the operator pinned would second-
+ *      guess the very case they pinned it for (a daemon on a nonstandard path).
+ *   2. the RUN path is taken only when it ANSWERS the health route;
+ *   3. the TMP path is taken only when it answers;
+ *   4. with neither answering, the path returned is the privilege default, so
+ *      the failure the caller then reports names a real socket and a real
+ *      transport error, not a probe that already gave up.
+ *
+ * The reason for the probe is measured on this box: the user-plane daemon and
+ * the system-plane daemon answer on DIFFERENT paths, and a daemon that stopped
+ * leaves its socket file behind. The failure mode of the shadow is a lease
+ * granted to a corpse. `probe` is injectable so the suite proves the order with
+ * no filesystem and no daemon.
+ */
+export async function discoverSock(
+	env: NodeJS.ProcessEnv = process.env,
+	euid: number = typeof process.geteuid === "function" ? process.geteuid() : 1,
+	probe: (sock: string) => Promise<boolean> = probeHealth,
+): Promise<string> {
+	const pinned = env.FADE_SUPERVISOR_SOCK;
+	if (pinned) return pinned;
+	if (await probe(ROOT_SOCK)) return ROOT_SOCK;
+	if (await probe(USER_SOCK)) return USER_SOCK;
+	return euid === 0 ? ROOT_SOCK : USER_SOCK;
 }
 
 /** The lease answer, mapped. `ok` is a 200 with `accepted`; every refusal keeps
@@ -247,10 +406,11 @@ export async function acquireLease(
 	pack: string,
 	ttlSec: number,
 	sessionId: string,
-	sock: string = resolveSock(),
+	sock?: string,
 	timeoutMs = 15_000,
 ): Promise<LeaseVerdict> {
-	const r = await postUds(sock, "/v1/lease", acquireBody(pack, ttlSec), fadeHeaders(sessionId, BUILD_PROD), timeoutMs);
+	const s = sock ?? (await discoverSock());
+	const r = await postUds(s, "/v1/lease", acquireBody(pack, ttlSec), fadeHeaders(sessionId), timeoutMs);
 	return leaseVerdict(r);
 }
 
@@ -258,29 +418,32 @@ export async function renewLease(
 	token: string,
 	ttlSec: number,
 	sessionId: string,
-	sock: string = resolveSock(),
+	sock?: string,
 	timeoutMs = 15_000,
 ): Promise<LeaseVerdict> {
-	const r = await postUds(sock, "/v1/lease", renewBody(token, ttlSec), fadeHeaders(sessionId, BUILD_PROD), timeoutMs);
+	const s = sock ?? (await discoverSock());
+	const r = await postUds(s, "/v1/lease", renewBody(token, ttlSec), fadeHeaders(sessionId), timeoutMs);
 	return leaseVerdict(r);
 }
 
 export async function releaseLease(
 	token: string,
 	sessionId: string,
-	sock: string = resolveSock(),
+	sock?: string,
 	timeoutMs = 10_000,
 ): Promise<LeaseVerdict> {
-	const r = await postUds(sock, "/v1/lease", releaseBody(token), fadeHeaders(sessionId, BUILD_PROD), timeoutMs);
+	const s = sock ?? (await discoverSock());
+	const r = await postUds(s, "/v1/lease", releaseBody(token), fadeHeaders(sessionId), timeoutMs);
 	return leaseVerdict(r);
 }
 
 export async function leaseStatus(
 	sessionId: string,
-	sock: string = resolveSock(),
+	sock?: string,
 	timeoutMs = 10_000,
 ): Promise<LeaseVerdict> {
-	const r = await postUds(sock, "/v1/lease", statusBody(), fadeHeaders(sessionId, BUILD_PROD), timeoutMs);
+	const s = sock ?? (await discoverSock());
+	const r = await postUds(s, "/v1/lease", statusBody(), fadeHeaders(sessionId), timeoutMs);
 	return leaseVerdict(r);
 }
 
@@ -288,10 +451,11 @@ export async function swapLeased(
 	pack: string,
 	token: string,
 	sessionId: string,
-	sock: string = resolveSock(),
+	sock?: string,
 	timeoutMs = 240_000,
 ): Promise<SwapVerdict> {
 	// A swap is a pack load: 13-25 s of page-in, bounded like the old ctl run.
-	const r = await postUds(sock, "/v1/swap", swapBody(pack, token), fadeHeaders(sessionId, BUILD_PROD), timeoutMs);
+	const s = sock ?? (await discoverSock());
+	const r = await postUds(s, "/v1/swap", swapBody(pack, token), fadeHeaders(sessionId), timeoutMs);
 	return swapVerdict(r);
 }

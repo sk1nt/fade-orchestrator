@@ -131,6 +131,34 @@ carries no host-specific code.
   (`{ts, run_id, turn, round, phase?, pp, tg, ttft, kv_hit_pct, swap_ms, round_outcome}`), built
   **only** from numbers the router reported: with no `pp`+`tg` available the line is not written, so
   the ledger records no zero for a number the router never reported.
+- **Residency before the gate.** The lane question is asked of the
+  **fade-supervisor daemon** (`GET /v1/residency` over its Unix socket) before the
+  router's slot census is polled and before any swap byte is issued. A daemon that
+  reports the lane `RESIDENT` with `active_pack` equal to the target lands the
+  request with **zero polls, zero DEFERRED, zero swap** — the census calling the
+  lane busy (`running=1`) is basalt serving its concurrent slots, not a lane that
+  has to move, and the `flash-next load is DEFERRED — slot busy` warning for a lane
+  that was never going to move is the symptom this closes. The read is
+  **fail-open**: no answer (no daemon, 503, a body with no lane state) falls into
+  the busy loop that has always worked, so a daemon under restart costs a load and
+  never a refusal. A NO ANSWER is never read as residency, and a cached residency
+  is never used: the reading that stops a 52 GiB load has to be current.
+- **The socket is chosen by liveness.** `FADE_SUPERVISOR_SOCK` wins outright and is
+  never probed (it is the operator's lever, including for a daemon on a nonstandard
+  path); otherwise `/run/fade/supervisor.sock` is taken **only if it answers
+  `/v1/health`**, then `/tmp/fade-supervisor.sock` only if it answers, then the
+  privilege default. A stopped daemon leaves its socket FILE behind, and the
+  failure mode of that shadow is a lease granted to a corpse and a swap that never
+  lands.
+- **A turn that owns no run lease mints one and returns it.** A swap issued by a
+  review, escalation or hand-back turn (the overlay keys, the hand-back) carries no
+  run token, so it acquires its own lease and `await`s the release in a `finally`:
+  success, refused swap, 503, transport throw, bounded timeout — the lane goes back
+  every time, and `:18014` returns to its resident pack owner. Every call presents
+  `X-Fade-Build: prod` by default, because on the supervisor path the plugin IS the
+  lane authority; `FADE_BUILD=dev` is the explicit opt-out, and the daemon answers a
+  dev acquire with `403 dev_build_no_evict`. A run's own token is never released by
+  a load: the run lifecycle owns that release.
 
 ## Screen capture
 
@@ -207,6 +235,9 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_THINK_PROBE_CACHE_MS` | `15000` | the in-process lane probe's cache window; `0` disables probing and that answer carries `skipped`, so a disabled probe is never read as a proved lane |
 | `FADE_ORCHESTRATE_GATE_TRIAGE` / `_GATE_TRIAGE_BIN` / `_GATE_TRIAGE_TIMEOUT_MS` | set / `grok` / `45000` | red-gate **triage**: after a red pre-swap gate, ONE bounded `--disallowed-tools '*'` CLI call names the probable cause from the tails the gate already captured, as one advisory line on the briefing and the tool's answer. Zero authority: the verdict stays the checks' exit codes, no lane load is paid, the advisory agent cannot touch the tree, and a timeout / missing binary / cancelled turn ships the briefing unchanged (`0` disables) |
 | `FADE_ORCHESTRATE_VERIFIER_AGENT` | `fade-verifier` | the verification subagent's name: the `task` call's `agent`, and the file `/orchestrate verifier install` writes at `.omp/agents/<name>.md` |
+| `FADE_SUPERVISOR_SOCK` | unset | the fade-supervisor daemon's Unix socket. Pinned, it is used outright and never probed; unset, the daemon that ANSWERS `/v1/health` is chosen, `/run/fade/supervisor.sock` before `/tmp/fade-supervisor.sock` |
+| `FADE_ORCHESTRATE_LEASE_MINT_TTL_S` | `300` | the lease length a single-turn load asks for when it carries no run token. The daemon clamps it to `lease.max_ttl_s`; the `finally` release is the guarantee, the TTL is the backstop for a caller that dies mid-swap |
+| `FADE_BUILD` | `prod` | the build claim in `X-Fade-Build`. `prod` carries eviction authority (acquire + swap under the lease); `dev` is refused the acquire, so a coding session resolves onto whatever is resident and moves nothing |
 
 ## Surface and commands
 

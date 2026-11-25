@@ -15,7 +15,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { swapLeased } from "./supervisor.ts";
+import { acquireLease, getResidency, releaseLease as releaseSupervisorLease, swapLeased } from "./supervisor.ts";
 
 const execC = promisify(exec);
 
@@ -191,11 +191,123 @@ export const SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?
  *    serve — unreachable, an error state, a loaded context naming no model, a dead zero-VRAM context,
  *    a swap still in flight — is REFUSED with the class named, and `/v1/load` is never sent.
  */
+/**
+ * What the supervisor says about the lane, in the shape the load path needs.
+ * `resident` is the single question that decides whether a 13-25 s, 52 GiB load
+ * is issued at all: the lane state is RESIDENT and the resident pack IS the
+ * target. `undefined` (from `supervisorResident`) means NO ANSWER, and a missing
+ * reading is never residency — the caller falls through to the router surface
+ * that works with the daemon under restart.
+ */
+export interface SupervisorResident {
+	resident: boolean;
+	state: string;
+	pack: string;
+	pid: number;
+	active_requests: number;
+	telemetry_source: string;
+	detail: string;
+}
+
+/** Read the supervisor once and answer the residency question. The comparison is the
+ *  plugin lane id against the daemon `active_pack`: on this box both are the basalt
+ *  model/pack id, so they are compared as given. A daemon that names its packs
+ *  differently reports NOT resident, which costs a load and never costs a swap of the
+ *  wrong pack — the fail-safe direction. One read per call, no caching: a cached
+ *  residency is exactly the stale reading that reloads 52 GiB. */
+export async function supervisorResident(lane: string, sessionId = "fade-orchestrator"): Promise<SupervisorResident | undefined> {
+	const sup = await getResidency(sessionId);
+	if (!sup) return undefined;
+	return {
+		resident: sup.state === "RESIDENT" && sup.pack === lane,
+		state: sup.state,
+		pack: sup.pack,
+		pid: sup.pid,
+		active_requests: sup.active_requests,
+		telemetry_source: sup.telemetry_source,
+		detail: `supervisor ${sup.version || "?"} lane ${sup.state} pack=${sup.pack || "none"} pid=${sup.pid} requests=${sup.active_requests} telemetry=${sup.telemetry_source}`,
+	};
+}
+
+/** The gate injected effects. Nothing here reaches the UI or the router directly, which
+ *  is what makes the gate DECISION testable: the suite passes counters and reads the
+ *  result. */
+export interface GateOpts {
+	busy: () => Promise<RouterBusy>;
+	residency?: () => Promise<SupervisorResident | undefined>;
+	deferred?: (msg: string) => void;
+	progress?: (msg: string) => void;
+	budgetMs?: number;
+	pollMs?: number;
+}
+
+/** The idle gate answer. `short` names the residency short-circuit when it fired, so a
+ *  caller that records the gate (the run rejection_history) can tell a zero-cost
+ *  residency answer from a zero-cost idle lane. */
+export interface IdleGateResult {
+	waited_ms: number;
+	polls: number;
+	over_budget: boolean;
+	last: RouterBusy;
+	short?: string;
+}
+
+/**
+ * The pre-unload idle gate, as a function of its inputs. It lives here, not in the
+ * extension closure, because its decision is the part that must be tested: with a
+ * supervisor answer of RESIDENT for the target pack the gate returns WITHOUT polling
+ * the router and WITHOUT a DEFERRED notify. The DEFERRAL is the plugin-level symptom
+ * the operator sees, and the claim that the lane is already where the run wants it is
+ * a fact the daemon can state. The residency read is FAIL-OPEN by contract: no answer
+ * falls into the busy loop below, the behavior that has always worked.
+ */
+export async function gateLaneIdle(lane: string, opts: GateOpts): Promise<IdleGateResult> {
+	const budgetMs = opts.budgetMs ?? 60_000;
+	const pollMs = opts.pollMs ?? 3_000;
+	const sup = opts.residency ? await opts.residency() : undefined;
+	if (sup?.resident) {
+		return {
+			waited_ms: 0,
+			polls: 0,
+			over_budget: false,
+			last: { busy: false, reason: `supervisor: ${sup.detail}; the target is resident, the idle gate is not paid` },
+			short: "supervisor-resident",
+		};
+	}
+	return gateBusyLoop(lane, opts, budgetMs, pollMs);
+}
+
+/** The busy-wait half of the gate: poll the router busy reading on the interval until it
+ *  goes idle (a paid gate, not over budget) or the budget runs out (over budget, and the
+ *  caller pays the load anyway, because a loop that never lands its lane is a stalled
+ *  run). The notify text, the working text and the poll cadence are the ones the operator
+ *  reads today; this half only takes its effects as parameters, so the suite can count
+ *  them. */
+async function gateBusyLoop(lane: string, opts: GateOpts, budgetMs: number, pollMs: number): Promise<IdleGateResult> {
+	const t0 = Date.now();
+	const budget_s = Math.round(budgetMs / 1000);
+	const poll_s = Math.round(pollMs / 1000);
+	let polls = 0;
+	let last = await opts.busy();
+	while (last.busy) {
+		polls += 1;
+		const waited = Date.now() - t0;
+		if (waited >= budgetMs) return { waited_ms: waited, polls, over_budget: true, last };
+		if (polls === 1) opts.deferred?.(`fade_orchestrate: the ${lane} load is DEFERRED — ${last.reason}; retrying every ${poll_s}s up to ${budget_s}s`);
+		opts.progress?.(`fade_orchestrate: ${lane} load deferred ${Math.round(waited / 1000)}s/${budget_s}s — ${last.reason}`);
+		const { promise: tick, resolve: tickDone } = Promise.withResolvers<void>();
+		setTimeout(tickDone, pollMs);
+		await tick;
+		last = await opts.busy();
+	}
+	return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
+}
+
 // `lease: true` asks the router for the DURABLE load: the lane stays resident until
 // `releaseLease`, and a request naming any other model is refused (409) instead of swapping
 // the lane out — the run's advisory lane runs its full turn. The request rides the swap job
 // and `basalt-ctl.sh` puts it in the load body, so the gate and the lease are taken together.
-export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken?: string; sessionId?: string } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
+export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken?: string; sessionId?: string; mintLease?: { ttlSec: number } } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
 	const t0 = Date.now();
 	// Settle any in-flight swap FIRST and keep the health line the window ended on — that
 	// reading is the gate's evidence.
@@ -207,6 +319,15 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 	// the churn named: this is the call site where a flip would be paid, so it is where the
 	// operator has to see it.
 	if (resident === lane) return { ok: true, detail: `already resident; no swap issued${flipNote(flip)}`, elapsed_s: 0, guarded, flip };
+	// The supervisor residency answer, read BEFORE the health gate: it is the only
+	// reading that stops a 13-25 s, 52 GiB load the router census calls necessary (an
+	// unreachable census, a models list naming no loaded entry, a context that reports
+	// no model). A NO ANSWER falls through to the gate below, so a daemon under restart
+	// costs a load and never a refusal.
+	const sup = await supervisorResident(lane, opts.sessionId ?? "fade-orchestrator");
+	if (sup?.resident) {
+		return { ok: true, detail: `resident per supervisor; no swap issued (${sup.detail})${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+	}
 	// A swap UNLOADS the resident context, so the router's health is read before the byte: the
 	// refusal names the class, and the router is never poked with a load it cannot serve.
 	const verdict = serveVerdict(health);
@@ -214,17 +335,46 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 		return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}
 
-	// The supervisor lease is the single authority over the lane: with a token
-	// held and FADE_ORCHESTRATE_SWAP_VIA=supervisor (the default), the swap byte
-	// rides POST /v1/swap under the lease, and a 409 lease_not_holder is a named
-	// refusal (the lane is not ours to move). No token, or SWAP_VIA=ctl: the
+	// The supervisor lease is the single authority over the lane: with a token held
+	// and FADE_ORCHESTRATE_SWAP_VIA=supervisor (the default), the swap byte rides
+	// the lease route, and a 409 lease_not_holder is a named refusal (the lane is
+	// not ours to move). A call that carries no token mints its own and releases it
+	// in the same call. No token and no mint request, or SWAP_VIA=ctl: the
 	// basalt-ctl.sh fleet gate below, unchanged.
-	if (SWAP_VIA === "supervisor" && opts.leaseToken) {
-		const v = await swapLeased(lane, opts.leaseToken, opts.sessionId ?? "fade-orchestrator");
-		const detail = v.ok
-			? `swap via supervisor: ${lane}`
-			: `swap supervisor refused http ${v.status} rule ${v.rule || "?"}: ${v.reason || "no reason"}`;
-		return { ok: v.ok, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+	if (SWAP_VIA === "supervisor") {
+		const sid = opts.sessionId ?? "fade-orchestrator";
+		let token = opts.leaseToken;
+		let minted = false;
+		if (!token && opts.mintLease) {
+			// The review/escalation-turn case: this call carries no run token, so it mints
+			// its own. The daemon floors apply unchanged - a dev build is refused the acquire
+			// here (dev_build_no_evict), which is the point of the floors.
+			const lease = await acquireLease(lane, opts.mintLease.ttlSec, sid);
+			token = lease.ok ? lease.token : undefined;
+			minted = !!token;
+			if (!token) {
+				return { ok: false, detail: `lease mint refused http ${lease.status} rule ${lease.rule || "?"}: ${lease.reason || "no reason"}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+			}
+		}
+		if (token) {
+			// A lease THIS call minted is THIS call to release, and the finally is the
+			// guarantee: a refused swap, a 503, a transport throw, a bounded timeout - the
+			// lease comes back in every case, so the lane returns to the resident pack owner
+			// and a peer is never locked out by a caller that died mid-swap. The run own
+			// token is NOT touched here: the run lifecycle owns it, and the run end (complete,
+			// failed, stopped, a preflight refusal) releases it.
+			try {
+				const v = await swapLeased(lane, token, sid);
+				const detail = v.ok
+					? `swap via supervisor: ${lane}`
+					: `swap supervisor refused http ${v.status} rule ${v.rule || "?"}: ${v.reason || "no reason"}`;
+				return { ok: v.ok, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+			} finally {
+				if (minted) await releaseSupervisorLease(token, sid).catch(() => undefined);
+			}
+		}
+		// The supervisor path with no token and no mint request: the fleet gate below is
+		// the path that works, unchanged.
 	}
 	try {
 		// One swap, one lease: the ctl script gates, mints, grants, burns, loads, and the minted
