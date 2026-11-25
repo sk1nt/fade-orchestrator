@@ -23,7 +23,8 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy } from "./router.ts";
+import { CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan } from "./router.ts";
+import { acquireLease, releaseLease, renewLease, leaseLine, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 import {
 	DESK_DEADLINE_MS,
@@ -177,6 +178,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  router is not a concurrency question but a correctness one: each one's pre-swap gate ends up
 	 *  judging the other's working tree. */
 	let lockDir: string | undefined;
+	/** The supervisor lane lease held by THIS run: the token is the write capability
+	 *  (in-process only, never rendered); the session id is the run id the daemon
+	 *  attributes the lease to. LEASE_TTL_S is the ask; the daemon clamps to its max. */
+	let leaseToken: string | undefined;
+	let leaseSession = "";
+	const LEASE_TTL_S = Number(process.env.FADE_ORCHESTRATE_LEASE_TTL_S ?? 1800);
 	let pending: { lane: string; phase: string } | undefined;
 	/** The desk batch this session CLAIMED and is answering. The claim is the one-use ticket: it is
 	 *  what makes `fade_verdicts` legal for those ids, and what stops the same batch being answered
@@ -214,6 +221,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let swapPill: SwapPill | undefined;
 
 	const refreshMetrics = async (): Promise<void> => {
+		// The lease outlives one turn; renew it on the tick (TTL 1800 s vs a 30 s
+		// tick) so a planning/frontier run never loses the lane mid-phase.
+		void renewLaneLease();
 		const s = await fetchMetrics();
 		if (!s) return;
 		metrics = s;
@@ -404,6 +414,65 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		releaseInstanceLock(lockDir);
 		lockDir = undefined;
 	};
+	/** Return the supervisor lane lease ("return the coder"). Best-effort: a dead
+	 *  daemon must never take a run's end down. Clears the in-process token either
+	 *  way, so a resumed run never re-releases a stale one. */
+	const releaseLaneLease = (): void => {
+		const tok = leaseToken;
+		leaseToken = undefined;
+		if (run) run.lease_state = "released";
+		if (!tok) return;
+		void releaseLease(tok, leaseSession)
+			.then((v) => {
+				if (run) run.lease_hint = v.token_hint ?? run.lease_hint;
+			})
+			.catch(() => undefined);
+	};
+	/** Acquire the lane lease as the prod authority. Granted → the run may swap
+	 *  under the minted token. Not granted (a peer holds it via 409 lease_not_holder,
+	 *  a stale token, or the daemon is unreachable) → the run has no lane authority
+	 *  and is refused at the start, so a second orchestration serializes behind the
+	 *  holder. The token is the write capability: it lives in the closure and the
+	 *  run state, never in any rendered line. */
+	const acquireLaneLease = async (lane: string, runId: string, ctx: ExtensionContext): Promise<{ ok: boolean; line: string }> => {
+		leaseSession = runId;
+		try {
+			const v = await acquireLease(lane, LEASE_TTL_S, runId);
+			if (run) {
+				run.lease_holder = v.holder;
+				run.lease_hint = v.token_hint;
+			}
+			if (v.ok && v.token) {
+				leaseToken = v.token;
+				if (run) {
+					run.lease_state = "held";
+					run.lease_token = v.token;
+					run.lease_granted_ttl_s = v.granted_ttl_s;
+				}
+				return { ok: true, line: leaseLine(v) };
+			}
+			if (run) run.lease_state = v.rule === RULE_LEASE_STALE_TOKEN ? "refused" : "deferred";
+			return { ok: false, line: leaseLine(v) };
+		} catch (e) {
+			if (run) run.lease_state = "refused";
+			return { ok: false, line: `supervisor lease unreachable: ${msg(e)}` };
+		}
+	};
+	/** Renew the held lease on the metrics tick so a long run never drops its
+	 *  authority mid-flight. A stale/lost lease clears the token, so the run stops
+	 *  swapping the lane it no longer owns. */
+	const renewLaneLease = async (): Promise<void> => {
+		if (!leaseToken) return;
+		try {
+			const v = await renewLease(leaseToken, LEASE_TTL_S, leaseSession);
+			if (run) run.lease_hint = v.token_hint ?? run.lease_hint;
+			if (v.rule === RULE_LEASE_STALE_TOKEN || v.rule === RULE_LEASE_NOT_HOLDER) leaseToken = undefined;
+		} catch {
+			// A daemon that drops mid-run: keep the token. The swap path names the
+			// daemon being unreachable, and TTL expiry is the backstop for a run that
+			// dies outright, so a transient blip never silently strands the lane.
+		}
+	};
 
 	/**
 	 * The ON-DISK run, for the verifier sandbox, which asks on EVERY tool call. `readFileSync` +
@@ -548,6 +617,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run.state = "failed";
 			run.reason = reason;
 			releaseLock();
+			releaseLaneLease();
 			void persist().catch(warnWrite(ctx, "fail"));
 			paint(ctx);
 		}
@@ -713,7 +783,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// DEFERRAL — the caller keeps `pending`, so the owed lane survives the whole wait — and an
 		// over-budget wait pays the load anyway, because a loop that never lands its lane is a
 		// stalled run. That decision is written into `rejection_history`, not just notified.
-		const gate = await gateRouterIdle(lane, ctx);
+		const plan = switchPlan(await residentLane(), lane);
+		if (!plan.load) ctx.ui.notify(`fade_orchestrate: ${plan.reason}`, "info");
+		const gate: { waited_ms: number; polls: number; over_budget: boolean; last: RouterBusy } = plan.gate
+			? await gateRouterIdle(lane, ctx)
+			: { waited_ms: 0, polls: 0, over_budget: false, last: { busy: false, reason: plan.reason } };
 		if (gate.over_budget && run) {
 			pushRejection(run, "task", `the ${lane} load was paid after the idle gate ran its full ${Math.round(GATE_BUDGET_MS / 1000)}s: ${gate.polls} polls, ${gate.last.reason}`);
 			await persist();
@@ -786,30 +860,32 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// `PROOF_TTL_MS`). Reading the stale one would label a warm start off the pre-swap engine.
 		engineProofInvalidate();
 		const moe = laneMoe(lane, { configPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG });
-		const watch = startSwapWatch(lane, moe, (percent) => {
-			// A superseded switch's watch must never paint: its lane is not the one loading.
+		const watch = plan.load
+			? startSwapWatch(lane, moe, (percent) => {
+					// A superseded switch's watch must never paint: its lane is not the one loading.
 			if (gen !== switchGen || !swapPill) return;
 			swapPill = { ...swapPill, percent };
 			paint(ctx);
-		});
+				})
+			: undefined;
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
-		const loaded = await loadLane(lane);
+		const loaded = await loadLane(lane, { leaseToken, sessionId: leaseSession });
 		if (gen !== switchGen) {
 			// The pill, the row and the briefing belong to the switch that superseded this one; the
 			// watch is the only thing here that outlives the call, so it is the thing cancelled.
-			watch.cancel();
+			watch?.cancel();
 			return;
 		}
 		ctx.ui.setWorkingMessage();
 		swapPill = undefined;
 		if (!loaded.ok) {
-			watch.cancel();
+			watch?.cancel();
 			fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
 			return;
 		}
 		if (from && runDir && from !== lane) {
 			turnSwapMs += Math.round(loaded.elapsed_s * 1000);
-			void watch.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
+			void watch?.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
 		}
 		if (run) run.lane = lane;
 		await persist();
@@ -1297,6 +1373,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// starts without a manual release. Owner-only: an adopted run holds no claim of its own.
 			if (applied.nextState === "complete" || applied.nextState === "failed") {
 				releaseLock();
+				releaseLaneLease();
 			}
 			let checkpointNote = "";
 			if (params.phase === "verification_done" && applied.nextState === "complete") {
@@ -1619,7 +1696,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// says so in words, never a bare zero.
 				const call = run.lane_call ? ` · in-process ${run.lane_call.model} ${run.lane_call.ok ? `answered ${run.lane_call.chars} chars` : `refused ${run.lane_call.cls}`} · ${(run.lane_call.ms / 1000).toFixed(1)}s` : " · no in-process call";
 				ctx.ui.notify(
-					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · ${paid}${deskPart}${call} · ${statePath()}`,
+					`orchestrate ${run.run_id}: ${run.state} · lane ${run.lane} · round ${run.round}/${run.max_rounds} · tasks ${done}/${run.tasks.length} · phases ${run.phases.length} · router claim ${lockDir ? `this run (pid ${process.pid})` : claim ? `pid ${claim.pid} · ${claim.run_id} · ${claim.repo} · ${claim.host}` : "free"}${held} · lease ${run.lease_state ?? "none"}${run.lease_holder && run.lease_state !== "held" ? `(${run.lease_holder})` : run.lease_granted_ttl_s ? `(${run.lease_granted_ttl_s}s)` : ""}${paid}${deskPart}${call} · ${statePath()}`,
 					"info",
 				);
 				paint(ctx);
@@ -1858,6 +1935,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					if (runDir) writeJson(statePath(), run);
 				}
 				releaseLock();
+				releaseLaneLease();
 				pending = undefined;
 				// The hand-back: a stop is the end of the run's role, so the thinking lane is not left
 				// resident. Quiet — no briefing for a lane nobody asked for.
@@ -1918,12 +1996,23 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			if (!(await isGitRepo(repo))) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
 			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
 			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
+			// The :18014 lane is a single-authority lease. Acquire it as the prod
+			// authority BEFORE the first pack load: a peer orchestration that holds
+			// it (409 lease_not_holder) is refused here, so two sessions serialize on
+			// the lane instead of one swapping out the other's planning pack.
+			const lease = await acquireLaneLease(THINK_LANE, runId, ctx);
+			if (!lease.ok) {
+				releaseLock();
+				ctx.ui.notify(`orchestrate: the :18014 lane lease is held — ${lease.line}. End the holding run there, then start here. Nothing was written.`, "error");
+				return;
+			}
 			// in this run reads a pre-load engine state.
-			const loaded = await loadLane(THINK_LANE);
+			const loaded = await loadLane(THINK_LANE, { leaseToken, sessionId: runId });
 			if (!loaded.ok) {
 				// A start that never began releases its claim: a preflight failure must not strand
 				// the router behind a run that does not exist.
 				releaseLock();
+				releaseLaneLease();
 				ctx.ui.notify(`orchestrate: preflight failed loading ${THINK_LANE} (${loaded.detail}); nothing written`, "error");
 				return;
 			}
@@ -1931,6 +2020,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const resident = census.models.find((m) => m.status === "loaded");
 			if (!census.error && resident?.id !== THINK_LANE) {
 				releaseLock();
+				releaseLaneLease();
 				ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
 				return;
 			}

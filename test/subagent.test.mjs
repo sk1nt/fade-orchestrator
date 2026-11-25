@@ -7,6 +7,7 @@
  * not: count the plain ones and the batch never closes; miss the verification ones and the batch
  * closes before their requests land.
  */
+import "./env.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {

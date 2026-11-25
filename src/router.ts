@@ -15,6 +15,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { swapLeased } from "./supervisor.ts";
 
 const execC = promisify(exec);
 
@@ -35,6 +36,13 @@ export const msg = (e: unknown): string => (e instanceof Error ? e.message : Str
  * "exactly ONE / ZERO POST /v1/load" proofs honest.
  */
 export const SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "/home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh";
+
+/** Which plane issues the lane swap. `supervisor` (the default) rides the
+ *  fade-supervisor lane lease (POST /v1/swap under the run's lease token) — the
+ *  single authority that serializes concurrent OMP sessions. `ctl` preserves the
+ *  basalt-ctl.sh fleet gate (VRAM floor, circuit, minted nonce) verbatim. With
+ *  no lease token held the swap falls to ctl regardless of this setting. */
+export const SWAP_VIA = process.env.FADE_ORCHESTRATE_SWAP_VIA === "ctl" ? "ctl" : "supervisor";
 
 /** Run the swap command to completion (240 s bound, same as the old direct POST). A kill on
  * timeout is reported as rc 124, never thrown, so the caller's detail names the stage. */
@@ -187,7 +195,7 @@ export const SETTLE_MAX_MS = Number(process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS ?
 // `releaseLease`, and a request naming any other model is refused (409) instead of swapping
 // the lane out — the run's advisory lane runs its full turn. The request rides the swap job
 // and `basalt-ctl.sh` puts it in the load body, so the gate and the lease are taken together.
-export async function loadLane(lane: string, opts: { lease?: boolean } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
+export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken?: string; sessionId?: string } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
 	const t0 = Date.now();
 	// Settle any in-flight swap FIRST and keep the health line the window ended on — that
 	// reading is the gate's evidence.
@@ -204,6 +212,19 @@ export async function loadLane(lane: string, opts: { lease?: boolean } = {}): Pr
 	const verdict = serveVerdict(health);
 	if (verdict.serve === false) {
 		return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+	}
+
+	// The supervisor lease is the single authority over the lane: with a token
+	// held and FADE_ORCHESTRATE_SWAP_VIA=supervisor (the default), the swap byte
+	// rides POST /v1/swap under the lease, and a 409 lease_not_holder is a named
+	// refusal (the lane is not ours to move). No token, or SWAP_VIA=ctl: the
+	// basalt-ctl.sh fleet gate below, unchanged.
+	if (SWAP_VIA === "supervisor" && opts.leaseToken) {
+		const v = await swapLeased(lane, opts.leaseToken, opts.sessionId ?? "fade-orchestrator");
+		const detail = v.ok
+			? `swap via supervisor: ${lane}`
+			: `swap supervisor refused http ${v.status} rule ${v.rule || "?"}: ${v.reason || "no reason"}`;
+		return { ok: v.ok, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}
 	try {
 		// One swap, one lease: the ctl script gates, mints, grants, burns, loads, and the minted
@@ -395,6 +416,30 @@ export function resetFlipLedger(): void {
 /** The entry the router is holding right now, or `undefined` when it names none. */
 export async function residentLane(): Promise<string | undefined> {
 	return (await listLanes()).models.find((m) => m.status === "loaded")?.id;
+}
+
+export interface SwitchPlan {
+	/** True when the pre-unload idle gate has to run at all. */
+	gate: boolean;
+	/** True when a load/swap byte is on the table. */
+	load: boolean;
+	/** The reason, in the words the operator reads. */
+	reason: string;
+}
+
+/**
+ * The lane-switch decision, as a pure function of what the router holds.
+ *
+ * A target the router ALREADY holds needs no idle gate and no load: `loadLane` refuses it with
+ * `already resident; no swap issued` after one lane-listing read. Gating before that check — which
+ * is what this file used to do — polled the slot census for up to `GATE_BUDGET_MS` and raised the
+ * `load is DEFERRED — slot busy` warning for a lane that was never going to move, while the request
+ * occupying the slot was the session asking for it. Any other target keeps the full sequence
+ * untouched: idle gate, then the lease/ctl swap path.
+ */
+export function switchPlan(resident: string | undefined, lane: string): SwitchPlan {
+	if (resident === lane) return { gate: false, load: false, reason: `already resident: ${lane}; no load to gate` };
+	return { gate: true, load: true, reason: `${lane} is not resident${resident ? ` (resident: ${resident})` : " (the router names no loaded entry)"}: gate, then swap` };
 }
 
 /**

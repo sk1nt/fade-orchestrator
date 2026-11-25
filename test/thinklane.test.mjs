@@ -12,6 +12,7 @@
  * and no real router is touched; `resident` is injected so the residency rule is testable without a
  * router at all.
  */
+import "./env.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { answerText, askLane, probeThink, resolveAskSpec } from "../.test-build/thinklane.mjs";
@@ -150,7 +151,7 @@ test("a wedged lane is `timeout`, named as busy-or-loading, not a silent empty a
 	const wedged = new Error("The operation was aborted due to timeout");
 	wedged.name = "TimeoutError";
 	const { calls, fetchImpl } = stub({ throw: wedged });
-	const r = await askLane("basalt-deepseek/deepseek", "think", { timeoutMs: 5 }, {}, { yml: YML, fetchImpl });
+	const r = await askLane("basalt-deepseek/deepseek", "think", { timeoutMs: 5 }, { yml: YML, fetchImpl });
 	assert.equal(r.ok, false);
 	assert.equal(r.cls, "timeout");
 	assert.match(r.detail, /answered no completion in/);
