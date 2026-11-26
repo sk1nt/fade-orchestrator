@@ -237,7 +237,7 @@ test("a minted lease is released when the swap is refused: the finally is the gu
 	}
 });
 
-test("a minted lease is released when the swap lands, and the swap byte rides the token", async () => {
+test("a minted lease is KEPT when the swap lands, and the swap byte rides the token", async () => {
 	const sup = await daemon({
 		residency: IDLE,
 		lease: { acquire: { body: { decision: "GRANT", accepted: true, rule: "lease_granted", granted_ttl_s: 300, token: "T-OK" } }, release: { body: { decision: "RELEASE", accepted: true, rule: "lease_released" } } },
@@ -250,9 +250,39 @@ test("a minted lease is released when the swap lands, and the swap byte rides th
 		const r = await router.loadLane(TARGET, { sessionId: "sess-turn", mintLease: { ttlSec: 300 } });
 		assert.equal(r.ok, true, r.detail);
 		assert.match(r.detail, /swap via supervisor: flash-next/, r.detail);
-		const released = sup.hits.filter((h) => h.includes("release") && h.includes("T-OK"));
-		assert.equal(released.length, 1, "the success path releases too: the lane is free for the next caller");
+		assert.equal(r.minted, true, "the load says this token is the CALLER'S to keep");
+		assert.equal(r.leaseToken, "T-OK", "the minted capability is returned, not consumed");
+		assert.equal(r.leaseSession, "sess-turn", "the minting identity rides back for the release");
+		assert.equal(sup.hits.filter((h) => h.includes("release")).length, 0,
+			"the success path releases NOTHING: releasing here freed the lane before the turn the load protects ran (measured 2026-11-25)");
 		assert.equal(sup.hits.filter((h) => h.includes("acquire")).length, 1, "one acquire, no retry storm");
+		assert.match(sup.hits.find((h) => h.includes(R_SWAP)), /token=T-OK/, "the swap byte rides the minted token");
+		assert.ok(!existsSync(ctl.log), "a supervisor-path swap never falls to the ctl fleet gate");
+	} finally {
+		await sup.close();
+		rt.close();
+		rmSync(sup.dir, { recursive: true, force: true });
+	}
+});
+
+test("a held capability rides the next move: no mint, no release, one swap byte", async () => {
+	const sup = await daemon({
+		residency: IDLE,
+		swap: { status: 202, body: { decision: "ADMIT", accepted: true, rule: "swap_admitted", lane: { active_pack: TARGET } } },
+	});
+	const rt = await routerStub();
+	const ctl = ctlStub(sup.dir);
+	try {
+		const router = await fresh("load-held", { FADE_SUPERVISOR_SOCK: sup.sock, FADE_ORCHESTRATE_ROUTER: rt.url, FADE_ORCHESTRATE_SWAP_CMD: ctl.script });
+		const r = await router.loadLane(TARGET, { leaseToken: "T-HELD", sessionId: "sess-verify" });
+		assert.equal(r.ok, true, r.detail);
+		assert.equal(r.minted, undefined, "a presented token is not a mint, so there is nothing to hand back");
+		assert.equal(sup.hits.filter((h) => h.includes(R_LEASE)).length, 0,
+			"zero lease traffic: the session's capability covers the whole review, one holder for the turn");
+		const held = sup.hits.find((h) => h.includes(R_SWAP));
+		assert.match(held, /token=T-HELD/, "the swap rides the held token");
+		assert.match(held, /sid=sess-verify/, "under the identity that minted it");
+		assert.ok(!existsSync(ctl.log), "the ctl fleet gate was never invoked");
 	} finally {
 		await sup.close();
 		rt.close();

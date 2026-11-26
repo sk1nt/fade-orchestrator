@@ -183,6 +183,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  attributes the lease to. LEASE_TTL_S is the ask; the daemon clamps to its max. */
 	let leaseToken: string | undefined;
 	let leaseSession = "";
+	/** The capability a NON-RUN move minted (a verification/escalation turn, the panel). Held
+	 *  across the turn it protects and returned at hand-back/shutdown — releasing inside the
+	 *  load left the lane free before the review ran (measured 2026-11-25). */
+	let verifyLeaseToken: string | undefined;
+	let verifyLeaseSession = "";
+	let verifyLeaseLane = "";
+	let verifyLeaseRemainingS = 0;
 	/** The single-turn mint: a load that carries no run lease (the overlay keys, the
 	 *  hand-back, a review/escalation turn) acquires for the length of ONE pack load plus
 	 *  slack and releases it in the same call (`loadLane`'s `finally`). The daemon clamps
@@ -433,6 +440,25 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	/** Return the supervisor lane lease ("return the coder"). Best-effort: a dead
 	 *  daemon must never take a run's end down. Clears the in-process token either
 	 *  way, so a resumed run never re-releases a stale one. */
+	/** Return the verify capability: the hand-back landed, or the session is closing. A
+	 *  failure is logged, never swallowed — an unreleased lease pins the lane for its TTL. */
+	const returnVerifyLease = async (): Promise<void> => {
+		const tok = verifyLeaseToken;
+		const sid = verifyLeaseSession || SELF_SESSION;
+		verifyLeaseToken = undefined;
+		verifyLeaseRemainingS = 0;
+		verifyLeaseLane = "";
+		verifyLeaseSession = "";
+		if (!tok) return;
+		try {
+			const v = await releaseLease(tok, sid);
+			if (!v.ok) process.stderr.write(`orchestrate: verify lease release refused (${v.rule || v.status}); it expires on its TTL
+`);
+		} catch (e) {
+			process.stderr.write(`orchestrate: verify lease release failed: ${msg(e)}; it expires on its TTL
+`);
+		}
+	};
 	const releaseLaneLease = (): void => {
 		const tok = leaseToken;
 		const sid = leaseSession;
@@ -484,6 +510,19 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  authority mid-flight. A stale/lost lease clears the token, so the run stops
 	 *  swapping the lane it no longer owns. */
 	const renewLaneLease = async (): Promise<void> => {
+		// The verify capability gets the same gate on the same tick: a review turn can outlive a
+		// short mint TTL, and a lease that expires mid-review hands the lane to the next peer.
+		if (verifyLeaseToken && shouldRenew(verifyLeaseRemainingS, LEASE_MINT_TTL_S)) {
+			try {
+				const v = await renewLease(verifyLeaseToken, LEASE_MINT_TTL_S, verifyLeaseSession || SELF_SESSION);
+				verifyLeaseRemainingS = v.remaining_s ?? v.granted_ttl_s ?? LEASE_MINT_TTL_S;
+				if (v.rule === RULE_LEASE_STALE_TOKEN || v.rule === RULE_LEASE_NOT_HOLDER) verifyLeaseToken = undefined;
+			} catch {
+				/* keep it: the TTL is the backstop and the next tick retries */
+			}
+		} else if (verifyLeaseToken) {
+			verifyLeaseRemainingS = Math.max(0, verifyLeaseRemainingS - METRICS_INTERVAL_MS / 1000);
+		}
 		if (!leaseToken) return;
 		if (!shouldRenew(leaseRemainingS, LEASE_TTL_S)) {
 			// The lease is running down, not running out: age the published countdown by
@@ -648,6 +687,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run.reason = reason;
 			releaseLock();
 			releaseLaneLease();
+			void returnVerifyLease();
 			void persist().catch(warnWrite(ctx, "fail"));
 			paint(ctx);
 		}
@@ -694,9 +734,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 */
 	let switchGen = 0;
 	let switchChain: Promise<void> = Promise.resolve();
-	const requestLane = (lane: string, ctx: ExtensionContext, quiet = false): void => {
+	const requestLane = (lane: string, ctx: ExtensionContext, quiet = false, handBack = false): void => {
 		const gen = ++switchGen;
-		switchChain = switchChain.then(() => (gen === switchGen ? runSwitch(lane, ctx, gen, quiet) : undefined)).catch(() => undefined);
+		switchChain = switchChain.then(() => (gen === switchGen ? runSwitch(lane, ctx, gen, quiet, handBack) : undefined)).catch(() => undefined);
 	};
 
 	/**
@@ -797,7 +837,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		return `; OWED ${owed.length} unjudged verification request(s): ${ids} — those slices are UNVERIFIED`;
 	};
 
-	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number, quiet = false): Promise<void> => {
+	const runSwitch = async (lane: string, ctx: ExtensionContext, gen: number, quiet = false, handBack = false): Promise<void> => {
 		const model = ctx.modelRegistry.find(PROVIDER, lane);
 		if (!model) {
 			fail(ctx, `model ${PROVIDER}/${lane} is not in the registry`);
@@ -894,11 +934,30 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				})
 			: undefined;
 		ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${lane} on the router…`);
-		// A switch that carries no run lease mints its own and releases it in the same
-		// call: the supervisor is the single authority over :18014, so a non-run turn
-		// never swaps behind its back on the ctl fleet gate, and never leaves the lane
-		// claimed after the turn ends.
-		const loaded = await loadLane(lane, { leaseToken, sessionId: leaseSession || SELF_SESSION, ...(leaseToken ? {} : { mintLease: { ttlSec: LEASE_MINT_TTL_S } }) });
+		// The lease this load presents, in priority order:
+		//  1. the RUN's own token — the run lifecycle owns that lease, and a mid-run swap
+		//     must never mint over it;
+		//  2. the verify capability this session already holds. A lease is the LANE's write
+		//     capability, not the pack's: one held token moves the lane anywhere this session
+		//     needs it, so a second review move — and the hand-back — re-use the same holder
+		//     instead of churning a new lease per load;
+		//  3. a mint under this session's own identity, KEPT (never released here) for the turn
+		//     the load protects. The old `finally` released it before the review ran a byte,
+		//     which left `lease=free` and let the next peer session take the lane back
+		//     (measured 2026-11-25). A minted lease is returned at the hand-back/shutdown.
+		const presentToken = leaseToken ?? verifyLeaseToken;
+		const loaded = await loadLane(lane, {
+			...(presentToken ? { leaseToken: presentToken } : { mintLease: { ttlSec: LEASE_MINT_TTL_S } }),
+			sessionId: leaseToken ? leaseSession || SELF_SESSION : verifyLeaseSession || SELF_SESSION,
+		});
+		if (loaded.minted && loaded.leaseToken) {
+			verifyLeaseToken = loaded.leaseToken;
+			verifyLeaseSession = loaded.leaseSession ?? SELF_SESSION;
+			verifyLeaseLane = lane;
+			verifyLeaseRemainingS = LEASE_MINT_TTL_S;
+		} else if (loaded.ok && verifyLeaseToken) {
+			verifyLeaseLane = lane;
+		}
 		if (gen !== switchGen) {
 			// The pill, the row and the briefing belong to the switch that superseded this one; the
 			// watch is the only thing here that outlives the call, so it is the thing cancelled.
@@ -916,6 +975,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			turnSwapMs += Math.round(loaded.elapsed_s * 1000);
 			void watch?.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
 		}
+		if (handBack && verifyLeaseToken && !leaseToken) await returnVerifyLease();
 		if (run) run.lane = lane;
 		await persist();
 		paint(ctx);
@@ -926,6 +986,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// A QUIET switch carries no briefing: the hand-back lands a lane the operator did not ask
 			// about, and a page sent for it would be a queued request naming the lane just left.
 			if (quiet) return;
+			// A PLAIN session (no run) has no round, no desk, no protocol debt: the lane move IS the
+			// deliverable. The briefing below reads `run!` — measured 2026-11-25, a verdict act in a
+			// session with no run reached this timer with `run === undefined` and threw inside a
+			// host timer (unhandled rejection: `Cannot read properties of undefined (reading
+			// 'state')`), which is the plain-session verification path dying on the host.
+			if (!run) return;
 			await ensurePhaseTool();
 			// A batch briefing is owed to exactly ONE landing: the switch the desk dispatch asked
 			// for. The flag is consumed here, so a later switch to the same lane re-briefs the
@@ -1664,6 +1730,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return;
 			}
 			ctx.ui.notify(`lane: moving :18014 to ${target} (teardown, spawn, readiness) …`, "info");
+			// The verb is the operator taking the lane: a capability THIS session still holds
+			// would be the daemon's own `lease_held` against this very process. Hand it back
+			// first, then let the verb mint (and return) its own.
+			await returnVerifyLease();
 			const mv = await moveLane(target, { sessionId: `omp-pid-${process.pid}` });
 			ctx.ui.setWidget("lanes", [`lane ${target}: ${mv.ok ? "resident, id proven" : "NOT proven resident"}`, mv.detail]);
 			ctx.ui.notify(`lane ${target}: ${mv.detail}`, mv.ok ? "info" : "warning");
@@ -1996,7 +2066,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// The hand-back: a stop is the end of the run's role, so the thinking lane is not left
 				// resident. Quiet — no briefing for a lane nobody asked for.
 				const handBack = run.lane === THINK_LANE;
-				if (handBack) requestLane(CODE_LANE, ctx, true);
+				if (handBack) requestLane(CODE_LANE, ctx, true, true);
 				ctx.ui.notify(`orchestrate: stopped; ${handBack ? `handing the lane back to ${CODE_LANE}` : `resident lane left as ${run.lane}`}; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
 					try {
@@ -2056,6 +2126,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// authority BEFORE the first pack load: a peer orchestration that holds
 			// it (409 lease_not_holder) is refused here, so two sessions serialize on
 			// the lane instead of one swapping out the other's planning pack.
+			// One process can hold at most ONE lease on the lane: the verify capability (a review
+			// turn's) is a DIFFERENT (caller, session) pair, and `AdmitLease` refuses a cross-pair
+			// claim as `lease_held` — against this very session. Return it, then claim as the run.
+			await returnVerifyLease();
 			const lease = await acquireLaneLease(THINK_LANE, runId, ctx);
 			if (!lease.ok) {
 				releaseLock();
@@ -2227,7 +2301,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// back at the boundary: one `setModel` + load, no briefing, no run state. The forward
 			// direction is the host resolving the thinking-lane role; the reverse is here. Delegated
 			// sessions never touch the lane — their parent's run owns it.
-			if (!isDelegatedSession() && ctx.model?.provider === PROVIDER && ctx.model.id === THINK_LANE) requestLane(CODE_LANE, ctx, true);
+			if (!isDelegatedSession() && ctx.model?.provider === PROVIDER && ctx.model.id === THINK_LANE) requestLane(CODE_LANE, ctx, true, true);
 			return;
 		}
 		const next = pending;
@@ -2241,7 +2315,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				}
 				void recordTurn(run.state);
 				// DS's role is done: hand the lane back instead of leaving the thinking lane resident.
-				if (run.lane === THINK_LANE) requestLane(CODE_LANE, ctx, true);
+				if (run.lane === THINK_LANE) requestLane(CODE_LANE, ctx, true, true);
 				return;
 			}
 			if (run.paused === true) {
@@ -2457,6 +2531,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		clearSurface(ctx);
 		stopMetricsTimer();
+		await returnVerifyLease();
 		if (inputUnsub) {
 			inputUnsub();
 			inputUnsub = undefined;

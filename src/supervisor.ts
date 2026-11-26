@@ -151,6 +151,11 @@ export function postUds(sock: string, path: string, body: unknown, headers: Reco
 	const req = request(
 		{
 			socketPath: sock,
+			// No pooled connection: the global agent is keep-alive, and a pooled UDS socket is an
+			// open handle that outlives the call. In the TUI that is invisible; in a one-shot host
+			// (`omp -p`) the plugin's residency/lease calls keep the event loop alive after the work
+			// is done, so the process exits on nothing. `agent: false` is a per-request socket.
+			agent: false,
 			method: "POST",
 			path,
 			headers: { ...headers, "content-length": Buffer.byteLength(payload) },
@@ -169,6 +174,11 @@ export function postUds(sock: string, path: string, body: unknown, headers: Reco
 					parsed = undefined;
 				}
 				resolve({ status: res.statusCode ?? 0, body: parsed, raw });
+				// The response is read: drop the socket. The daemon keeps a keep-alive connection open
+				// after replying, so a client that ends the call and keeps the socket leaves a live
+				// handle — counted on this box: 2 `PipeWrap` outliving a completed lease round trip,
+				// which pins a one-shot host's event loop for the process's whole life.
+				req.destroy();
 			});
 		},
 	);
@@ -200,7 +210,7 @@ const ROUTE_HEALTH = SL.concat("v1", SL, "health");
  */
 export function getUds(sock: string, path: string, headers: Record<string, string>, timeoutMs = 4_000): Promise<WireResult> {
 	const { promise, resolve, reject } = Promise.withResolvers<WireResult>();
-	const req = request({ socketPath: sock, method: "GET", path, headers }, (res) => {
+	const req = request({ socketPath: sock, agent: false, method: "GET", path, headers }, (res) => {
 		let raw = "";
 		res.setEncoding("utf8");
 		res.on("data", (c) => {
@@ -214,6 +224,7 @@ export function getUds(sock: string, path: string, headers: Record<string, strin
 				parsed = undefined;
 			}
 			resolve({ status: res.statusCode ?? 0, body: parsed, raw });
+			req.destroy(); // read leg: the same rule, no socket outlives the reply
 		});
 	});
 	req.setTimeout(timeoutMs, () => req.destroy(new Error(`supervisor ${path}: timed out after ${timeoutMs}ms`)));

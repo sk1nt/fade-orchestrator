@@ -44,10 +44,11 @@ export const msg = (e: unknown): string => (e instanceof Error ? e.message : Str
 export const SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "/home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh";
 
 /** Which plane issues the lane swap. `supervisor` (the default) rides the
- *  fade-supervisor lane lease (POST /v1/swap under the run's lease token) — the
- *  single authority that serializes concurrent OMP sessions. `ctl` preserves the
- *  basalt-ctl.sh fleet gate (VRAM floor, circuit, minted nonce) verbatim. With
- *  no lease token held the swap falls to ctl regardless of this setting. */
+ *  fade-supervisor lane lease exclusively: a load with no token is REFUSED, never
+ *  handed to the ctl fleet gate, because a ctl load takes no lease and is exactly
+ *  the bypass that let a peer session evict the lane under a held lease
+ *  (measured 2026-11-25). `ctl` preserves the basalt-ctl.sh fleet gate (VRAM
+ *  floor, circuit, minted nonce) verbatim, and is chosen, never fallen into. */
 export const SWAP_VIA = process.env.FADE_ORCHESTRATE_SWAP_VIA === "ctl" ? "ctl" : "supervisor";
 
 /** Run the swap command to completion (240 s bound, same as the old direct POST). A kill on
@@ -309,11 +310,21 @@ async function gateBusyLoop(lane: string, opts: GateOpts, budgetMs: number, poll
 	return { waited_ms: Date.now() - t0, polls, over_budget: false, last };
 }
 
+/** The answer one lane load gives. `minted` is set when the load itself acquired
+ *  the lane lease, and `leaseToken`/`leaseSession` are then the capability and the
+ *  identity that hold it — the load does NOT return its own lease: the lease
+ *  outlives the load by exactly the turn the caller is about to run, and the
+ *  caller returns it at the hand-back. Releasing inside the load (the old
+ *  `finally`) dropped the guard before the review turn had run a byte, and the
+ *  very next peer session minted its own lease and swapped the lane back
+ *  (measured 2026-11-25). */
+export type LaneLoad = { ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState; leaseToken?: string; leaseSession?: string; minted?: boolean };
+
 // `lease: true` asks the router for the DURABLE load: the lane stays resident until
 // `releaseLease`, and a request naming any other model is refused (409) instead of swapping
 // the lane out — the run's advisory lane runs its full turn. The request rides the swap job
 // and `basalt-ctl.sh` puts it in the load body, so the gate and the lease are taken together.
-export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken?: string; sessionId?: string; mintLease?: { ttlSec: number } } = {}): Promise<{ ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState }> {
+export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken?: string; sessionId?: string; mintLease?: { ttlSec: number } } = {}): Promise<LaneLoad> {
 	const t0 = Date.now();
 	// Settle any in-flight swap FIRST and keep the health line the window ended on — that
 	// reading is the gate's evidence.
@@ -341,47 +352,67 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 		return { ok: false, detail: `refused pre-unload: ${verdict.reason}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 	}
 
-	// The supervisor lease is the single authority over the lane: with a token held
-	// and FADE_ORCHESTRATE_SWAP_VIA=supervisor (the default), the swap byte rides
-	// the lease route, and a 409 lease_not_holder is a named refusal (the lane is
-	// not ours to move). A call that carries no token mints its own and releases it
-	// in the same call. No token and no mint request, or SWAP_VIA=ctl: the
-	// basalt-ctl.sh fleet gate below, unchanged.
+	// The supervisor lease is the single authority over the lane, and on the default
+	// plane it is the ONLY swap path: FADE_ORCHESTRATE_SWAP_VIA=supervisor never
+	// falls through to the ctl fleet gate. A load with no token and no mint request
+	// is REFUSED — a ctl load takes no lease, so it would swap a lane another
+	// caller's lease owns, which is the bypass that evicted a held deepseek lane
+	// (measured 2026-11-25: the peer minted 300 s and landed flash-next unconditionally).
+	// A load that carries no run token MINTS under its own identity and KEEPS the
+	// lease: the capability must outlive the load by the turn the caller is about to
+	// run (`LaneLoad.minted`), or the next peer takes the lane before the turn starts.
 	if (SWAP_VIA === "supervisor") {
 		const sid = opts.sessionId ?? "fade-orchestrator";
 		let token = opts.leaseToken;
 		let minted = false;
-		if (!token && opts.mintLease) {
+		if (!token) {
+			if (!opts.mintLease) {
+				return {
+					ok: false,
+					detail: `swap via supervisor refused: no lease token held for ${lane} and no mint requested — the supervisor plane never falls through to the ctl fleet gate (a ctl load takes no lease)${flipNote(flip)}`,
+					elapsed_s: (Date.now() - t0) / 1000,
+					guarded,
+					flip,
+				};
+			}
 			// The review/escalation-turn case: this call carries no run token, so it mints
 			// its own. The daemon floors apply unchanged - a dev build is refused the acquire
-			// here (dev_build_no_evict), which is the point of the floors.
+			// here (dev_build_no_evict), and a lane a peer pair owns is `lease_held` naming
+			// the holder, which is the refusal a review turn must surface, never swap past.
 			const lease = await acquireLease(lane, opts.mintLease.ttlSec, sid);
 			token = lease.ok ? lease.token : undefined;
 			minted = !!token;
 			if (!token) {
-				return { ok: false, detail: `lease mint refused http ${lease.status} rule ${lease.rule || "?"}: ${lease.reason || "no reason"}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+				return {
+					ok: false,
+					detail: `lease mint refused http ${lease.status} rule ${lease.rule || "?"}: ${lease.reason || "no reason"}${flipNote(flip)}`,
+					elapsed_s: (Date.now() - t0) / 1000,
+					guarded,
+					flip,
+				};
 			}
 		}
-		if (token) {
-			// A lease THIS call minted is THIS call to release, and the finally is the
-			// guarantee: a refused swap, a 503, a transport throw, a bounded timeout - the
-			// lease comes back in every case, so the lane returns to the resident pack owner
-			// and a peer is never locked out by a caller that died mid-swap. The run own
-			// token is NOT touched here: the run lifecycle owns it, and the run end (complete,
-			// failed, stopped, a preflight refusal) releases it.
-			try {
-				const v = await swapLeased(lane, token, sid);
-				const detail = v.ok
-					? `swap via supervisor: ${lane}`
-					: `swap supervisor refused http ${v.status} rule ${v.rule || "?"}: ${v.reason || "no reason"}`;
-				return { ok: v.ok, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
-			} finally {
-				if (minted) await releaseSupervisorLease(token, sid).catch(() => undefined);
-			}
+		const v = await swapLeased(lane, token, sid);
+		const detail = v.ok
+			? `swap via supervisor: ${lane}`
+			: `swap supervisor refused http ${v.status} rule ${v.rule || "?"}: ${v.reason || "no reason"}`;
+		if (!v.ok && minted) {
+			// Nothing will run under a lease whose swap was refused: return it, or the
+			// capability strands the lane for the whole TTL with no holder to release it.
+			await releaseSupervisorLease(token, sid).catch(() => undefined);
+			return { ok: false, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 		}
-		// The supervisor path with no token and no mint request: the fleet gate below is
-		// the path that works, unchanged.
+		return {
+			ok: v.ok,
+			detail: `${detail}${flipNote(flip)}`,
+			elapsed_s: (Date.now() - t0) / 1000,
+			guarded,
+			flip,
+			...(minted ? { leaseToken: token, leaseSession: sid, minted: true } : {}),
+		};
 	}
+	// The ctl plane is reached only by FADE_ORCHESTRATE_SWAP_VIA=ctl — the operator's
+	// explicit choice. It takes no supervisor lease, so it is never a fallback.
 	try {
 		// One swap, one lease: the ctl script gates, mints, grants, burns, loads, and the minted
 		// approval nonce rides the service lease the census audits.
@@ -455,6 +486,8 @@ export interface LaneMove {
 	n_ctx?: number;
 	waited_s: number;
 	flip: FlipState;
+	/** Present when the move minted its own lease and could not hand it back. */
+	lease_returned?: boolean;
 }
 
 /**
@@ -500,6 +533,19 @@ export async function moveLane(target: string, opts: { sessionId?: string; waitM
 
 	const r = await loadLane(target, { mintLease: { ttlSec: LANE_LEASE_TTL_SEC }, sessionId: sid });
 	if (!r.ok) return { ok: false, detail: r.detail, waited_s: (Date.now() - t0) / 1000, flip: r.flip };
+	// A HUMAN move returns the lane: this verb loads a pack for the operator and,
+	// unlike a turn that runs under the lease, has no review to protect with it. The
+	// lease is held across the readiness proof below, so a peer cannot swap the pack
+	// out mid-proof, and returned before the verb answers.
+	const handBack = async (): Promise<boolean> => {
+		if (!r.minted || !r.leaseToken) return false;
+		try {
+			const rel = await releaseSupervisorLease(r.leaseToken, r.leaseSession ?? sid);
+			return rel.ok;
+		} catch {
+			return false;
+		}
+	};
 
 	// Admitted is not loaded: the job tears the old pack down, spawns, and the daemon's own
 	// readiness window is 900 s. Poll the daemon, then prove the id from the router.
@@ -514,17 +560,20 @@ export async function moveLane(target: string, opts: { sessionId?: string; waitM
 	}
 	const idn = await servedIdentity();
 	const waited_s = (Date.now() - t0) / 1000;
+	const returned = await handBack();
 	if (state === "RESIDENT" && pack === target && idn?.id === target) {
 		return {
 			ok: true,
 			detail: `${target} resident in ${waited_s.toFixed(1)}s; router id ${idn.id}${idn.n_ctx ? ` n_ctx ${idn.n_ctx}` : ""} — requests naming any other id answer 404 until the roles move${flipNote(flip)}`,
 			resident: pack, served_id: idn.id, n_ctx: idn.n_ctx, waited_s, flip,
+			...(r.minted ? { lease_returned: returned } : {}),
 		};
 	}
 	return {
 		ok: false,
 		detail: `${target} not proven resident after ${waited_s.toFixed(1)}s: daemon state ${state} pack ${pack ?? "none"}, router id ${idn?.id ?? "nothing"} — hand the lane back with \`/lane flash-next\`${flipNote(flip)}`,
 		resident: pack, served_id: idn?.id, n_ctx: idn?.n_ctx, waited_s, flip,
+		...(r.minted ? { lease_returned: returned } : {}),
 	};
 }
 
