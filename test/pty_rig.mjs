@@ -211,7 +211,7 @@ try {
 	ok("the screen carries the task text", flatPanel.includes("the panel must show T1"), flatPanel.slice(0, 300));
 	ok("the screen carries the engine column", flatPanel.includes("ENGINE / ROUTER"), flatPanel.slice(0, 400));
 	ok("the screen carries the swap cost from the ledger", flatPanel.includes("deepseek → flash-next 14.2s"), flatPanel.slice(0, 500));
-	ok("the screen carries the key bar", flatPanel.includes("[esc] close") && flatPanel.includes("[s] skip selected"), flatPanel.slice(0, 200));
+	ok("the screen carries the key bar", flatPanel.includes("[esc/q/Alt+F] close") && flatPanel.includes("[s] skip selected"), flatPanel.slice(0, 200));
 	ok("the screen is bounded by the terminal width", pane().split("\n").every((l) => l.length <= 151), `longest=${Math.max(0, ...pane().split("\n").map((l) => l.length))}`);
 
 	// LIVE: the panel's own tick re-reads the screen, so its refreshed clock moves while it is open.
@@ -241,6 +241,22 @@ try {
 	tmux("send-keys", "-t", SESSION, "-H", "1b", "5b", "32", "37", "75");
 	const closedKitty = await until("Orchestrator:", 15_000);
 	ok("the Kitty CSI-u escape (ESC [ 2 7 u) closes the screen too", !closedKitty.includes("ENGINE / ROUTER"), strip(closedKitty).slice(0, 300));
+
+	// The toggle, on the real terminal: the overlay is keystroke-owned. `q` closes, the SAME
+	// chord that opened it closes an open panel, and — after ANY close — the chord re-opens it.
+	// That re-open is the bounded-first-read proof: the flag is cleared on the timeout return, so
+	// the keystroke is never stranded.
+	tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
+	await until("ENGINE / ROUTER", 20_000);
+	tmux("send-keys", "-t", SESSION, "q");
+	const closedQ = await until("Orchestrator:", 15_000);
+	ok("`q` closes the screen on the real terminal", !closedQ.includes("ENGINE / ROUTER"), strip(closedQ).slice(0, 300));
+	tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
+	const reopened = await until("ENGINE / ROUTER", 20_000);
+	ok("the chord RE-OPENS the panel after a close: the keystroke is never stranded", reopened.includes("ENGINE / ROUTER"), strip(reopened).slice(0, 200));
+	tmux("send-keys", "-t", SESSION, "-H", "1b", "66");
+	const chordClosed = await until("Orchestrator:", 15_000);
+	ok("the chord closes an OPEN panel: Alt+F is the toggle", !chordClosed.includes("ENGINE / ROUTER"), strip(chordClosed).slice(0, 300));
 
 	// The disclosure's proof surface is the scrollback (run 3): a notify at session_start has
 	// scrolled out of the 45 visible lines by the time the row paints, and a disclosure that scrolls

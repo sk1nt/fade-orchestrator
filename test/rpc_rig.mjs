@@ -263,7 +263,7 @@ ok(
 			t.includes("acceptance:") &&
 			t.includes("ENGINE / ROUTER") &&
 			t.includes("LANE SWAPS") &&
-			t.includes("[esc] close")
+			t.includes("[esc/q/Alt+F] close")
 		);
 	})(),
 	`panels=${panelFrames.length} text=${panelText().replace(/\s+/g, " ").slice(0, 300)}`,

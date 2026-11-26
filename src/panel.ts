@@ -9,7 +9,9 @@
  * `alt+shift+i`) stay the fallbacks, and a configured CONTROL chord (`ctrl+o`) stays the host's:
  * the raw listener's family is ESC + a byte, never a control code.
  *
- * Closing is a parse, not a byte: the accepted ESC encodings are listed on `isEscape` below.
+ * Closing is a parse, not a byte: `isClose` is the accepted set — ESC in every encoding the host
+ * delivers, `q`, Ctrl+C/D, and the panel's own OPEN chord: the overlay is keystroke-owned, so the
+ * chord toggles.
  *
  * Live by construction: the panel is given a `provider` and a bounded refresh tick, re-reads the
  * screen and calls `tui.requestRender()` — the numbers move while you watch, which is the whole
@@ -23,7 +25,7 @@
  * Every rendered line passes `redact` (ui.ts), so a screenshot of the screen is safe.
  */
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { OVERLAY_WIDGET_KEY, redact, redactOn, shortState } from "./ui.ts";
+import { OVERLAY_WIDGET_KEY, chordBytes, redact, redactOn, shortState } from "./ui.ts";
 import { compactNumber, formatElapsed, gateRows, swapRows, swapSummaryRow, turnRows, clockOf, type MetricRow, type ScreenData } from "./screendata.ts";
 
 /** The panel's refresh tick. The router's /metrics is a local request; 2 s keeps it honest and cheap. */
@@ -81,7 +83,7 @@ function pad(s: string, width: number): string {
 }
 
 /** The keys the panel owns, in the order the operator reads them. */
-export const KEY_BAR = ["[↑↓/j-k] select", "[PgUp/PgDn] scroll", "[s] skip selected", "[v] verify", "[r] reset", "[p] pause", "[c] code", "[h] halt", "[esc] close"];
+export const KEY_BAR = ["[↑↓/j-k] select", "[PgUp/PgDn] scroll", "[s] skip selected", "[v] verify", "[r] reset", "[p] pause", "[c] code", "[h] halt", "[esc/q/Alt+F] close"];
 
 /**
  * The key bar, packed per line. Each item stays whole: prose-wrapping cuts a key mid-token and a
@@ -312,21 +314,69 @@ export type PanelAction = { key: string; taskId?: string };
 const KITTY_CSI_U = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
 const MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
 
+/**
+ * The Escape KEY in every form the host's parser recognizes. Ctrl+Esc rides the close set — the
+ * panel is keystroke-owned, so it is unambiguously an exit — but ALT+ESC (`27;3u`) is a host
+ * edit chord, not the Escape key, and an ESC PAIRED with another key (`ESC q`, `ESC b`, the
+ * `27;<mod>;<key>u`/`27;<mod>;<key>~` spellings) is a chord, not an Escape, and stays the raw
+ * listener's and the host's. The Kitty RELEASE form (`...:3u`) never closes: one press is one
+ * close. Kitty's modifier field is the bitmask +1: bit 2 (value 1) is shift, bit 3 (value 2) alt.
+ */
 export function isEscape(data: string): boolean {
+	const modsOk = (mod1: number) => (mod1 - 1 & 2) === 0;
 	if (data === "\x1b") return true;
-	const kitty = KITTY_CSI_U.exec(data);
-	if (kitty) {
-		// groups: 1 codepoint, 2 shifted, 3 base-layout, 4 modifier (1 = none), 5 event (1 press, 2 repeat, 3 release)
-		return Number(kitty[1]) === 27 && (kitty[4] === undefined ? 1 : Number(kitty[4])) === 1 && (kitty[5] === undefined ? 1 : Number(kitty[5])) !== 3;
-	}
+	const kitty = kittyParts(data);
+	if (kitty) return kitty.code === 27 && kitty.event !== 3 && modsOk(kitty.mod);
 	const mok = MODIFY_OTHER_KEYS.exec(data);
-	if (mok) return Number(mok[2]) === 27 && Number(mok[1]) === 1;
+	if (mok) return Number(mok[2]) === 27 && modsOk(Number(mok[1]));
 	return false;
 }
 
-/** Keys the panel owns: the loop controls and the plain-byte closes; ESC is `isEscape`, not a byte. */
-const CLOSE_KEYS: Record<string, true> = { q: true, "\x03": true };
+/** Kitty CSI-u fields. `mod` is Kitty's 1-based modifier (1 = none, 3 = alt, 5 = ctrl). Event 3 is a release. */
+function kittyParts(data: string): { code: number; mod: number; event: number } | undefined {
+	const kitty = KITTY_CSI_U.exec(data);
+	if (!kitty) return undefined;
+	return {
+		code: Number(kitty[1]),
+		mod: kitty[4] === undefined ? 1 : Number(kitty[4]),
+		// The release event arrives TWO ways: `27;5:3u` (semicolon mod, colon event — group 5)
+		// and the bare `27:3u` (colon event right after the codepoint — group 2). A matcher
+		// that reads only the first lets a RELEASE close the panel: two closes for one press.
+		event: kitty[2] !== undefined && kitty[2] !== "" ? Number(kitty[2]) : kitty[5] === undefined ? 1 : Number(kitty[5]),
+	};
+}
+
+/**
+ * Every encoding that must leave the overlay. The host focuses the overlay and hands it Ctrl+C
+ * (`tui.js`: "including Ctrl+C"), so a close matcher that only sees the legacy `\x03` / `\x1b`
+ * bytes traps the session: Kitty/wezterm/ghostty send CSI-u, Alt+F arrives as `\x1bf` or
+ * `\x1b[102;3u`, and nothing the operator presses reaches SIGINT. `done()` is the only unmount.
+ */
+const OPEN_CHORD = chordBytes(process.env.FADE_ORCHESTRATE_KEY ?? "alt+f");
+const CLOSE_KEYS: Record<string, true> = { q: true, Q: true, "\x03": true, "\x04": true };
 const ACTION_KEYS: Record<string, true> = { s: true, v: true, r: true, p: true, c: true, h: true };
+
+export function isClose(data: string): boolean {
+	if (isEscape(data) || CLOSE_KEYS[data] === true) return true;
+	if (OPEN_CHORD && data === OPEN_CHORD) return true;
+	const kitty = kittyParts(data);
+	if (kitty && kitty.event !== 3) {
+		if (kitty.code === 99 && kitty.mod === 5) return true; // Ctrl+C
+		if (kitty.code === 100 && kitty.mod === 5) return true; // Ctrl+D
+		if (kitty.code === 113 && (kitty.mod === 1 || kitty.mod === 2)) return true; // q / Q
+		if (kitty.code === 102 && kitty.mod === 3) return true; // Alt+F, the open chord
+	}
+	const mok = MODIFY_OTHER_KEYS.exec(data);
+	if (mok) {
+		const mod = Number(mok[1]);
+		const key = Number(mok[2]);
+		if (key === 99 && mod === 5) return true;
+		if (key === 100 && mod === 5) return true;
+		if (key === 113 && (mod === 1 || mod === 2)) return true;
+		if (key === 102 && mod === 3) return true;
+	}
+	return false;
+}
 
 /** Minimal view of the host's TUI: the panel needs the height and the render kick, nothing else. */
 export interface PanelTui {
@@ -413,7 +463,10 @@ export class PanelComponent {
 		const all = arr(this.data.run.tasks);
 		const tasks = all.length;
 		const h = this.getHeight();
-		if (isEscape(data) || CLOSE_KEYS[data] === true) return this.done(JSON.stringify({ key: "close" } satisfies PanelAction));
+		if (isClose(data)) {
+			this.dispose();
+			return this.done(JSON.stringify({ key: "close" } satisfies PanelAction));
+		}
 		if (ACTION_KEYS[data] === true) {
 			const t = all[this.sel];
 			return this.done(JSON.stringify({ key: data, ...(t ? { taskId: t.id } : {}) } satisfies PanelAction));
@@ -448,7 +501,22 @@ export class PanelComponent {
  * without a terminal.
  */
 export async function openPanel(ctx: ExtensionContext, provider: () => Promise<ScreenData>, onAction?: (a: PanelAction) => void, headless = process.env.FADE_ORCHESTRATE_HEADLESS === "1"): Promise<void> {
-	const initial = await provider();
+	// The first read is the router plus the run's ledgers. A provider that never answers while
+	// `panelOpen` is set is the second overlay trap: `ctx.ui.custom` is never mounted, so no key —
+	// not even Ctrl+C — can leave. `openPanelGuarded`'s `finally` clears the flag on this return.
+	const firstFetchMs = Number(process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS ?? 3000);
+	const { promise: firstTimeout, resolve: firstTimedOut } = Promise.withResolvers<undefined>();
+	const firstTimer = setTimeout(() => firstTimedOut(undefined), firstFetchMs);
+	// NOT unref'd, on purpose: the bound is what ends the wait, and an unref'd fuse lets the event
+	// loop drain around a provider that never answers — the test rig dies with the promise
+	// pending and the operator's keystroke hangs with it. The timer is cleared the moment the
+	// race ends.
+	const initial = await Promise.race([provider(), firstTimeout]);
+	clearTimeout(firstTimer);
+	if (initial === undefined) {
+		ctx.ui.notify(`panel: the first read did not answer in ${firstFetchMs / 1000}s — the screen did not open; the keystroke retries`, "warning");
+		return;
+	}
 	if (ctx.hasUI !== true || headless) {
 		ctx.ui.setWidget(OVERLAY_WIDGET_KEY, panelLines(initial, WIDGET_WIDTH, { sel: 0 }).lines, { placement: "aboveEditor" });
 		return;

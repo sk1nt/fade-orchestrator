@@ -26,8 +26,9 @@ const account = () => {
 		return "";
 	}
 };
+import "./env.mjs";
 import test from "node:test";
-import { isEscape, openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
+import { isClose, isEscape, openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
 
 const task = (id, status, over = {}) => ({ id, objective: `${id} objective: ${"long ".repeat(12)}text`, files: [`${id}.ts`], acceptance: `${id} acceptance: run the rig and read the frame`, dependencies: id === "T2" ? ["T1"] : [], round: 1, status, ...over });
 
@@ -137,7 +138,7 @@ test("the screen fits 120 columns and carries every section in one view", () => 
 	assert.ok(s.includes("LANE FLIP"), "the flip guard rides");
 	assert.ok(s.includes("NOT MEASURED"), "the named gaps ride");
 	assert.ok(s.includes("[s] skip selected"), "the key bar rides");
-	assert.ok(s.includes("[esc] close"), "close is on screen");
+	assert.ok(s.includes("[esc/q/Alt+F] close"), "close is on screen");
 });
 
 test("the box is SQUARE, and the key bar never loses a key", () => {
@@ -148,7 +149,7 @@ test("the box is SQUARE, and the key bar never loses a key", () => {
 		const lines = panelLines(data(), w, { sel: 0 }).lines;
 		for (const l of lines) assert.equal(visibleWidth(l), w, `row is not flush at ${w}: ${JSON.stringify(l)}`);
 		const s = lines.join("\n");
-		for (const key of ["[↑↓/j-k] select", "[PgUp/PgDn] scroll", "[s] skip selected", "[v] verify", "[r] reset", "[p] pause", "[c] code", "[h] halt", "[esc] close"]) {
+		for (const key of ["[↑↓/j-k] select", "[PgUp/PgDn] scroll", "[s] skip selected", "[v] verify", "[r] reset", "[p] pause", "[c] code", "[h] halt", "[esc/q/Alt+F] close"]) {
 			assert.ok(s.includes(key), `the key bar lost ${key} at ${w} columns`);
 		}
 	}
@@ -158,7 +159,7 @@ test("the screen fits 60 columns: the metrics stack under the list, nothing is d
 	const r = panelLines(data(), 60, { sel: 0 });
 	for (const l of r.lines) assert.ok(visibleWidth(l) <= 60, `over-long at 60: ${visibleWidth(l)} ${JSON.stringify(l)}`);
 	const s = joined(r);
-	for (const need of ["TASKS 2/3 passed", "PHASES", "ENGINE / ROUTER", "engine 0.4.0 quant IQ1_M", "gate RED 1/2 failing", "LANE SWAPS", "[esc] close"]) {
+	for (const need of ["TASKS 2/3 passed", "PHASES", "ENGINE / ROUTER", "engine 0.4.0 quant IQ1_M", "gate RED 1/2 failing", "LANE SWAPS", "[esc/q/Alt+F] close"]) {
 		assert.ok(hasRow(s, need), `60-column screen lost ${need}`);
 	}
 });
@@ -310,7 +311,75 @@ test("the component: the loop controls answer with the key and the selected task
 	assert.deepEqual(last(), { key: "close" }, "esc closes without touching the loop");
 	c.handleInput("q");
 	assert.deepEqual(last(), { key: "close" });
+	c.handleInput("\x1bf");
+	assert.deepEqual(last(), { key: "close" }, "the OPEN chord closes an open panel: the overlay is keystroke-owned, so it can always be left by hand");
+	c.handleInput("\x1b[99;5u");
+	assert.deepEqual(last(), { key: "close" }, "the Kitty CSI-u Ctrl+C closes too: the host focuses the overlay and hands IT Ctrl+C");
 	c.dispose();
+});
+
+test("isClose: the close set is a parse, not a byte — every ESC encoding, Ctrl+C, and the chord close", () => {
+	// ESC in EVERY encoding the host's parser recognizes: the legacy byte, the Kitty
+	// keyboard-protocol CSI-u form (`\x1b[<code>;<mod>u` — kitty, wezterm, ghostty, foot, where
+	// the ESC key sends CSI-u and a legacy-only matcher traps the overlay), and xterm's
+	// modifyOtherKeys (`\x1b[27;<mod>;<code>~`). tmux's `screen` cannot enable the Kitty
+	// protocol, which is exactly why the pty rig passed for weeks while ESC was dead live.
+	assert.equal(isEscape("\x1b"), true);
+	assert.equal(isEscape("\x1b[27u"), true, "the Kitty CSI-u escape");
+	assert.equal(isEscape("\x1b[27;5u"), true, "Kitty CSI-u with a modifier");
+	assert.equal(isEscape("\x1b[27:3u"), false, "the Kitty RELEASE form is excluded: one press is one close");
+	assert.equal(isEscape("\x1b[27;1;27~"), true, "xterm modifyOtherKeys");
+	assert.equal(isClose("\x1b"), true);
+	assert.equal(isClose("\x1b[27u"), true);
+	assert.equal(isClose("\x03"), true, "Ctrl+C closes — the host focuses the overlay and hands IT Ctrl+C");
+	assert.equal(isClose("\x1b[99;5u"), true, "Ctrl+C as Kitty CSI-u");
+	assert.equal(isClose("\x1b[27;5;99~"), true, "Ctrl+C as modifyOtherKeys");
+	assert.equal(isClose("\x1bf"), true, "the open chord closes: the overlay is keystroke-owned (the toggle)");
+	assert.equal(isClose("\x1b[102;3u"), true, "Alt+F as Kitty CSI-u closes");
+	assert.equal(isClose("\x1b[102;3:3u"), false, "the chord RELEASE byte is not a second close");
+	assert.equal(isClose("q"), true, "`q` is in the close family the component honors");
+	assert.equal(isClose("x"), false, "an unbound byte is not close");
+	assert.equal(isClose("\x1b[Z"), false, "shift-TAB is not close");
+	assert.equal(isClose("\x1bq"), false, "ESC-q is a chord, not ESC");
+	assert.equal(isClose("\x1bb"), false, "alt-left is a host edit, not close");
+	assert.equal(isClose("\x0f"), false, "Ctrl+O (0x0f) is NOT close: raw 15 is not ESC");
+});
+
+test("the close set follows the CONFIGURED chord: move the key, move the toggle", async () => {
+	// OPEN_CHORD is read at import, like the raw listener's byte. The suite owns the env
+	// (`env.mjs` deleted `FADE_ORCHESTRATE_KEY`), so this is a fresh import with the chord moved.
+	process.env.FADE_ORCHESTRATE_KEY = "alt+shift+i";
+	try {
+		const m = await import(`../.test-build/panel.mjs?case=chord-${Date.now()}`);
+		assert.equal(m.isClose("\x1bI"), true, "the configured chord closes an open panel");
+		assert.equal(m.isClose("\x1bf"), false, "with the key moved, the default byte is not the panel's chord");
+	} finally {
+		delete process.env.FADE_ORCHESTRATE_KEY;
+	}
+});
+
+test("openPanel bounds the FIRST read: a provider that never answers leaves NO overlay and a clearable flag", async () => {
+	// The overlay flag is set BEFORE the first read; a provider that never resolves used to strand
+	// it with NO `ctx.ui.custom` mounted — no key, not even Ctrl+C, could leave, and the chord was
+	// dead for the session. The bound returns; the caller's `finally` clears the flag; the keystroke
+	// retries.
+	process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS = "20";
+	const notices = [];
+	const widgets = [];
+	const ctx = {
+		hasUI: false,
+		ui: {
+			notify: (m) => notices.push(m),
+			setWidget: (k) => widgets.push(k),
+		},
+	};
+	const t0 = Date.now();
+	await openPanel(ctx, () => new Promise(() => undefined), undefined, true);
+	const spent = Date.now() - t0;
+	assert.ok(notices.some((n) => n.includes("did not answer")), notices.join(" | "));
+	assert.equal(widgets.length, 0, "no widget is written from a read that never landed");
+	assert.ok(spent < 2000, `the bound, not the default: ${spent}ms`);
+	delete process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS;
 });
 
 test("the component: PgDn/PgUp/g/G scroll a long screen, and the selection stays visible", () => {

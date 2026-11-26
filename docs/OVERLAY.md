@@ -146,8 +146,9 @@ log opened with `no server running`. A per-rig session name does not isolate; th
 
 Run 1 runs on the host's own config and asserts the `ESC f` bytes reach the extension (the host prints
 no `Tool output expansion:` for them), that the panel opens, that it is bounded by the terminal width,
-that its clock moves on the refresh tick while open, that **both** escape encodings close it, and that
-`halt` clears the row.
+that its clock moves on the refresh tick while open, that ESC closes in **both** encodings, that
+`q` closes, that the chord closes an OPEN panel and re-opens it after any close (the toggle), and
+that `halt` clears the row.
 
 The wiring is:
 
@@ -170,12 +171,25 @@ recognizes three forms: the legacy `\x1b`, the Kitty keyboard-protocol CSI-u
 sequence (`\x1b[27u`, `\x1b[27;<mod>u`) and xterm's `modifyOtherKeys` (`\x1b[27;<mod>;27~`). The
 panel compared only the legacy byte, so on a terminal that enables the Kitty protocol — kitty,
 wezterm, ghostty, foot — ESC did nothing while `q` closed.
-`isEscape()` in `src/panel.ts` now matches all three, ignores the Kitty RELEASE form (`...:3u`) so
-one press is one close, and refuses ESC carrying a modifier (the raw listener owns ESC + letter
-chords). `test/panel.test.mjs` drives each encoding through `handleInput`; the pty rig closes the
-panel with the legacy Escape **and** the injected CSI-u sequence (`send-keys -H 1b 5b 32 37 75`),
-because tmux's `screen` terminal has no Kitty protocol and cannot produce it unaided — which is
-exactly why the rig passed with ESC dead.
+`isEscape()` in `src/panel.ts` matches all three and ignores the Kitty RELEASE form (`...:3u`) so
+one press is one close. `isClose()` is the full set the overlay honors: `isEscape`, `q`/`Q`,
+Ctrl+C and Ctrl+D **in every encoding** (the host focuses the overlay and hands IT Ctrl+C — a
+matcher that only sees the legacy `\x03` traps the session with nothing left to press), and the
+panel's own OPEN chord, in its raw and CSI-u spellings: the overlay is keystroke-owned, so the
+chord that opened it closes it, and after any close the same chord re-opens it. ESC + any OTHER
+letter stays the raw listener's and the host's — never close. `test/panel.test.mjs` drives the
+whole encoding table through `isClose`/`handleInput`, including the moved chord
+(`FADE_ORCHESTRATE_KEY=alt+shift+i` closes on `ESC I`, not on `ESC f`); the pty rig closes the
+panel with the legacy Escape, the injected CSI-u sequence (`send-keys -H 1b 5b 32 37 75`), `q`,
+and the chord, and re-opens it after each — tmux's `screen` terminal has no Kitty protocol and
+cannot produce it unaided, which is exactly why the rig passed for weeks with ESC dead.
+
+The keystroke can also never be **stranded**: the overlay flag is set before the panel's FIRST
+read (the router plus the run's ledgers), and a provider that never answers used to leave the
+flag set with no component mounted — no key closed a panel that was never drawn, and the chord
+was dead for the session. `FADE_ORCHESTRATE_PANEL_FIRST_MS` (default 3 s) bounds that first read:
+the open returns with a named warning, the guard's `finally` clears the flag, and the keystroke
+retries (`test/panel.test.mjs`).
 
 A delegated session (a subagent's own session file) binds **no extra** listener: one listener per
 process, proved by `test/gate_rig.mjs` and `test/rpc_rig.mjs`. A delegated session is not inert: it
@@ -210,7 +224,7 @@ headless rigs assert the delivered text.
 │ LAST VERIFIER CRITIQUE / RECENT REJECTIONS / LANE FLIP / NOT MEASURED        │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ [↑↓/j-k] select  [PgUp/PgDn] scroll  [s] skip selected  [v] verify         │
-│ [r] reset  [p] pause  [c] code  [h] halt  [esc] close                      │
+│ [r] reset  [p] pause  [c] code  [h] halt  [esc/q/Alt+F] close               │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -281,10 +295,10 @@ absent-reading rule covers the wire itself.
 | `p` | pause / resume |
 | `c` | code (load the code lane) |
 | `h` | halt the run |
-| `esc` `q` `ctrl+c` | close, touching no loop control — `esc` in every encoding the host delivers (see above) |
+| `esc` `q` `ctrl+c` `ctrl+d` `Alt+F` | close, touching no loop control — `esc` in every encoding the host delivers (see above), Ctrl+C/D in every encoding too, and the OPEN chord: the panel is keystroke-owned, so the chord toggles, and after any close the same chord re-opens it |
 
-The bar **wraps**; it never clips. It is 120 visible columns, so on the 110-column default surface a
-single-line bar lost its tail: `[esc] close` was not on screen.
+The bar **wraps**; it never clips. It is 129 visible columns, so on the 110-column default surface
+a single-line bar loses its tail — that is how `[esc] close` once vanished from the screen.
 `wrapText()` in `src/panel.ts` folds it onto as many rows as the width needs, at every width the
 panel supports.
 
