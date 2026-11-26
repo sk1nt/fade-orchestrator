@@ -2289,6 +2289,28 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		void refreshMetrics().then(() => paint(ctx));
 	});
 
+	// AUTO-SYNC: every screen follows the RESIDENT pack. The daemon's residency — not
+	// this screen's model line — is the authority on what :18014 answers. A human-cli
+	// swap (the operator outranks every lease) or a peer's leased swap changes the
+	// served pack under every open session, and a turn that names the old pack is a
+	// `404 The model '<old-pack>' does not exist`. One bounded residency read per turn:
+	// a match costs nothing; a mismatch lands the resident pack in-memory before the
+	// turn's first request. A screen that OWNS the lease lands its own model at the
+	// boundary, so the sync reads the same pack — it never hijacks a lane this process
+	// did not move, and it never touches a screen whose model is not a basalt pack.
+	// Delegated sessions never touch it: their parent's run owns the lane.
+	pi.on("before_agent_start", async (_event, ctx) => {
+		if (isDelegatedSession()) return;
+		const res = await getResidency(leaseSession || verifyLeaseSession || SELF_SESSION);
+		if (!res || res.state !== "RESIDENT" || !res.pack) return;
+		if (ctx.model?.provider !== PROVIDER || ctx.model.id === res.pack) return;
+		const model = ctx.modelRegistry.find(PROVIDER, res.pack);
+		if (!model) return;
+		const switched = (await pi.setModel(model)) as unknown as boolean | { switched?: boolean } | undefined;
+		if (switched === true || (typeof switched === "object" && switched !== null && switched.switched === true))
+			ctx.ui.notify(`lane sync: ${PROVIDER}/${res.pack} is resident — this screen follows`, "info");
+	});
+
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!run) {
 			// THE NON-RUN VERIFICATION MOVE. The verdict act recorded during the turn is paid
