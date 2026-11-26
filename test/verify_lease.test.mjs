@@ -66,6 +66,9 @@ const daemon = async () => {
 			if (req.url === R_RESIDENCY) return send(200, { ...IDLE, active_pack: state.resident });
 			if (req.url === R_LEASE && p.action === "acquire") return send(200, { decision: "GRANT", accepted: true, rule: "lease_granted", granted_ttl_s: 1800, token: TOKEN, token_hint: "a1b2c3", lease: { holder_caller: "fade-orchestrator", remaining_sec: 1800, token_hint: "a1b2c3" } });
 			if (req.url === R_LEASE && p.action === "release") return send(200, { decision: "RELEASE", accepted: true, rule: "lease_released" });
+			// A renew is granted, not refused: the assertion below must measure a RENEWED lease, not a
+			// client beating against a 503.
+			if (req.url === R_LEASE && p.action === "renew") return send(200, { decision: "RENEW", accepted: true, rule: "lease_renewed", granted_ttl_s: 3, lease: { holder_caller: "fade-orchestrator", remaining_sec: 3, token_hint: "a1b2c3" } });
 			if (req.url === R_SWAP) {
 				state.resident = p.pack;
 				return send(202, { decision: "ADMIT", accepted: true, rule: "swap_admitted", lane: { active_pack: p.pack } });
@@ -116,6 +119,10 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		FADE_ORCHESTRATE_THINK_LANE: THINK,
 		FADE_ORCHESTRATE_CODE_LANE: CODE,
 		FADE_ORCHESTRATE_FLIP_WINDOW_MS: "0",
+		// The lease's clock is the metrics tick. Drive it fast and mint short so `shouldRenew`
+		// (remaining <= max(60, ttl/3)) is already true on the tick that follows the mint.
+		FADE_ORCHESTRATE_METRICS_INTERVAL_MS: "250",
+		FADE_ORCHESTRATE_LEASE_MINT_TTL_S: "3",
 		// The stub never reports `loading`, so the settle window is never entered; declared small so a
 		// harness window can never be mistaken for the plugin's 13-25 s pack load.
 		FADE_ORCHESTRATE_SETTLE_MAX_MS: "2000",
@@ -160,6 +167,14 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		assert.equal(leases().filter((h) => h.includes("release")).length, 0,
 			"the load releases NOTHING: the lane stays claimed while the session's turns run on the thinking pack (the defect released it here and a peer took the lane mid-verdict)");
 
+
+		// 2b. the HELD lease is RENEWED on the tick. This session owns no run, and the tick was started
+		// only at run start/adoption, so the mint had no clock at all: a review turn past the mint TTL
+		// let the lease lapse MID-VERDICT and a peer minted the lane back — the verdict then ran on the
+		// pack it had displaced. Minting must start the clock that keeps the lane.
+		await settled(sup.hits, (h) => h.some((x) => x.includes(R_LEASE) && x.includes("action=renew")), notes);
+		assert.ok(supHits().some((h) => h.includes(R_LEASE) && h.includes("action=renew") && h.includes(TOKEN)),
+			"the minted capability is renewed while the session holds the lane");
 		// 3. the next boundary hands the code lane back: the SAME capability rides, then returns once.
 		await hooks.agent_end({}, ctx({ provider: "basalt", id: THINK }));
 		await settled(sup.hits, (h) => h.filter((x) => x.includes(R_SWAP)).length >= 2, notes);
@@ -179,7 +194,7 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		assert.equal(sup.hits.filter((h) => h.includes(R_LEASE) && h.includes("release")).length, 1,
 			"the shutdown does not release what the hand-back already returned");
 	} finally {
-		for (const k of ["FADE_SUPERVISOR_SOCK", "FADE_ORCHESTRATE_ROUTER", "FADE_ORCHESTRATE_SWAP_VIA", "FADE_ORCHESTRATE_SWAP_CMD", "FADE_ORCHESTRATE_FLIP_WINDOW_MS"]) delete process.env[k];
+		for (const k of ["FADE_SUPERVISOR_SOCK", "FADE_ORCHESTRATE_ROUTER", "FADE_ORCHESTRATE_SWAP_VIA", "FADE_ORCHESTRATE_SWAP_CMD", "FADE_ORCHESTRATE_FLIP_WINDOW_MS", "FADE_ORCHESTRATE_METRICS_INTERVAL_MS", "FADE_ORCHESTRATE_LEASE_MINT_TTL_S"]) delete process.env[k];
 		await sup.close();
 		rt.close();
 		rmSync(sup.dir, { recursive: true, force: true });

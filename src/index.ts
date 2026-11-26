@@ -188,7 +188,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  load left the lane free before the review ran (measured 2026-11-25). */
 	let verifyLeaseToken: string | undefined;
 	let verifyLeaseSession = "";
-	let verifyLeaseLane = "";
 	let verifyLeaseRemainingS = 0;
 	/** The single-turn mint: a load that carries no run lease (the overlay keys, the
 	 *  hand-back, a review/escalation turn) acquires for the length of ONE pack load plus
@@ -271,6 +270,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			void refreshMetrics();
 			void watchFlips();
 		}, METRICS_INTERVAL_MS);
+		// The tick is bookkeeping, not a reason to keep the process alive: the host keeps
+		// the TUI open, and a test runner must not sit on an open handle to its cap.
+		metricsTimer.unref?.();
 		void refreshMetrics();
 		void watchFlips();
 	};
@@ -437,9 +439,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		releaseInstanceLock(lockDir);
 		lockDir = undefined;
 	};
-	/** Return the supervisor lane lease ("return the coder"). Best-effort: a dead
-	 *  daemon must never take a run's end down. Clears the in-process token either
-	 *  way, so a resumed run never re-releases a stale one. */
 	/** Return the verify capability: the hand-back landed, or the session is closing. A
 	 *  failure is logged, never swallowed — an unreleased lease pins the lane for its TTL. */
 	const returnVerifyLease = async (): Promise<void> => {
@@ -447,9 +446,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const sid = verifyLeaseSession || SELF_SESSION;
 		verifyLeaseToken = undefined;
 		verifyLeaseRemainingS = 0;
-		verifyLeaseLane = "";
 		verifyLeaseSession = "";
 		if (!tok) return;
+		// The mint started the tick (see `requestLane`); the capability is gone, so the clock goes
+		// with it -- a plain session that handed the lane back must not keep polling the router.
+		if (!run && !leaseToken) stopMetricsTimer();
 		try {
 			const v = await releaseLease(tok, sid);
 			if (!v.ok) process.stderr.write(`orchestrate: verify lease release refused (${v.rule || v.status}); it expires on its TTL
@@ -459,6 +460,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 `);
 		}
 	};
+	/** Return the supervisor lane lease ("return the coder"). Best-effort: a dead
+	 *  daemon must never take a run's end down. Clears the in-process token either
+	 *  way, so a resumed run never re-releases a stale one. */
 	const releaseLaneLease = (): void => {
 		const tok = leaseToken;
 		const sid = leaseSession;
@@ -953,10 +957,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (loaded.minted && loaded.leaseToken) {
 			verifyLeaseToken = loaded.leaseToken;
 			verifyLeaseSession = loaded.leaseSession ?? SELF_SESSION;
-			verifyLeaseLane = lane;
 			verifyLeaseRemainingS = LEASE_MINT_TTL_S;
-		} else if (loaded.ok && verifyLeaseToken) {
-			verifyLeaseLane = lane;
+			// The metrics tick IS this lease's clock: `refreshMetrics` -> `renewLaneLease` is the only
+			// renewer, and the host starts that tick at run start and run adoption only. A plain
+			// verification session -- the no-run path that lands the thinking pack for a review turn --
+			// therefore renewed its mint exactly once, at the next `agent_start`: a review turn longer
+			// than the mint TTL let the lease lapse MID-VERDICT and a peer minted the lane back, the same
+			// loss class as the mid-turn release this file pins. Minting is the moment this session holds
+			// authority, so minting is where its clock starts.
+			if (!run) startMetricsTimer();
 		}
 		if (gen !== switchGen) {
 			// The pill, the row and the briefing belong to the switch that superseded this one; the
