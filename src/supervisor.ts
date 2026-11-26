@@ -114,6 +114,46 @@ export const swapBody = (pack: string, token: string, phase = "phase_boundary"):
 	lease_token: token,
 });
 
+// ---- pack key <-> OMP model id.
+//
+// The daemon keys its packs by the model id the pack serves on :18014 (measured
+// from GET /v1/models; the rule is stated in /etc/fade/supervisor.yaml), so
+// flash-next, deepseek and hy4-flash are BOTH the pack key and the OMP model id.
+// The legacy short names (ds41, hy4, ablit) survive as aliases at every edge,
+// and this is the single place the two spellings translate: a swap, a lease, a
+// residency read speaks pack keys; pi.setModel and modelRegistry.find speak
+// model ids. Feeding one spelling to the other surface is the 404
+// `The model '<id>' does not exist` and the status bar that never moves.
+const PACK_TO_MODEL: Record<string, string> = {
+	"ds41": "deepseek",
+	"hy4": "hy4-flash",
+	"ablit": "flash-next-ablit",
+	"flash-next": "flash-next",
+	"deepseek": "deepseek",
+	"hy4-flash": "hy4-flash",
+	"flash-next-ablit": "flash-next-ablit",
+};
+const MODEL_TO_PACK: Record<string, string> = {
+	"deepseek": "deepseek",
+	"ds41": "deepseek",
+	"hy4-flash": "hy4-flash",
+	"hy4": "hy4-flash",
+	"flash-next-ablit": "flash-next-ablit",
+	"ablit": "flash-next-ablit",
+	"flash-next": "flash-next",
+};
+
+/** The OMP model id a daemon pack key serves. Unknown keys pass through: an
+ *  unregistered pack is a registry question, never a rename to guess at. */
+export function packToModelId(pack: string): string {
+	return PACK_TO_MODEL[pack] ?? pack;
+}
+
+/** The daemon pack key an OMP model id names. Unknown ids pass through. */
+export function modelIdToPack(modelId: string): string {
+	return MODEL_TO_PACK[modelId] ?? modelId;
+}
+
 /** Mask a lease token for any surface: a 4-char head and the length, never the
  *  secret. The token is a write capability — rendering it lets a reader mint a
  *  swap — so it is masked everywhere (status, panel, notify). The daemon hands

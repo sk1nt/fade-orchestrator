@@ -20,6 +20,8 @@ import { join } from "node:path";
 import {
 	acquireBody,
 	acquireLease,
+	packToModelId,
+	modelIdToPack,
 	fadeHeaders,
 	leaseLine,
 	leaseVerdict,
@@ -256,4 +258,23 @@ test("shouldRenew renews on the daemon's countdown, not on every tick", () => {
 	assert.equal(shouldRenew(undefined, 1800), true);
 	assert.equal(shouldRenew(0, 1800), true);
 	assert.equal(shouldRenew(Number.NaN, 1800), true);
+});
+
+// ---- pack key <-> OMP model id: one table, both directions. The daemon keys
+// packs by the served model id, so the live lanes are identity; the legacy short
+// names resolve, and unknown names pass through (an unregistered pack is the
+// daemon's named refusal, never a rename to guess at).
+test("packToModelId/modelIdToPack map the aliases and pass the unknowns", () => {
+	assert.equal(packToModelId("ds41"), "deepseek");
+	assert.equal(modelIdToPack("ds41"), "deepseek");
+	assert.equal(packToModelId("hy4"), "hy4-flash");
+	assert.equal(modelIdToPack("hy4"), "hy4-flash");
+	assert.equal(packToModelId("ablit"), "flash-next-ablit");
+	assert.equal(modelIdToPack("ablit"), "flash-next-ablit");
+	for (const id of ["flash-next", "deepseek", "hy4-flash", "flash-next-ablit"]) {
+		assert.equal(packToModelId(id), id);
+		assert.equal(modelIdToPack(id), id);
+	}
+	assert.equal(packToModelId("nope"), "nope");
+	assert.equal(modelIdToPack("nope"), "nope");
 });

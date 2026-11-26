@@ -24,7 +24,7 @@ import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
-import { acquireLease, releaseLease, renewLease, leaseLine, getResidency, shouldRenew, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
+import { acquireLease, releaseLease, renewLease, leaseLine, getResidency, shouldRenew, packToModelId, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 import {
 	DESK_DEADLINE_MS,
@@ -2303,12 +2303,17 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (isDelegatedSession()) return;
 		const res = await getResidency(leaseSession || verifyLeaseSession || SELF_SESSION);
 		if (!res || res.state !== "RESIDENT" || !res.pack) return;
-		if (ctx.model?.provider !== PROVIDER || ctx.model.id === res.pack) return;
-		const model = ctx.modelRegistry.find(PROVIDER, res.pack);
+		// The daemon speaks PACK KEYS; the registry and the status bar speak MODEL
+		// IDS. Map before comparing: a resident `deepseek` pack and the model id
+		// `deepseek` are the same lane (identity today), and any alias spelling
+		// resolves through the one helper so no call site renames by hand.
+		const target = packToModelId(res.pack);
+		if (ctx.model?.provider !== PROVIDER || ctx.model.id === target) return;
+		const model = ctx.modelRegistry.find(PROVIDER, target);
 		if (!model) return;
 		const switched = (await pi.setModel(model)) as unknown as boolean | { switched?: boolean } | undefined;
 		if (switched === true || (typeof switched === "object" && switched !== null && switched.switched === true))
-			ctx.ui.notify(`lane sync: ${PROVIDER}/${res.pack} is resident — this screen follows`, "info");
+			ctx.ui.notify(`lane sync: ${PROVIDER}/${target} (${res.pack}) is resident — this screen follows`, "info");
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
