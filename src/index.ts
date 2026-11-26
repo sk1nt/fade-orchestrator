@@ -23,8 +23,8 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan } from "./router.ts";
-import { acquireLease, releaseLease, renewLease, leaseLine, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
+import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
+import { acquireLease, releaseLease, renewLease, leaseLine, getResidency, shouldRenew, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 import {
 	DESK_DEADLINE_MS,
@@ -193,6 +193,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  session on a refusal, and an empty string there is a lease nobody can trace. */
 	const SELF_SESSION = `omp-pid-${process.pid}`;
 	const LEASE_TTL_S = Number(process.env.FADE_ORCHESTRATE_LEASE_TTL_S ?? 1800);
+	/** The lease's remaining seconds AS THE DAEMON PUBLISHED THEM (the grant/renew
+	 *  answer's `remaining_sec`), decremented by the tick between renewals. It gates
+	 *  the renew so a 30 s poll over a 1800 s TTL is not 60 round trips and 60
+	 *  `decision=RENEWED` journal lines per hour. The daemon's own expiry stays the
+	 *  authority: this number can only make the client renew SOONER than the lease
+	 *  dies, never later. */
+	let leaseRemainingS = 0;
 	let pending: { lane: string; phase: string } | undefined;
 	/** The desk batch this session CLAIMED and is answering. The claim is the one-use ticket: it is
 	 *  what makes `fade_verdicts` legal for those ids, and what stops the same batch being answered
@@ -430,6 +437,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const tok = leaseToken;
 		const sid = leaseSession;
 		leaseToken = undefined;
+		leaseRemainingS = 0;
 		// The session the lease was attributed to goes with the token: a mint by a turn that
 		// belongs to no run must present its own identity, not a finished run's id.
 		leaseSession = "";
@@ -457,6 +465,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			}
 			if (v.ok && v.token) {
 				leaseToken = v.token;
+				leaseRemainingS = v.remaining_s ?? v.granted_ttl_s ?? LEASE_TTL_S;
 				if (run) {
 					run.lease_state = "held";
 					run.lease_token = v.token;
@@ -476,9 +485,17 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  swapping the lane it no longer owns. */
 	const renewLaneLease = async (): Promise<void> => {
 		if (!leaseToken) return;
+		if (!shouldRenew(leaseRemainingS, LEASE_TTL_S)) {
+			// The lease is running down, not running out: age the published countdown by
+			// the tick and pay nothing. The metrics tick is the clock here, and it is the
+			// same tick that reads the router, so the gate adds no timer.
+			leaseRemainingS = Math.max(0, leaseRemainingS - METRICS_INTERVAL_MS / 1000);
+			return;
+		}
 		try {
 			const v = await renewLease(leaseToken, LEASE_TTL_S, leaseSession);
 			if (run) run.lease_hint = v.token_hint ?? run.lease_hint;
+			leaseRemainingS = v.remaining_s ?? v.granted_ttl_s ?? LEASE_TTL_S;
 			if (v.rule === RULE_LEASE_STALE_TOKEN || v.rule === RULE_LEASE_NOT_HOLDER) leaseToken = undefined;
 		} catch {
 			// A daemon that drops mid-run: keep the token. The swap path names the
@@ -1626,6 +1643,33 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		},
 	});
 
+	// The human lane verb. `/orchestrate` moves the lane at phase boundaries; this is the same
+	// machinery for one named pack, for the moments between runs: the churn ledger first (zero
+	// bytes at the breaker), the residency short-circuit, a lease minted and released in the same
+	// call, and the identity proof from the router's own `/v1/models` — `RESIDENT` alone is only a
+	// claim that some model answered the readiness probe.
+	pi.registerCommand("lane", {
+		description: `Move the :18014 pack: /lane (who is resident) · /lane <model-id> (swap, wait to RESIDENT, prove the served id)`,
+		handler: async (args, ctx) => {
+			const target = args.trim().split(/\s+/)[0] ?? "";
+			if (!target) {
+				const sup = await getResidency("fade-orchestrator");
+				const st = await listLanes();
+				const idn = await servedIdentity();
+				const line = sup
+					? `daemon lane ${sup.state} pack=${sup.pack || "none"} pid=${sup.pid} requests=${sup.active_requests} · router id ${idn?.id ?? "none"}${idn?.n_ctx ? ` n_ctx ${idn.n_ctx}` : ""}`
+					: `no daemon answer · router ${st.health}`;
+				ctx.ui.setWidget("lanes", [`router: ${ROUTER}`, ...st.models.map((m) => `${m.id} ${m.status}`)]);
+				ctx.ui.notify(`lane: ${line}`, "info");
+				return;
+			}
+			ctx.ui.notify(`lane: moving :18014 to ${target} (teardown, spawn, readiness) …`, "info");
+			const mv = await moveLane(target, { sessionId: `omp-pid-${process.pid}` });
+			ctx.ui.setWidget("lanes", [`lane ${target}: ${mv.ok ? "resident, id proven" : "NOT proven resident"}`, mv.detail]);
+			ctx.ui.notify(`lane ${target}: ${mv.detail}`, mv.ok ? "info" : "warning");
+		},
+	});
+
 	// The panel's chord is registered as a shortcut, so the HOST parses the chord string: that
 	// is the robust delivery for an `alt+…` chord, whose two bytes (ESC + letter) a pty can
 	// split across reads. The host is the authority on who owns a chord — `getShortcuts()` logs
@@ -2164,6 +2208,21 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!run) {
+			// THE NON-RUN VERIFICATION MOVE. The verdict act recorded during the turn is paid
+			// here: one `setModel` + load through `requestLane`, so the pin and the lane move
+			// together. The hand-back rule below is deliberately skipped for THIS boundary — the
+			// task's own turns must run on the thinking pack — and the next boundary, where the
+			// session is on the thinking lane, hands the code lane back. A `dev` build claim is
+			// refused the lease by the daemon (dev_build_no_evict), so a session that never claimed
+			// authority pays nothing here beyond a residency read.
+			if (!isDelegatedSession() && pendingVerifyLane) {
+				const want = pendingVerifyLane;
+				pendingVerifyLane = undefined;
+				traceTrigger("paid", want, undefined, ctx);
+				ctx.ui.notify(`lane on verification: ${want} — the verdict act lands at the turn boundary`, "info");
+				requestLane(want, ctx, want !== THINK_LANE);
+				return;
+			}
 			// THE NON-RUN HAND-BACK. A session whose turn ran on the thinking lane hands the lane
 			// back at the boundary: one `setModel` + load, no briefing, no run state. The forward
 			// direction is the host resolving the thinking-lane role; the reverse is here. Delegated
@@ -2290,7 +2349,47 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// write past it. `task` is NOT refused — it writes nothing itself, its spawned sessions are
 	// inert by `isDelegatedSession`, and refusing it would only block the coding session that
 	// owns the run.
+	// One move per target per session: the trigger is idempotent, and `moveLane` re-reads
+	// residency every call, so a lane that is already there costs one read and zero bytes.
+	// The verdict act seen in this turn, paid at the next boundary; cleared when paid.
+	let pendingVerifyLane: string | undefined;
+
+	// The trigger's two seams, written to the plugin's existing state root. Print mode shows no
+	// `ctx.ui.notify`, so the file is the only honest way to tell "the act was recorded" from
+	// "the boundary paid it" — and to separate a code defect from a harness limitation.
+	const traceTrigger = (phase: string, lane: string | undefined, tool: string | undefined, context: ExtensionContext): void => {
+		const dir = join(process.env.HOME ?? "/tmp", "var", "fade-orchestrate");
+		void writeJsonAsync(join(dir, "lane-trigger.json"), {
+			at: new Date().toISOString(),
+			phase,
+			lane,
+			tool,
+			pid: process.pid,
+			model: context.model ? `${context.model.provider}/${context.model.id}` : undefined,
+		}).catch(() => undefined);
+	};
+
 	pi.on("tool_call", async (event: { toolName?: string; input?: Record<string, unknown> }, ctx: ExtensionContext) => {
+		// The move goes through `requestLane`: the plugin's ONE proven sequence — idle gate, churn
+		// breaker, `pi.setModel`, `setThinkingLevel`, the lease-minting load. Calling the supervisor
+		// module's `moveLane` directly moves the LANE and leaves the session's model pin on the pack
+		// that is gone: measured live at 15:56, the swap landed on deepseek and the very next turn of
+		// the session that asked for it died with `404 The model 'flash-next' does not exist`. The pin
+		// and the lane move together, or the feature is an outage. `lastVerifyLane` keeps it one move
+		// per target per session, and the daemon's floors stay the authority: a `dev` build claim is
+		// refused the lease (dev_build_no_evict), so a session that never claimed authority cannot
+		// move the lane from here either.
+		if (!isDelegatedSession()) {
+			// Record the verdict act; the lane is paid at the boundary below. Moving mid-turn is
+			// what broke at 15:56: the swap landed on deepseek while the session was still
+			// streaming, and its next request named the pack that was gone —
+			// `404 The model 'flash-next' does not exist`. A model switch and a load belong at a
+			// turn boundary, which is where `agent_end` already does the hand-back.
+			const trig = verifyTrigger(event.toolName, event.input);
+			const trigLane = "lane" in trig ? trig.lane : undefined;
+			if (trigLane) pendingVerifyLane = trigLane;
+			traceTrigger("recorded", trigLane, event.toolName, ctx);
+		}
 		// The delegation census, recorded on the desk BEFORE the worker starts: how many workers this
 		// `task` call carries, and how many of them carry VERIFICATION work. That count is what the
 		// open batch waits for (`expected`), and it is the whole batching rule: a worker that

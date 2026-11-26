@@ -414,6 +414,26 @@ export async function acquireLease(
 	return leaseVerdict(r);
 }
 
+/** The renew gate: renew only when the lease is running down, never on every
+ *  poll. The metrics tick is 30 s and the TTL is 1800 s, so an ungated renew is
+ *  ~60 round trips and ~60 `msg=decision … decision=RENEWED` journal lines per
+ *  held hour — measured 2026-11-25, where the lease records in the daemon's
+ *  journal were renewal noise, and the operator's one question ("who owns the
+ *  lane, and since when") was buried under the client's own heartbeat.
+ *
+ *  The gate is the daemon's remaining time, not a client clock: `remainingS` is
+ *  the `remaining_sec` the last grant/renew published, decremented by the tick
+ *  between calls, so drift in the client never extends a lease past the daemon's
+ *  deadline — the daemon's expiry stays the authority. Below a third of the TTL
+ *  (never under 60 s) the answer is renew. An unknown remaining (0, absent, a
+ *  daemon that does not publish it) renews: a client that cannot see the
+ *  countdown must not lose the lane. */
+export function shouldRenew(remainingS: number | undefined, ttlSec: number): boolean {
+	const floor = Math.max(60, Math.floor(ttlSec / 3));
+	const rem = typeof remainingS === "number" && Number.isFinite(remainingS) ? remainingS : 0;
+	return rem <= floor;
+}
+
 export async function renewLease(
 	token: string,
 	ttlSec: number,

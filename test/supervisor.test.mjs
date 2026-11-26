@@ -28,6 +28,7 @@ import {
 	releaseLease,
 	renewBody,
 	resolveSock,
+	shouldRenew,
 	statusBody,
 	swapBody,
 	swapLeased,
@@ -227,4 +228,32 @@ test("a dead socket is a transport error, never a fabricated success", async () 
 	const missing = join(tmpdir(), `fs-sup-dead-${process.pid}-${Math.random().toString(36).slice(2, 7)}.sock`);
 	assert.ok(!existsSync(missing));
 	await assert.rejects(() => acquireLease("deepseek", 1800, "run-3", missing), /./);
+});
+
+// ---- the renew gate.
+//
+// The metrics tick is 30 s and the lease TTL is 1800 s. An ungated renew is a
+// round trip and a daemon `msg=decision … decision=RENEWED` journal line every
+// 30 s — ~60 per held hour — which is measured 2026-11-25 as the lease records
+// drowning the one question the journal answers: who owns the lane, and since
+// when. So the client renews below a third of the TTL, and the number it
+// compares is the DAEMON's published `remaining_sec`, never a client clock.
+test("shouldRenew renews on the daemon's countdown, not on every tick", () => {
+	// A fresh 1800 s grant and its run-down: nothing paid until a third remains.
+	assert.equal(shouldRenew(1800, 1800), false);
+	assert.equal(shouldRenew(1200, 1800), false);
+	assert.equal(shouldRenew(601, 1800), false);
+	assert.equal(shouldRenew(600, 1800), true);
+	assert.equal(shouldRenew(120, 1800), true);
+	// The floor is 60 s, so a TTL under 180 s renews on the floor, not on a third:
+	// the third of a 120 s lease (40 s) is a window shorter than the 30 s tick, and
+	// a client that waits for it can miss the deadline outright.
+	assert.equal(shouldRenew(61, 120), false);
+	assert.equal(shouldRenew(60, 120), true);
+	assert.equal(shouldRenew(120, 120), false);
+	// Unknown remaining renews: a client that cannot see the countdown must not
+	// lose the lane.
+	assert.equal(shouldRenew(undefined, 1800), true);
+	assert.equal(shouldRenew(0, 1800), true);
+	assert.equal(shouldRenew(Number.NaN, 1800), true);
 });
