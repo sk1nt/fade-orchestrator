@@ -1,5 +1,6 @@
 /**
- * fade_orchestrate: one OMP session, two basalt lanes. (Wiring; the router client is
+ * fade_orchestrate: one OMP session, three basalt lanes: a planning lane plans, an advisor lane
+ * answers the verdict acts, the code lane implements. (Wiring; the router client is
  * ./router.ts, the schema/validators/briefings are ./core.ts.)
  *
  * The loop is a phase contract, not tool sandboxing: the thinking lane answers with
@@ -13,8 +14,8 @@
  *   /orchestrate lanes reset           clear the flip ledger and land the owed lane (the THRASH BREAKER's release)
  *   /orchestrate runs                  the archived finished runs, newest first
  *   Alt+F                              the live panel: tasks, phases, engine metrics, swap cost
- *                                      (keys s/v/r/p/c/h act on the selected task; esc closes)
- *   /lanes                             live router census: both entries + health
+ *                                      (keys s/v/r/p/c/h act on the selected task; esc/q/Ctrl+C/the chord close)
+ *   /lanes                             live router census: all three lane entries + health
  */
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -23,7 +24,7 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, FLIP_WINDOW_MS, PROVIDER, ROUTER, THINK_LANE, THINKING, flipBreaker, flipGuarded, flipState, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
+import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, ENV_NOTICES, FLIP_WINDOW_MS, LANE_POLL_MS, PROVIDER, ROUTER, START_PROOF_WAIT_MS, THINK_LANE, THINKING, VERIFY_LANE, flipBreaker, flipGuarded, flipState, isThinkingLane, laneSyncTarget, listLanes, loadLane, msg, observeSwaps, proveResident, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
 import { acquireLease, releaseLease, renewLease, leaseLine, getResidency, shouldRenew, packToModelId, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 import {
@@ -322,7 +323,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// is the enforcement layer for anything that still tries.
 	const applyToolPolicy = async (lane: string): Promise<void> => {
 		const active = pi.getActiveTools();
-		if (lane === THINK_LANE) {
+		if (isThinkingLane(lane)) {
 			verifierTools = active;
 			const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true);
 			if (!readOnly.includes("fade_phase")) readOnly.push("fade_phase");
@@ -792,8 +793,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			run.lane_probe = { ok: probe.ok, detail: probe.detail, at: new Date().toISOString(), ms: probe.ms, skipped: probe.skipped };
 			if (!probe.ok && probe.skipped !== true) {
 				route = { route: "swap", reason: `the ${VERIFIER_MODEL} verifier lane failed its claim-time probe: ${probe.detail}`, flips: route.flips };
-				pushRejection(run, "task", `the zero-swap subagent verification route was REFUSED before the claim: ${probeLabel(probe)}. A claimed batch cannot be reclaimed (desk.ts:214), so an unproven lane leaves the batch owed for the whole run; paid the ${THINK_LANE} swap instead, the route with recovery`);
-				ctx.ui.notify(`orchestrate: verifier lane UNPROVEN — ${probeLabel(probe)}; the batch goes to one ${THINK_LANE} swap, not the zero-swap subagent route`, "warning");
+				pushRejection(run, "task", `the zero-swap subagent verification route was REFUSED before the claim: ${probeLabel(probe)}. A claimed batch cannot be reclaimed (desk.ts:214), so an unproven lane leaves the batch owed for the whole run; paid the ${VERIFY_LANE} swap instead, the route with recovery`);
+				ctx.ui.notify(`orchestrate: verifier lane UNPROVEN — ${probeLabel(probe)}; the batch goes to one ${VERIFY_LANE} swap, not the zero-swap subagent route`, "warning");
 			}
 		}
 		const claimed = claimBatch(desk, route.route);
@@ -812,13 +813,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		}
 		await writeJsonAsync(deskPath(runDir), claimed.desk);
 		run.state = "verifying";
-		pending = { lane: THINK_LANE, phase: "verification_batch" };
+		pending = { lane: VERIFY_LANE, phase: "verification_batch" };
 		deskBriefing = true;
 		settledNotified = false;
 		await persist();
 		paint(ctx);
-		ctx.ui.notify(`orchestrate: ${deskLine(desk)} — one ${THINK_LANE} load answers the whole batch`, "info");
-		requestLane(THINK_LANE, ctx);
+		ctx.ui.notify(`orchestrate: ${deskLine(desk)} — one ${VERIFY_LANE} load answers the whole batch`, "info");
+		requestLane(VERIFY_LANE, ctx);
 		return true;
 	};
 
@@ -1005,7 +1006,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// A batch briefing is owed to exactly ONE landing: the switch the desk dispatch asked
 			// for. The flag is consumed here, so a later switch to the same lane re-briefs the
 			// round's own page and never repeats the batch.
-			const owed = deskBriefing && lane === THINK_LANE && run?.verify_batch;
+			const owed = deskBriefing && isThinkingLane(lane) && run?.verify_batch;
 			deskBriefing = false;
 			if (owed && runDir && run) {
 				const st = run;
@@ -1294,13 +1295,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				}
 			}
 			st.state = "verifying";
-			return { next: THINK_LANE, nextState: "verifying" };
+			return { next: VERIFY_LANE, nextState: "verifying" };
 		}
 		const accepted = String(payload.verdict) === "accepted";
 		st.phases[st.phases.length - 1].accepted = accepted;
 		if (accepted) {
 			st.state = "complete";
-			return { next: THINK_LANE, nextState: "complete" };
+			return { next: VERIFY_LANE, nextState: "complete" };
 		}
 		pushRejection(
 			st,
@@ -1311,7 +1312,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (st.round + 1 > st.max_rounds) {
 			st.state = "failed";
 			st.reason = `round budget exhausted (${st.max_rounds}) with verdict needs_repair`;
-			return { next: THINK_LANE, nextState: "failed" };
+			return { next: VERIFY_LANE, nextState: "failed" };
 		}
 		st.round += 1;
 		st.repair_tasks = (payload.tasks as Task[]).map((t) => ({ ...t, round: st.round, status: undefined, result: undefined }));
@@ -1704,7 +1705,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("lanes", {
-		description: `Live basalt router census on ${ROUTER}: both entries' load state and /health`,
+		description: `Live basalt router census on ${ROUTER}: every lane entry's load state and /health`,
 		handler: async (_args, ctx) => {
 			const st = await listLanes();
 			if (st.error) {
@@ -2017,7 +2018,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					const d = await readDesk(runDir, run.run_id);
 					if (d?.churn) {
 						await writeJsonAsync(deskPath(runDir), setChurn(d, false));
-						ctx.ui.notify(`orchestrate: churn route cleared — verification batches answer on the ${THINK_LANE} lane again`, "info");
+						ctx.ui.notify(`orchestrate: churn route cleared — verification batches answer on the ${VERIFY_LANE} lane again`, "info");
 					}
 				}
 				run.paused = false;
@@ -2072,9 +2073,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				releaseLock();
 				releaseLaneLease();
 				pending = undefined;
-				// The hand-back: a stop is the end of the run's role, so the thinking lane is not left
+				// The hand-back: a stop is the end of the run's role, so neither advisor lane is left
 				// resident. Quiet — no briefing for a lane nobody asked for.
-				const handBack = run.lane === THINK_LANE;
+				const handBack = run.lane !== CODE_LANE;
 				if (handBack) requestLane(CODE_LANE, ctx, true, true);
 				ctx.ui.notify(`orchestrate: stopped; ${handBack ? `handing the lane back to ${CODE_LANE}` : `resident lane left as ${run.lane}`}; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
@@ -2160,12 +2161,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// never started. `burstLive` flips only when the run is created.
 			let burstLive = false;
 			try {
-				const census = await listLanes();
-				const resident = census.models.find((m) => m.status === "loaded");
-				if (!census.error && resident?.id !== THINK_LANE) {
+				// Admitted is not loaded. The planning briefing is a request naming
+				// `${PROVIDER}/${THINK_LANE}`; sent while the lane still serves flash-next it
+				// answers 404, and the old one-shot census SKIPPED on a census error — the start
+				// defect. The proof is the daemon's RESIDENT pack AND the router's served id.
+				const proof = await proveResident(THINK_LANE, { sessionId: runId, waitMs: START_PROOF_WAIT_MS, pollMs: LANE_POLL_MS });
+				if (!proof.ok) {
 					releaseLock();
 					releaseLaneLease();
-					ctx.ui.notify(`orchestrate: preflight expected ${THINK_LANE} loaded, router reports ${resident ? resident.id : "none"}; nothing written`, "error");
+					ctx.ui.notify(`orchestrate: preflight did not prove ${THINK_LANE} serving — daemon ${proof.state} pack ${proof.pack ?? "none"}, router id ${proof.served_id ?? "nothing"}, after ${proof.waited_s.toFixed(1)}s; the planning briefing was not sent and nothing was written`, "error");
 					return;
 				}
 				burstLive = true;
@@ -2219,7 +2223,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			pi.sendUserMessage(await briefings.plan(run));
 	};
 	pi.registerCommand("orchestrate", {
-		description: `One session, two basalt lanes: ${THINK_LANE} plans/verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | think [model] <prompt> | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
+		description: `One session, three basalt lanes: ${THINK_LANE} plans, ${VERIFY_LANE} verifies, ${CODE_LANE} codes. /orchestrate [--rounds N] [--demo-redact] <goal> | status | overlay | runs | moe | desk | think [model] <prompt> | verifier [install] | skip [Tn] | verify | reset | lanes reset | pause [note] | code | halt | stop [--clear]`,
 		handler: orchestrateCommand,
 	});
 	pi.registerCommand("plan", {
@@ -2271,7 +2275,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
 			}
 		}
-		const line = [chordNote, runNote].filter((n): n is string => n !== undefined).join(" · ");
+		const line = [chordNote, ...ENV_NOTICES.map((n) => `lanes: ${n}`), runNote].filter((n): n is string => n !== undefined).join(" · ");
 		if (line !== "") {
 			// The FIRST notify of a session is swallowed by the host's TUI attach (measured in the
 			// pty rig: the disclosure fired at `session_start` never reached the scrollback, while a
@@ -2303,11 +2307,20 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (isDelegatedSession()) return;
 		const res = await getResidency(leaseSession || verifyLeaseSession || SELF_SESSION);
 		if (!res || res.state !== "RESIDENT" || !res.pack) return;
-		// The daemon speaks PACK KEYS; the registry and the status bar speak MODEL
-		// IDS. Map before comparing: a resident `deepseek` pack and the model id
-		// `deepseek` are the same lane (identity today), and any alias spelling
-		// resolves through the one helper so no call site renames by hand.
-		const target = packToModelId(res.pack);
+		// The daemon speaks PACK KEYS; the registry and the status bar speak MODEL IDS, and
+		// `laneSyncTarget` maps through the one helper so no call site renames by hand. The pin
+		// follows the resident pack ONLY when that pack is the lane this screen's work is owed:
+		// a swap drains for tens of seconds, and pinning the pack that is still resident in that
+		// window is the measured defect — the run asks for `deepseek`, the sync lands
+		// `flash-next`, and the first completion never names the guest. `pendingVerifyLane` is
+		// declared below with `let`; this hook only fires after the factory body has run, so the
+		// reference is safe.
+		const owed = run ? (pending?.lane ?? run.lane) : pendingVerifyLane;
+		const target = laneSyncTarget(res.pack, owed);
+		if (target === undefined) {
+			ctx.ui.notify(`lane sync: ${res.pack} is resident while this work owes ${owed} — the pin stays (the swap is draining)`, "info");
+			return;
+		}
 		if (ctx.model?.provider !== PROVIDER || ctx.model.id === target) return;
 		const model = ctx.modelRegistry.find(PROVIDER, target);
 		if (!model) return;
@@ -2317,6 +2330,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
+		// A delegated (subagent) session NEVER drives the loop: no protocol ladder, no nudges,
+		// no lane moves, no counters. The run in this closure belongs to the session that adopted
+		// it; a worker's turn ending is that session's business, not the worker's (gate_rig 15).
+		if (isDelegatedSession()) return;
 		if (!run) {
 			// THE NON-RUN VERIFICATION MOVE. The verdict act recorded during the turn is paid
 			// here: one `setModel` + load through `requestLane`, so the pin and the lane move
@@ -2333,11 +2350,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				requestLane(want, ctx, want !== THINK_LANE);
 				return;
 			}
-			// THE NON-RUN HAND-BACK. A session whose turn ran on the thinking lane hands the lane
-			// back at the boundary: one `setModel` + load, no briefing, no run state. The forward
-			// direction is the host resolving the thinking-lane role; the reverse is here. Delegated
+			// THE NON-RUN HAND-BACK. A session whose turn ran on the planning or advisor lane hands
+			// the lane back at the boundary: one `setModel` + load, no briefing, no run state. The
+			// forward direction is the host resolving the verdict role onto the advisor lane; the
+			// reverse is here. Delegated
 			// sessions never touch the lane — their parent's run owns it.
-			if (!isDelegatedSession() && ctx.model?.provider === PROVIDER && ctx.model.id === THINK_LANE) requestLane(CODE_LANE, ctx, true, true);
+			if (!isDelegatedSession() && ctx.model?.provider === PROVIDER && isThinkingLane(ctx.model.id)) requestLane(CODE_LANE, ctx, true, true);
 			return;
 		}
 		const next = pending;
@@ -2350,8 +2368,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 					ctx.ui.notify(briefings.final(run), "info");
 				}
 				void recordTurn(run.state);
-				// DS's role is done: hand the lane back instead of leaving the thinking lane resident.
-				if (run.lane === THINK_LANE) requestLane(CODE_LANE, ctx, true, true);
+				// The verdict is spent: hand the lane back instead of leaving an advisor pack resident.
+				if (run.lane !== CODE_LANE) requestLane(CODE_LANE, ctx, true, true);
 				return;
 			}
 			if (run.paused === true) {
@@ -2539,7 +2557,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// its whole-file `readFileSync` + parse of `state.json` was a per-keystroke stall of the
 		// host's loop; the mtime guard makes a steady run pay one `stat`.
 		const live = await liveState();
-		if (!live || live.state !== "verifying" || live.lane !== THINK_LANE) return undefined;
+		if (!live || live.state !== "verifying" || !isThinkingLane(live.lane)) return undefined;
 		const name = event.toolName ?? "";
 		if (MUTATING_TOOLS[name] !== true) return undefined;
 		pushRejection(run, "task", `verifier sandbox: ${name} refused on the thinking lane (read-only); the fix is delegated to the coder`);

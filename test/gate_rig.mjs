@@ -213,6 +213,51 @@ process.env.FADE_ORCHESTRATE_ROUTER = `http://127.0.0.1:${server.address().port}
 process.env.FADE_ORCHESTRATE_SWAP_CMD = `node ${new URL("./swap_stub.mjs", import.meta.url).pathname}`;
 process.env.FADE_ORCHESTRATE_HEADLESS = "1";
 
+// ---- stub supervisor: the lane authority, in tmp ----
+// The rig MUST own this socket. Pinned to nothing, the plugin's `getSocketPath` probes the LIVE
+// `/run/fade/supervisor.sock`, then `/tmp/fade-supervisor.sock` — the trading box's real daemon
+// (measured 2026-11-26: the rig's `loadLane("flash-next")` answered `resident per supervisor`
+// from the live daemon and the block's swap assertions died against a daemon the rig never
+// drove). Pinned here, the residency answer MIRRORS the rig's own `resident` variable, so the
+// residency short-circuit and the census never disagree, and every swap rides the ctl stub.
+const supDir = mkdtempSync(join(tmpdir(), "fade-rig-sup-"));
+const supSock = join(supDir, "supervisor.sock");
+const supServer = http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    const p = body ? JSON.parse(body) : {};
+    const send = (obj) => {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(obj));
+    };
+    if (req.url === "/v1/residency" || req.url === "/v1/status")
+      return send({ lane_state: resident === null ? "IDLE" : "RESIDENT", active_pack: resident ?? "-", pid: process.pid, active_requests: 0, telemetry: { source: "rig" }, supervisor: { version: "rig-stub" } });
+    if (req.url === "/v1/lease") {
+      // The daemon's wire shape (server.go dispatchLease): `accepted` is the verdict, `decision`
+      // and `token` ride a grant, `granted_ttl_s` is the countdown. `{ok:true, lease_token}` is a
+      // pre-lease schema; the client parses the daemon's, and a stub that omits `accepted` reads
+      // as a refusal (`REJECT: refused`), which is what the start's lease mint then names.
+      if (p.action === "acquire") return send({ accepted: true, decision: "GRANT", rule: "", token: `RIG-${process.pid}`, granted_ttl_s: 1800, lease: { holder_caller: "rig", remaining_sec: 1800, token_hint: "rig…" } });
+      return send({ accepted: true, decision: "OK", rule: "", reason: `${p.action ?? "status"}: rig stub` });
+    }
+    if (req.url === "/v1/swap") return send({ ok: false, why: "rig: swaps ride the ctl stub (FADE_ORCHESTRATE_SWAP_VIA=ctl)" });
+    send({ ok: false, why: "rig: unknown supervisor call " + req.url });
+  });
+});
+await new Promise((r) => supServer.listen(supSock, r));
+process.env.FADE_SUPERVISOR_SOCK = supSock;
+// The swap rides the ctl stub: the supervisor plane is refused by design (the stub's /v1/swap
+// names it), and the rig's counters are `POST /v1/load` on ITS router — that is the load the
+// stub performs. The advisor lane rides the same router, so the rig names it a router pack.
+process.env.FADE_ORCHESTRATE_SWAP_VIA = "ctl";
+process.env.FADE_ORCHESTRATE_VERIFY_LANE = "hy4-flash";
+// The start preflight PROVES the planning lane resident (daemon state + router served id). The
+// rig's blocks set `resident` by hand before a start, so the proof lands on its first poll; the
+// short ceiling is a fuse, never a lever: a proof that misses is a rig bug, named by detail.
+process.env.FADE_ORCHESTRATE_START_PROOF_WAIT_MS = "800";
+
 // The idle gate and the THRASH BREAKER are configuration, so the rig runs their windows in
 // milliseconds (the convention `test/pty_rig.mjs` carries for the metrics tick). They MUST be set
 // BEFORE the extension is imported: `GATE_POLL_MS`/`GATE_BUDGET_MS` (src/index.ts) and
@@ -657,7 +702,10 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 {
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
 	await commands.orchestrate.handler("verify", ctx);
-	await new Promise((r) => setTimeout(r, 60));
+	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
+	// The boundary pays the swap: `setModel` lands first, then the ctl stub (a child process:
+	// spawn + POST) completes and `applyToolPolicy` strips the writers. 150 ms lost that race.
+	await new Promise((r) => setTimeout(r, 600));
 	ok("the verifier lane's active set carries no writers (delegation stays)", !activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
 	const blocked = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "x", input: {} }, ctx);
 	ok("a verifier edit is BLOCKED with the rule named", blocked?.block === true && /read-only/.test(blocked.reason ?? ""), JSON.stringify(blocked));
@@ -704,6 +752,11 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	const jsonl = join(repo, "var", "omp-orchestrate", "metrics.jsonl");
 	const lines = () => (existsSync(jsonl) ? readFileSync(jsonl, "utf8").trim().split("\n").filter(Boolean) : []);
 	process.env.PI_SESSION_FILE = nested;
+	// Drain the previous block's async tail first: the accepted verification paid a lane switch,
+	// and `runSwitch`'s persist lands a tick after the block returns. Seeding before that write
+	// lets the previous run's counters win the file race (measured 2026-11-26: seed 0 read back 3
+	// while the delegated hooks persisted nothing). The seed must own the file when it writes it.
+	await new Promise((r) => setTimeout(r, 150));
 	const base = loads();
 	const before = lines().length;
 	writeState({ ...seedState("coding", [["true", "green"]]), protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
@@ -975,7 +1028,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("lanes reset clears the badge: no `lane flip:` row", !hasRow((widgets.get("fade-top")?.lines ?? []).join("\n"), "lane flip:"), (widgets.get("fade-top")?.lines ?? []).join("\n").slice(0, 240));
   ok("lanes reset unpauses and clears the operator note", sReset.paused === false && sReset.operator_note === undefined, JSON.stringify({ paused: sReset.paused, operator_note: sReset.operator_note }));
   ok("lanes reset pays exactly ONE POST /v1/load", loads() - lReset === 1, `extra=${loads() - lReset}`);
-  ok("the lane it lands is the owed verifier lane", resident === "deepseek" && notes.some((n) => n.includes("flip ledger cleared; landing deepseek")), `${resident} · ${JSON.stringify(notes.slice(0, 2))}`);
+  ok("the lane it lands is the owed verifier lane", resident === "hy4-flash" && notes.some((n) => n.includes("flip ledger cleared; landing hy4-flash")), `${resident} · ${JSON.stringify(notes.slice(0, 2))}`);
 
   // The serialised chain: two switches for ONE lane, issued back to back. The chain runs the newest
   // and skips the superseded link outright — it never touches the router — so the lane loads ONCE.
@@ -1018,7 +1071,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the panel carries the engine column", panel.includes("ENGINE / ROUTER") && hasRow(panel, "resident flash-next"), panel.slice(0, 900));
   ok("the panel carries the context meter", hasRow(panel, "context 41.2k / 1.05M (3.9%)"), panel.slice(0, 900));
   ok("the panel names the ledger it has: the swap this rig drove is on screen, not a placeholder", panel.includes("LANE SWAPS") && /→/.test(panel) && !panel.includes("no swaps recorded"), panel.slice(0, 1200));
-  ok("the panel ends with the key bar", panel.includes("[esc] close") && panel.includes("[s] skip selected"));
+  ok("the panel ends with the key bar", panel.includes("[esc/q/Alt+F] close") && panel.includes("[s] skip selected"));
   await commands.orchestrate.handler("halt", ctx);
   ok("a terminal run clears the status row", !widgets.has("fade-top"), JSON.stringify([...widgets.keys()]));
   process.env.PI_SESSION_FILE = join(repo, "sessions", "2030-01-01T00-00-00-000Z_parent", "agent.jsonl");
@@ -1412,7 +1465,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await new Promise((r) => setTimeout(r, 250));
   const dReset = readDesk22();
   ok("`lanes reset` releases the churn route with the flip ledger", dReset.churn === false && dReset.churn_utc === undefined, JSON.stringify({ churn: dReset.churn, churn_utc: dReset.churn_utc }));
-  ok("the release names the lane that takes batches back", notes.some((n) => n.includes("churn route cleared") && n.includes("deepseek")), JSON.stringify(notes.slice(0, 4)));
+  ok("the release names the lane that takes batches back", notes.some((n) => n.includes("churn route cleared") && n.includes("hy4-flash")), JSON.stringify(notes.slice(0, 4)));
   ok("the release pays AT MOST one lane load (only a lane the loop owes)", loads() - lReset22 <= 1, `extra=${loads() - lReset22}`);
   swapLine = null;
   resident = "flash-next";
@@ -1594,7 +1647,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 
   // (a) the thinking lane is the session's model: one setModel + one load, no message sent
   resident = "deepseek";
-  ctx.model = { id: "deepseek", provider: "strata-flash" };
+  ctx.model = { id: "deepseek", provider: "basalt" };
   const b1 = loads();
   const m1 = modelCalls.length;
   const s1 = sent.length;
@@ -1605,7 +1658,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("the non-run hand-back sends no briefing", sent.length === s1, `${sent.length - s1}`);
 
   // (b) the code lane is already the session's model: nothing is sent
-  ctx.model = { id: "flash-next", provider: "strata-flash" };
+  ctx.model = { id: "flash-next", provider: "basalt" };
   const b2 = loads();
   const m2 = modelCalls.length;
   await hooks.agent_end({}, ctx);
@@ -1615,7 +1668,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   // (c) a delegated session never touches the lane, even on the thinking model
   const nested = join(repo, "sessions", "2030-01-01T09-11-28-519Z_01a1de79-d407-740b-a74e-ce2c57a1c556", "Worker.jsonl");
   process.env.PI_SESSION_FILE = nested;
-  ctx.model = { id: "deepseek", provider: "strata-flash" };
+  ctx.model = { id: "deepseek", provider: "basalt" };
   const b3 = loads();
   const m3 = modelCalls.length;
   await hooks.agent_end({}, ctx);

@@ -1,13 +1,14 @@
 # fade-orchestrator
 
-An [OMP](https://github.com/earendil-works) coding-agent extension. One session runs across **two
-model lanes**: a thinking lane plans and verifies, a code lane implements, and the `fade_phase` tool
-contract moves the session between them. The command that runs it is `/orchestrate <goal>`.
+An [OMP](https://github.com/earendil-works) coding-agent extension. One session runs across **three
+model lanes**: a planning lane plans, an advisor lane answers the verdict acts, a code lane
+implements, and the `fade_phase` tool contract moves the session between them. `/orchestrate <goal>`.
 
 It targets a local [basalt](https://github.com/sk1nt) router that serves several quantized packs on
 one GPU and keeps only one resident. Swapping a 52 GiB pack measures 13–25 s, so a lane swap is the
-unit of cost. The router URL, provider id, and the two lane entries are configuration; the package
-carries no host-specific code.
+unit of cost. The router URL, provider id, and the three lane entries are configuration; the package
+carries no host-specific code. A lane env that collapses the three lanes into two is **refused and
+named at login** — the documented lane wins and the refusal rides the status line (`test/lane_identity.test.mjs`).
 
 ## How it works
 
@@ -20,8 +21,8 @@ carries no host-specific code.
    │        fade_phase(coding_done)
    │        ┌─ pre-swap gate: run the plan's checks HERE, on the code lane
    │        │   red   → no swap paid; gate briefing names each failing command; self-repair
-   │        │   green → swap to the thinking lane for verification
-   │  planning lane: reads the diff, re-runs every check
+   │        │   green → swap to the advisor lane for verification
+   │  advisor lane: reads the diff, re-runs every check
    │        fade_phase(verification_done accepted)  → complete
    │        fade_phase(verification_done needs_repair) → repair tasks, swap back
 ```
@@ -31,11 +32,32 @@ carries no host-specific code.
   the queued requests name — measured live as a 0–2 s ping-pong. `loadLane` settles an in-flight
   swap first and returns without reloading the resident pack, so a load the resident entry already
   covers never re-reads 52 GiB.
+- **The start is a proof, not a census.** `/orchestrate <goal>` refuses until the planning lane is
+  PROVEN: the supervisor daemon's `lane_state` says `RESIDENT` with `active_pack` = the planning
+  pack AND the router serves that id on `/v1/models`. The old one-shot census SKIPPED on a census
+  error, the session pinned an id the lane did not serve, and the planning briefing answered
+  `404 The model 'basalt/deepseek' does not exist` — measured 2026-11-26. A cold load is not refused:
+  the proof polls the daemon's readiness window (`FADE_ORCHESTRATE_START_PROOF_WAIT_MS`, default 240 s,
+  13–25 s is the measured load) and never kills a swap in flight. The refusal is a line naming the
+  daemon state, the pack, the served id and the wait, and it pays no briefing and writes no state
+  (`test/preflight_proof.test.mjs`).
+- **The screen follows the lane it OWES.** The residency auto-sync pins a screen to the resident
+  pack only when that pack is the lane the session's work is owed (the run's pending lane, the run's
+  lane, or a plain session's recorded verify act). A swap drains for tens of seconds, and pinning
+  the pack that is still resident in that window is the measured defect: the run asks for
+  `deepseek`, the sync lands `flash-next`, and the first completion never names the guest. During
+  the drain the pin stays and the line says so: `the swap is draining` (`laneSyncTarget`).
+- **The overlay owns its keys.** `esc` (in every encoding the host delivers — legacy byte, Kitty
+  CSI-u, xterm modifyOtherKeys), `q`, Ctrl+C and Ctrl+D, and the OPEN chord itself, close the panel:
+  the chord is the toggle. The first read is bounded (`FADE_ORCHESTRATE_PANEL_FIRST_MS`, default
+  3 s) so a provider that never answers cannot strand the overlay flag with no component mounted —
+  the keystroke retries (`docs/OVERLAY.md`, `test/panel.test.mjs`).
 - **Planning residency, hand-back at the boundary.** `/plan <goal>` (the planning entry, same
   handler as `/orchestrate`) loads the thinking lane (DS4) first, and DS4 stays resident through
   the whole planning turn: the phase state machine authorizes every lane load, and the only
   planning hand-back is the `planning_done` phase act, which lands the code lane. `coding_done`
-  pays the DS4 load for the verification turn and DS stays through it. Terminal states hand the
+  pays the advisor load (`FADE_ORCHESTRATE_VERIFY_LANE`, default `hy4-flash`, never the coder's pack)
+  for the verification turn and the advisor stays through it. Terminal states hand the
   lane back to the code lane at the turn boundary (a quiet `setModel` + load, no briefing), `/orchestrate
   stop` does the same at the keystroke, and a **non-run session** whose turn ran on the thinking
   lane hands back at its `agent_end`; delegated sessions never touch the lane. Nothing inside this
@@ -59,12 +81,13 @@ carries no host-specific code.
   `:18014` lane, so "its own port" isolates the router, it does not coexist with the Flash-Next pack.
   A `lane_not_resident` or `endpoint_unreachable` line is that topology being named, not a bug to fix
   by loading DS4 mid-session.
-- **No pre-unload VRAM floor by default.** A controlled swap unloads the resident pack FIRST, so
-  free VRAM measured with the old pack resident is not the room the next pack gets — a floor
-  measured there refuses every hand-back on a box that has the room. The lever
-  (`FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB`) stays for routers that keep old contexts; it is armed by
-  the operator, off by default. The dead-context classes (unreachable, error state, zero VRAM,
-  loaded-naming-no-model, swap in flight) and the idle/busy/flip guards stay.
+- **The pre-unload VRAM floor is retired.** A controlled swap unloads the resident pack FIRST, so
+  free VRAM measured with the old pack resident is not the room the next pack gets — the measured
+  1.2 GiB line is a health line that SERVES (`test/load_hostile.mjs`), and a floor measured there
+  refused every hand-back on a box that had the room. The lever (`FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB`)
+  is no longer read at all, and the free reading is reported in the verdict, never gated on it. The
+  dead-context classes (unreachable, error state, zero VRAM, loaded-naming-no-model, swap in flight)
+  and the idle/busy/flip guards stay.
 - **Lane thrash breaker.** Swaps the router reports away from the run's lane are counted in a
   window. Past `FADE_ORCHESTRATE_FLIP_BREAKER_AT` (4) the loop stops paying: no `setModel`, no
   `POST /v1/load`, the run pauses with the flips, the window and the competing entry in its operator
@@ -206,13 +229,15 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 |---|---|---|
 | `FADE_ORCHESTRATE_ROUTER` | `http://127.0.0.1:18014` | basalt router base URL |
 | `FADE_ORCHESTRATE_LOCK_DIR` | `~/.local/state/fade-orchestrator` | the base of the **router claim**: one file per router (`<router-slug>/orchestrator.lock`), holding the owning pid, run id, repo, host and start time. A run claims its router at the keystroke and releases it at `halt`/`stop`/completion/preflight failure; a second session on the same router is refused before any lane load or state write, and the refusal, `/orchestrate status` and the screen all name the holder **with the age of the claim** (`· held 12h00m`), which is the "is this a session that never ended?" reading. Set it to move the whole plane (rigs, containers, a read-only home) |
-| `FADE_ORCHESTRATE_PROVIDER` | `strata-flash` | OMP provider id the lanes live under |
-| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | entry that plans/verifies (thinking lane). **Read from `process.env` at import** (`src/router.ts:30-31`), so `.bashrc` setting it means nothing: a session launched with it already set to `flash-next` re-loads that entry at every `fade_phase` boundary and looks exactly like churn. A live session cannot be repointed — relaunch with the lane on the launch line |
-| `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | entry that implements; the same import-time read, so the boundary hands back to whatever this names |
+| `FADE_ORCHESTRATE_PROVIDER` | `basalt` | OMP provider id the lanes live under. `basalt` is the provider that declares every alias of the single `:18014` lane; the live `modelRoles` are all `basalt/*`. `strata-flash` names only `flash-next`, so a thinking-lane `setModel` there cannot resolve and every lane move dies at the registry lookup (measured 2026-11-25) |
+| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | the **planning** lane. **Read from `process.env` at import** (`src/router.ts`), so `.bashrc` setting it means nothing: a live session cannot be repointed — relaunch with the lane on the launch line. A value equal to the code lane is **refused and named** (the box's `inference-keys.env` exports `flash-next`; honored, that made planning and coding run on the coder's pack with zero swaps, measured 2026-11-26) and the documented lane wins |
+| `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | the coder's pack; the same import-time read, so the boundary hands back to whatever this names. Naming a documented thinking pack here (`deepseek`, `hy4-flash`) is refused the same way: it collapses every lane onto one swap-free coder |
+| `FADE_ORCHESTRATE_VERIFY_LANE` | `hy4-flash` | the **advisor** lane: every verdict act (`frontier report`/`review`, a `task` carrying a verification agent, `/orchestrate verify`, `coding_done`'s verification leg) lands here, never on the coder. Equal to the coder is refused (named); equal to the planning lane is honored (one thinking pack for both acts is a lane-economy choice, not a collapse) |
 | `FADE_ORCHESTRATE_KEY` | `alt+f` | the screen's key. The host binds `alt+f` to `tui.editor.cursorWordRight`, so `registerShortcut` is **refused** for it and the extension takes the raw byte: `onTerminalInput` consumes `ESC f` (`1b 66`). No host binding is moved; [`docs/OVERLAY.md`](docs/OVERLAY.md) carries the chord history and the list of free single-alt chords |
 | `FADE_ORCHESTRATE_FALLBACK_KEY` | `alt+shift+i` | the companion chord (ESC + uppercase `I`), registered where the host's probe reports it free. It opens the screen when `FADE_ORCHESTRATE_KEY` names a chord the host holds |
 | `FADE_ORCHESTRATE_SURFACE` | unset | the status line's surface. Default = the host's **top widget** (`placement: aboveEditor`); `status` selects the host's status-bar row |
 | `FADE_ORCHESTRATE_PANEL_REFRESH_MS` | `2000` | the open screen's refresh tick (floor 500 ms); the tick is `unref`'d and cleared on close |
+| `FADE_ORCHESTRATE_PANEL_FIRST_MS` | `3000` | the bound on the panel's FIRST read: a provider that never answers returns with a named warning and clears the overlay flag, so the chord is never stranded with no component mounted; the keystroke retries |
 | `FADE_ORCHESTRATE_GLYPH` | `󰚩` | the status line's leading glyph; an empty value removes it (a terminal without a Nerd Font) |
 | `FADE_ORCHESTRATE_REDACT` | unset | `1`, or `/orchestrate --demo-redact` (`--demo-redact=off` to clear), strips the repo path, account, `/home/…`, `~` and the hostname from every rendered line. Display-only: `state.json`, `metrics.jsonl` and `swap_history.json` stay verbatim, and a fresh session starts unredacted |
 | `FADE_ORCHESTRATE_HEADLESS` | unset | `1` renders the screen as a widget (110 columns) instead of an overlay component (RPC/print hosts) |
@@ -220,8 +245,8 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 | `FADE_ORCHESTRATE_GATE_POLL_MS` / `_GATE_BUDGET_MS` | `3000` / `60000` | the pre-unload router-idle gate: a `POST /v1/load` is deferred while `/health` reports the router busy, polled every `_GATE_POLL_MS` for up to `_GATE_BUDGET_MS`, then paid anyway. A gate that expires without loading the lane leaves the run stalled |
 | `FADE_ORCHESTRATE_GATE_TOTAL_BUDGET_MS` | `600000` | the pre-swap gate's total wall budget across every check; each check keeps its own 120 s timeout. A row that starts with the budget spent is never spawned and prints `NOT RUN … unmeasured` |
 | `FADE_ORCHESTRATE_FASTPATH_FILES` / `_LINES` | `1` / `15` | the fast path's bound: a gate-green round that touched ≤ 1 file and < 15 changed lines on the first try completes with zero lane loads |
-| `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` | `8192` | the pre-unload floor. Free VRAM under it, a zero/negative reading, an error state, a loaded context naming no model, a swap in flight, or no answer at all refuses the lane load with the class named, and `POST /v1/load` is never sent (`node test/load_hostile.mjs`) |
 | `FADE_ORCHESTRATE_SETTLE_POLL_MS` / `_MAX_MS` | `2000` / `120000` | the pre-unload settle window: an in-flight swap is waited out first, and the gate reports the health line seen when the window ends |
+| `FADE_ORCHESTRATE_START_PROOF_WAIT_MS` | `240000` | the start preflight's proof window: the planning lane must become PROVEN (daemon `RESIDENT` for the pack AND the router serving its id) before the planning briefing is sent. The window is a fuse for a cold load, never a lever: the proof polls, it does not kill a swap in flight, and a miss is a refusal naming the daemon state, pack, served id and the wait |
 | `FADE_ORCHESTRATE_FLIP_WINDOW_MS` / `_FLIP_MIN_SWAPS` / `_FLIP_BREAKER_AT` | `120000` / `2` / `4` | the flip window, the count that badges it, and the count that halts the loop. At the breaker a switch issues no `setModel` and no `POST /v1/load`, the run pauses with the flips named, and `/orchestrate lanes reset` clears the ledger and lands the owed lane |
 | `FADE_ORCHESTRATE_SWITCH_GLYPH` | U+F051F | the icon on the model-switch row, in the same Nerd Font private-use family as the status glyph; an empty value removes it and its space (`test/ui_status.test.mjs`) |
 | `FADE_ORCHESTRATE_PROOF_TTL_MS` | `10000` | how long the MoE engine proof (the `/proc` scan for the running engine and router) is reused, so the keystroke and the 2 s refresh tick do not re-walk `/proc`; `0` re-scans every call, and a lane load drops the cache. Measured on this box (1103 processes): one walk 2-4 ms, so the TTL is what keeps that out of the panel's refresh path |
@@ -423,8 +448,9 @@ renders with nothing networked, and the screen prints the name of every number i
 RPC carries no raw keystrokes, so the chord is proved twice: by the fake-host rig (the host's table
 refuses an `alt+f` registration — the rig models that refusal — and the `ESC f` listener consumes
 the byte and opens, while the fallback chord is the registered one) and by the pty rig (the bytes
-sent to a real 150×45 terminal, the panel on screen, `ESC f` opening, the legacy Escape and the
-injected Kitty CSI-u escape closing, halt clearing, and `ctrl+o` staying the host's).
+sent to a real 150×45 terminal, the panel on screen, `ESC f` opening, the legacy Escape, the
+injected Kitty CSI-u escape, `q` and the chord itself all closing, the chord re-opening after any
+close (the toggle), halt clearing, and `ctrl+o` staying the host's).
 
 **Run root = git working tree.** `/orchestrate` roots a run at the session cwd and reads that
 directory with git (`status --porcelain`, `diff --stat`, checkpoint tags). Outside a working tree

@@ -32,7 +32,7 @@ Tier-2 synthesizer in the same file. The operator's own lever is `verify` (`actV
 
 ```ts
 run.state = "verifying";
-return { next: THINK_LANE, nextState: "verifying", note: "verification requested early; thinking lane loads at the turn boundary" };
+return { next: VERIFY_LANE, nextState: "verifying", note: "verification requested early; the advisor lane loads at the turn boundary" };
 ```
 
 `verify` pays 13-25 s of pack load to ask "is the tree green?" — the same question the gate already
@@ -99,7 +99,7 @@ export function swapRows(swaps: SwapRow[]): MetricRow[] {
 
 so the screen answers "what were the last swaps" and never the question an operator actually asks
 after a thrash halt: how much of the last hour did the code lane own the card, and what did the
-thinking lane cost. `summarizeSwaps` is the same shape per run, not per lane.
+thinking lanes (planning, advisor) cost. `summarizeSwaps` is the same shape per run, not per lane.
 
 Cost: 2 files (`src/screendata.ts` gains a pure share function; `src/panel.ts` renders it inside
 the LANE SWAPS block), `test/panel_data.test.mjs`. One turn.

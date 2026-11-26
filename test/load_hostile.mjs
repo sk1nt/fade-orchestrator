@@ -7,11 +7,12 @@
 // class must produce ZERO `POST /v1/load` with the class in the returned detail — plus the healthy
 // router loading exactly once, and the router that stops answering refusing by name.
 //
-// The router client reads `FADE_ORCHESTRATE_ROUTER`, the VRAM floor and the settle window at
-// IMPORT, so the env is set here BEFORE the `import()` of the bundle, and the settle window is
+// The router client reads `FADE_ORCHESTRATE_ROUTER` and the settle window at IMPORT, so the env
+// is set here BEFORE the `import()` of the bundle, and the settle window is
 // shrunk so the hung-context class is proved in milliseconds, not in the 120 s it takes live.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 
 let mode = "healthy";
 let loads = 0;
@@ -55,16 +56,22 @@ const server = createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 process.env.FADE_ORCHESTRATE_ROUTER = `http://127.0.0.1:${port}`;
+// Hermetic against the host: on a box with the live fade-supervisor, the daemon's RESIDENT answer
+// short-circuits `loadLane` ("resident per supervisor; no swap issued") for a target the box
+// really is serving, and the hostile health gate is never reached — the rig grades the daemon,
+// not the gate (measured 2026-11-26: `error` mode returned ok=true). Pin the supervisor socket to
+// a path that does not exist (a pinned value wins outright and is never probed, so a NO ANSWER
+// falls through to the gate) and ride the swap on the ctl plane through `swap_stub.mjs`, so the
+// POST lands on the rig's router and the load counter keeps its meaning.
+process.env.FADE_SUPERVISOR_SOCK = `${tmpdir()}/fade-hostile-no-daemon-${process.pid}.sock`;
+process.env.FADE_ORCHESTRATE_SWAP_VIA = "ctl";
 // The swap seam: hostile refusals must spawn NOTHING; the healthy case's POST lands on the
 // fake router through the stub, so the load counter keeps its meaning.
 process.env.FADE_ORCHESTRATE_SWAP_CMD = `node ${new URL("./swap_stub.mjs", import.meta.url).pathname}`;
-process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB = "4096";
 process.env.FADE_ORCHESTRATE_SETTLE_POLL_MS = "20";
 process.env.FADE_ORCHESTRATE_SETTLE_MAX_MS = "60";
 
-const { loadLane, serveVerdict, VRAM_MIN_FREE_MIB } = await import("../.test-build/router.mjs");
-
-assert.equal(VRAM_MIN_FREE_MIB, 4096, "the VRAM floor is the operator's lever");
+const { loadLane, serveVerdict } = await import("../.test-build/router.mjs");
 
 // -- the pure verdict: the classes, named -------------------------------------------------------
 assert.equal(serveVerdict(undefined).serve, false, "an unreachable router never serves");
@@ -74,12 +81,16 @@ assert.ok(serveVerdict(HEALTH.healthy).reason.includes("flash-next"), serveVerdi
 // No VRAM fields on the live build: absence is named, never read as a zero.
 assert.ok(serveVerdict(HEALTH.healthy).reason.includes("VRAM not reported"), serveVerdict(HEALTH.healthy).reason);
 
+// The floor that was retired: 1.2 GiB free is a health line that SERVES — a swap unloads the
+// resident pack first, so free VRAM before the swap says nothing about the swap. It must appear
+// in the reason, as a reading, never as a gate.
+assert.equal(serveVerdict(HEALTH.low_vram).serve, true, "1.2 GiB free is not a refusal");
+assert.ok(serveVerdict(HEALTH.low_vram).reason.includes("1200"), serveVerdict(HEALTH.low_vram).reason);
 // -- the gate: a hostile health line issues ZERO loads ------------------------------------------
 const HOSTILE = [
 	["error", 'reports "error"'],
 	["cuda_fatal", 'reports "cuda_fatal"'],
 	["zero_vram", "zero free VRAM"],
-	["low_vram", "under the 4096 MiB pack floor"],
 	["negative_vram", "zero free VRAM"],
 	["no_model", "names no model"],
 	["swapping", "swap in flight"],
