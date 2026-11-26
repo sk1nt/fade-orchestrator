@@ -36,6 +36,8 @@ const R_RESIDENCY = SL + "v1" + SL + "residency";
 const R_LEASE = SL + "v1" + SL + "lease";
 const R_SWAP = SL + "v1" + SL + "swap";
 
+const VERIFY = "hy4-flash";
+
 const CODE = "flash-next";
 const THINK = "deepseek";
 const TOKEN = "T-VERIFY";
@@ -118,6 +120,7 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		FADE_ORCHESTRATE_PROVIDER: "basalt",
 		FADE_ORCHESTRATE_THINK_LANE: THINK,
 		FADE_ORCHESTRATE_CODE_LANE: CODE,
+		FADE_ORCHESTRATE_VERIFY_LANE: VERIFY,
 		FADE_ORCHESTRATE_FLIP_WINDOW_MS: "0",
 		// The lease's clock is the metrics tick. Drive it fast and mint short so `shouldRenew`
 		// (remaining <= max(60, ttl/3)) is already true on the tick that follows the mint.
@@ -161,7 +164,7 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		const swaps = () => supHits().filter((h) => h.includes(R_SWAP));
 		const leases = () => supHits().filter((h) => h.includes(R_LEASE));
 		assert.equal(swaps().length, 1, `one swap: ${swaps().join(" | ")}`);
-		assert.match(swaps()[0], new RegExp(`pack=${THINK}`), "the thinking pack is what the boundary lands");
+		assert.match(swaps()[0], new RegExp(`pack=${VERIFY}`), "the advisor pack is what the boundary lands");
 		assert.match(swaps()[0], new RegExp(`token=${TOKEN}`), "the swap rides the minted capability");
 		assert.equal(leases().filter((h) => h.includes("acquire")).length, 1, "exactly one mint for the turn");
 		assert.equal(leases().filter((h) => h.includes("release")).length, 0,
@@ -176,7 +179,7 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		assert.ok(supHits().some((h) => h.includes(R_LEASE) && h.includes("action=renew") && h.includes(TOKEN)),
 			"the minted capability is renewed while the session holds the lane");
 		// 3. the next boundary hands the code lane back: the SAME capability rides, then returns once.
-		await hooks.agent_end({}, ctx({ provider: "basalt", id: THINK }));
+		await hooks.agent_end({}, ctx({ provider: "basalt", id: VERIFY }));
 		await settled(sup.hits, (h) => h.filter((x) => x.includes(R_SWAP)).length >= 2, notes);
 		const hand = swaps()[1];
 		assert.match(hand, new RegExp(`pack=${CODE}`), "the hand-back lands the code pack");

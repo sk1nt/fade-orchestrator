@@ -25,7 +25,7 @@
  * `/orchestrate verifier install`: it is a `.omp/agents/*.md` file, so the host's `task` tool
  * pins the model from the front matter and the orchestrator never has to swap a lane to use it.
  */
-import { CODE_LANE, FLIP_MIN_SWAPS, PROVIDER, THINK_LANE, THINKING } from "./router.ts";
+import { CODE_LANE, FLIP_MIN_SWAPS, PROVIDER, THINK_LANE, VERIFY_LANE, THINKING } from "./router.ts";
 import type { VerifyRequest } from "./desk.ts";
 
 /** The agent definition's name, as it is written into `.omp/agents/<name>.md`. */
@@ -42,8 +42,8 @@ export const VERIFIER_AGENT = process.env.FADE_ORCHESTRATE_VERIFIER_AGENT ?? "fa
  */
 export const VERIFIER_MODEL = process.env.FADE_ORCHESTRATE_VERIFIER_MODEL ?? "ninfer-local/coder-gpu1";
 
-/** The router's own two entries: the models that CANNOT host a churn-free verification. */
-export const ROUTER_ENTRIES = [CODE_LANE, THINK_LANE, PROVIDER].map((s) => s.toLowerCase());
+/** The router's own entries: the models that CANNOT host a churn-free verification. */
+export const ROUTER_ENTRIES = [CODE_LANE, THINK_LANE, VERIFY_LANE, PROVIDER].map((s) => s.toLowerCase());
 
 /** True when a model spec would land on the router and so re-price the swap the route avoids. */
 export function isRouterModel(model: string): boolean {
@@ -136,7 +136,7 @@ export function routeFor(desk: { churn: boolean; churn_utc?: string }, flip: { f
 	const guardAt = opts.guardAt ?? FLIP_MIN_SWAPS;
 	if (desk.churn) return { route: "subagent", reason: `the desk has churn declared${desk.churn_utc ? ` since ${desk.churn_utc}` : ""}: batches are answered by a verification subagent on ${VERIFIER_MODEL}, and no lane load is paid`, flips: flip.flips };
 	if (flip.flips >= guardAt) return { route: "subagent", reason: `lane churn began: ${flip.flips} swaps away from the run's lane in the guard window — the verification goes to a subagent on ${VERIFIER_MODEL} (zero router swaps) instead of a lane load`, flips: flip.flips };
-	return { route: "swap", reason: `no churn: one ${THINK_LANE} load addresses the whole batch`, flips: flip.flips };
+	return { route: "swap", reason: `no churn: one ${VERIFY_LANE} load addresses the whole batch`, flips: flip.flips };
 }
 
 /**
@@ -295,5 +295,5 @@ export const workerAgentPath = (repo: string, agent = WORKER_AGENT): string => `
 export function routeLine(route: RouteDecision): string {
 	return route.route === "subagent"
 		? `verification → ${VERIFIER_AGENT} on ${VERIFIER_MODEL} · zero lane loads`
-		: `verification → ${THINK_LANE} lane · one load (${THINKING[THINK_LANE] ?? "high"} thinking)`;
+		: `verification → ${VERIFY_LANE} lane · one load (${THINKING[VERIFY_LANE] ?? "high"} thinking)`;
 }

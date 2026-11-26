@@ -6,7 +6,7 @@
  * Each returns a directive; persistence and lane switching stay with the caller (index.ts),
  * because only the caller owns state.json writes and the router.
  */
-import { CODE_LANE, THINK_LANE } from "./router.ts";
+import { CODE_LANE, VERIFY_LANE } from "./router.ts";
 import { MAX_ROUNDS, type RunState } from "./core.ts";
 
 export interface ActionDirective {
@@ -28,11 +28,11 @@ export function actSkip(run: RunState, task?: string): ActionDirective {
 	return { nextState: run.state, note: `skipped ${target.id} (forced passed; recorded as manual skip)` };
 }
 
-/** v — trigger verification early from coding/repair: the run moves to the thinking lane. */
+/** v — trigger verification early from coding/repair: the run moves to the advisor lane. */
 export function actVerify(run: RunState): ActionDirective {
 	if (run.state !== "coding" && run.state !== "repair") return { nextState: run.state, note: `verify: state ${run.state} is not a coding phase` };
 	run.state = "verifying";
-	return { next: THINK_LANE, nextState: "verifying", note: "verification requested early; thinking lane loads at the turn boundary" };
+	return { next: VERIFY_LANE, nextState: "verifying", note: "verification requested early; the advisor lane loads at the turn boundary" };
 }
 
 /**

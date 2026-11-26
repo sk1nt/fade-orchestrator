@@ -93,6 +93,7 @@ test("the model pin is the load-bearing line: a router entry is named as the chu
 	assert.equal(isRouterModel("strata-flash/flash-next"), true);
 	assert.equal(isRouterModel("ninfer-local/coder-gpu1"), false);
 	assert.equal(isRouterModel("deepseek"), true);
+	assert.equal(isRouterModel("hy4-flash"), true, "the advisor pack is a router entry: the verifier install must refuse it");
 	const md = verifierAgentMd("ninfer-local/coder-gpu1", "fade-verifier");
 	assert.match(md, /^name: fade-verifier$/m);
 	assert.match(md, /^model: "ninfer-local\/coder-gpu1"$/m);

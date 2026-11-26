@@ -4,9 +4,9 @@
  * here answer on the router port; every failure names the stage, the HTTP status and the body.
  *
  * The host-specific parts are configuration, not constants:
- *   FADE_ORCHESTRATE_ROUTER   default http://127.0.0.1:18014
- *   FADE_ORCHESTRATE_PROVIDER default strata-flash
- *   FADE_ORCHESTRATE_THINK_LANE default deepseek   (plans + verifies)
+ *   FADE_ORCHESTRATE_PROVIDER default basalt      (the provider that declares every lane alias)
+ *   FADE_ORCHESTRATE_THINK_LANE default deepseek   (plans)
+ *   FADE_ORCHESTRATE_VERIFY_LANE default hy4-flash (verifies; never the code lane)
  *   FADE_ORCHESTRATE_CODE_LANE  default flash-next (codes)
  *   FADE_ORCHESTRATE_SWAP_CMD default /home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh
  */
@@ -15,7 +15,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { acquireLease, getResidency, releaseLease as releaseSupervisorLease, swapLeased } from "./supervisor.ts";
+import { acquireLease, getResidency, packToModelId, releaseLease as releaseSupervisorLease, swapLeased } from "./supervisor.ts";
 
 const execC = promisify(exec);
 
@@ -27,9 +27,46 @@ export const ROUTER = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:1
  *  `setModel` there cannot resolve and every lane move dies at the registry lookup. Measured
  *  2026-11-25: the verdict-lane move was inert until this default was corrected. */
 export const PROVIDER = process.env.FADE_ORCHESTRATE_PROVIDER ?? "basalt";
-export const THINK_LANE = process.env.FADE_ORCHESTRATE_THINK_LANE ?? "deepseek";
-export const CODE_LANE = process.env.FADE_ORCHESTRATE_CODE_LANE ?? "flash-next";
-export const THINKING: Record<string, "high" | "low"> = { [THINK_LANE]: "high", [CODE_LANE]: "low" };
+/** Every lane env the plugin refused, in the words the operator reads. Flushed once per session at
+ *  `session_start`; empty when the env is honest. */
+export const ENV_NOTICES: string[] = [];
+
+/** A lane env is honored only when it does not collapse the loop. `FADE_ORCHESTRATE_THINK_LANE=
+ *  flash-next` (the value `~/.config/inference-keys.env` still exports on this box) makes the think
+ *  lane the code lane: `loadLane` short-circuits on the resident pack, no swap is issued, and
+ *  planning runs on the coder's 52 GiB pack with `THINKING` collapsed to `low` — measured 2026-11-26
+ *  on run 20261126T063911Z-m5or, `planning_done` and `coding_done` both on flash-next. The refused
+ *  value is named once, and the documented lane wins. */
+const resolveLane = (name: string, label: string, fallback: string, forbidden: string[], forbiddenLabel: string): string => {
+	const want = (process.env[name] ?? "").trim();
+	if (want === "") return fallback;
+	if (!forbidden.includes(want)) return want;
+	const next = forbidden.includes(fallback) ? want : fallback;
+	ENV_NOTICES.push(`${name}="${want}" is ignored: that is the ${forbiddenLabel} lane, and a ${label} lane equal to it swaps nothing — ${label} runs on ${next}.`);
+	return next;
+};
+
+/** The coder's pack. Read first: the other two lanes are judged against it. Naming a documented
+ *  thinking pack here is the box poison MIRRORED (`FADE_ORCHESTRATE_CODE_LANE=deepseek`): every
+ *  lane collapses to one pack, `loadLane` short-circuits on the resident pack, and no swap is ever
+ *  issued. The coder stays on its documented pack and the refusal is named. */
+const CODE_WANT = (process.env.FADE_ORCHESTRATE_CODE_LANE ?? "").trim() || "flash-next";
+export const CODE_LANE = (() => {
+	if (CODE_WANT === "deepseek" || CODE_WANT === "hy4-flash") {
+		ENV_NOTICES.push(`FADE_ORCHESTRATE_CODE_LANE="${CODE_WANT}" is ignored: that is a thinking pack, and naming it the code lane collapses every lane to one swap-free coder — code runs on flash-next.`);
+		return "flash-next";
+	}
+	return CODE_WANT;
+})();
+/** The planning lane: deepseek, never the coder's pack. */
+export const THINK_LANE = resolveLane("FADE_ORCHESTRATE_THINK_LANE", "planning", "deepseek", [CODE_LANE], CODE_LANE);
+/** The advisor lane: hy4-flash, never the coder's pack. Equal to the PLANNING pack is honored:
+ *  one thinking pack for plan-and-verify is a lane-economy choice (the box that runs DS4 for both
+ *  pays one swap family, not two), not the one-pack collapse the coder rule refuses. */
+export const VERIFY_LANE = resolveLane("FADE_ORCHESTRATE_VERIFY_LANE", "verification", "hy4-flash", [CODE_LANE], CODE_LANE);
+/** The packs that verify, i.e. the read-only lanes. */
+export const isThinkingLane = (lane: string): boolean => lane === THINK_LANE || lane === VERIFY_LANE;
+export const THINKING: Record<string, "high" | "low"> = { [THINK_LANE]: "high", [VERIFY_LANE]: "high", [CODE_LANE]: "low" };
 
 export const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -108,9 +145,9 @@ export async function laneHealth(): Promise<RouterHealth | undefined> {
  *  * `no model` — `loaded: true` while `model` names nothing: a context that claims to be loaded
  *    and cannot say what it loaded is not serving;
  *  * `zero VRAM` — reported free VRAM at or under zero: the CUDA context is dead (the recorded
- *    half-dead shape) and no pack lands there. A *low* reading is NOT a refusal by default — see
- *    `VRAM_MIN_FREE_MIB`: a controlled swap unloads the resident pack FIRST, so the free VRAM
- *    measured while the old pack is still resident is never the room the next pack gets;
+ *    half-dead shape) and no pack lands there. A *low* positive reading is never a refusal: the
+ *    swap unloads the resident pack FIRST, so free VRAM with the old pack still mapped is not
+ *    the room the next pack gets. There is no pre-unload VRAM floor.
  *  * `swap in flight` — `loading: true` at the END of the settle window. The ping-pong this
  *    gate exists to stop (journal: `swap: flash-next ready in 16.4 s`, then `(1 waiting)`,
  *    `(3 waiting)`) is exactly a second load queued behind a running one.
@@ -119,14 +156,6 @@ export interface ServeVerdict {
 	serve: boolean;
 	reason: string;
 }
-
-/** Reported free VRAM below this is not a context a pack can land in. The default is ZERO — and
- *  zero is the honest default: `POST /v1/load` UNLOADS the resident pack before loading the next
- *  one, so the free VRAM measured with flash-next (52.2 GiB) still resident says nothing about
- *  the room the DS4 tier will get after the unload. A floor measured pre-unload refuses every
- *  controlled hand-back on a box that has the room. The lever stays: set
- *  `FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB` to arm a floor for a router that keeps old contexts. */
-export const VRAM_MIN_FREE_MIB = Number(process.env.FADE_ORCHESTRATE_VRAM_MIN_FREE_MIB ?? 0);
 
 /** Every state the health line reports (`status` and `state` can both ride): a hostile one is a
  *  hostile line, so a healthy `status` never masks a `state` of `cuda_fatal`. */
@@ -156,7 +185,6 @@ export function serveVerdict(h: RouterHealth | undefined): ServeVerdict {
 	}
 	const free = vramFreeMib(h);
 	if (free !== undefined && free <= 0) return { serve: false, reason: `zero free VRAM (${free} MiB): the CUDA context is dead — the recorded half-dead shape` };
-	if (free !== undefined && free < VRAM_MIN_FREE_MIB) return { serve: false, reason: `free VRAM ${free} MiB is under the ${VRAM_MIN_FREE_MIB} MiB pack floor: no lane lands here` };
 	const model = typeof h.model === "string" ? h.model.trim() : "";
 	if (h.loaded === true || h.loaded === "true") {
 		if (model === "") return { serve: false, reason: "health claims a loaded context that names no model: nothing is serving" };
@@ -455,6 +483,60 @@ export const LANE_WAIT_MS = Number(process.env.FADE_ORCHESTRATE_LANE_WAIT_MS ?? 
 export const LANE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_LANE_POLL_MS ?? 2_000);
 export const LANE_LEASE_TTL_SEC = Number(process.env.FADE_ORCHESTRATE_LANE_LEASE_TTL_SEC ?? 1_800);
 
+/** The start preflight's budget: a cold `deepseek` load measures 13-25 s and the daemon's own
+ *  readiness window is far longer, so the proof waits and names the state — it never kills a load. */
+export const START_PROOF_WAIT_MS = Number(process.env.FADE_ORCHESTRATE_START_PROOF_WAIT_MS ?? 240_000);
+
+export interface LaneProof {
+	ok: boolean;
+	/** The daemon's `lane_state` at the end of the window; `unknown` when it never answered. */
+	state: string;
+	pack?: string;
+	/** The id the ROUTER serves, from `/v1/models`; `undefined` when it answers nothing. */
+	served_id?: string;
+	n_ctx?: number;
+	waited_s: number;
+}
+
+/** Admitted is not loaded, and `RESIDENT` proves only that SOME model answered the readiness probe.
+ *  The proof is BOTH: the daemon names `target` as the resident pack AND the router serves `target`
+ *  as an id. A daemon that never answers, and a router that serves another id, are failures — a
+ *  census error is never a skip, because a session pinned to an id the lane does not serve answers
+ *  `404 The model '<id>' does not exist`. */
+export async function proveResident(target: string, opts: { sessionId?: string; waitMs?: number; pollMs?: number } = {}): Promise<LaneProof> {
+	const sid = opts.sessionId ?? "fade-orchestrator";
+	const waitMs = opts.waitMs ?? LANE_WAIT_MS;
+	const pollMs = opts.pollMs ?? LANE_POLL_MS;
+	const t0 = Date.now();
+	let state = "unknown";
+	let pack: string | undefined;
+	for (;;) {
+		const now = await supervisorResident(target, sid);
+		state = now?.state ?? state;
+		pack = now?.pack ?? pack;
+		if (now?.resident) break;
+		if (Date.now() - t0 >= waitMs) break;
+		const { promise: tick, resolve: tickDone } = Promise.withResolvers<void>();
+		setTimeout(tickDone, pollMs);
+		await tick;
+	}
+	const idn = await servedIdentity();
+	const waited_s = (Date.now() - t0) / 1000;
+	return { ok: state === "RESIDENT" && pack === target && idn?.id === target, state, pack, served_id: idn?.id, n_ctx: idn?.n_ctx, waited_s };
+}
+
+/** The screen's model pin, or `undefined` = leave the screen alone. `residentPack` is the daemon's
+ *  `active_pack`; `owed` is the lane this session's work is owed — `pending?.lane ?? run.lane` for a
+ *  live run, the recorded verify lane for a plain session. A swap drains for tens of seconds, and
+ *  pinning the pack that is still resident in that window is the measured defect: the run asks for
+ *  `deepseek`, the sync lands `flash-next`, and the first completion never names the guest. */
+export function laneSyncTarget(residentPack: string | undefined, owed: string | undefined): string | undefined {
+	if (residentPack === undefined) return undefined;
+	const target = packToModelId(residentPack);
+	if (owed !== undefined && packToModelId(owed) !== target) return undefined;
+	return target;
+}
+
 const statusOf = (m: Record<string, unknown>): string => {
 	const s = m.status;
 	return typeof s === "object" && s !== null ? String((s as { value?: string }).value ?? "") : String(s ?? "");
@@ -548,31 +630,22 @@ export async function moveLane(target: string, opts: { sessionId?: string; waitM
 	};
 
 	// Admitted is not loaded: the job tears the old pack down, spawns, and the daemon's own
-	// readiness window is 900 s. Poll the daemon, then prove the id from the router.
-	let state = sup?.state ?? "unknown";
-	let pack = sup?.pack;
-	while (Date.now() - t0 < waitMs) {
-		const now = await supervisorResident(target, sid);
-		state = now?.state ?? state;
-		pack = now?.pack ?? pack;
-		if (now?.resident) break;
-		await new Promise((res) => setTimeout(res, pollMs));
-	}
-	const idn = await servedIdentity();
-	const waited_s = (Date.now() - t0) / 1000;
+	// readiness window is 900 s. `proveResident` polls the daemon, then proves the id from the
+	// router — one proof implementation, shared with the start preflight.
+	const proof = await proveResident(target, { sessionId: sid, waitMs, pollMs });
 	const returned = await handBack();
-	if (state === "RESIDENT" && pack === target && idn?.id === target) {
+	if (proof.ok) {
 		return {
 			ok: true,
-			detail: `${target} resident in ${waited_s.toFixed(1)}s; router id ${idn.id}${idn.n_ctx ? ` n_ctx ${idn.n_ctx}` : ""} — requests naming any other id answer 404 until the roles move${flipNote(flip)}`,
-			resident: pack, served_id: idn.id, n_ctx: idn.n_ctx, waited_s, flip,
+			detail: `${target} resident in ${proof.waited_s.toFixed(1)}s; router id ${proof.served_id}${proof.n_ctx ? ` n_ctx ${proof.n_ctx}` : ""} — requests naming any other id answer 404 until the roles move${flipNote(flip)}`,
+			resident: proof.pack, served_id: proof.served_id, n_ctx: proof.n_ctx, waited_s: proof.waited_s, flip,
 			...(r.minted ? { lease_returned: returned } : {}),
 		};
 	}
 	return {
 		ok: false,
-		detail: `${target} not proven resident after ${waited_s.toFixed(1)}s: daemon state ${state} pack ${pack ?? "none"}, router id ${idn?.id ?? "nothing"} — hand the lane back with \`/lane flash-next\`${flipNote(flip)}`,
-		resident: pack, served_id: idn?.id, n_ctx: idn?.n_ctx, waited_s, flip,
+		detail: `${target} not proven resident after ${proof.waited_s.toFixed(1)}s: daemon state ${proof.state} pack ${proof.pack ?? "none"}, router id ${proof.served_id ?? "nothing"} — hand the lane back with \`/lane flash-next\`${flipNote(flip)}`,
+		resident: proof.pack, served_id: proof.served_id, n_ctx: proof.n_ctx, waited_s: proof.waited_s, flip,
 		...(r.minted ? { lease_returned: returned } : {}),
 	};
 }
@@ -804,8 +877,8 @@ export const flipNote = (f: FlipState): string => (flipGuarded(f) ? ` — FLIP G
 /** The verification trigger for NORMAL sessions. `/orchestrate` moves the lane at phase
  *  boundaries; a plain session has no phase contract, so the trigger is the act of asking for a
  *  verdict. The op names are the loop's own: `report` settles a task on its test log and `review`
- *  opens a reviewer round, and both are answered by the thinking lane; `intake` is coding work
- *  starting, and `abort` ends the task. `off` disables the whole mechanism by env. */
+ *  opens a reviewer round, and both are answered by the advisor lane (`VERIFY_LANE`); `intake` is
+ *  coding work starting, and `abort` ends the task. `off` disables the whole mechanism by env. */
 export const LANE_ON_VERIFY = process.env.FADE_ORCHESTRATE_LANE_ON_VERIFY !== "off";
 export const VERIFY_IN_OPS = (process.env.FADE_ORCHESTRATE_VERIFY_IN_OPS ?? "report,review").split(",").map((s) => s.trim()).filter(Boolean);
 export const VERIFY_OUT_OPS = (process.env.FADE_ORCHESTRATE_VERIFY_OUT_OPS ?? "intake,abort").split(",").map((s) => s.trim()).filter(Boolean);
@@ -814,19 +887,19 @@ export const VERIFY_AGENTS = (process.env.FADE_ORCHESTRATE_VERIFY_AGENTS ?? "rev
 export type VerifyTrigger = { lane: string; reason: string } | { none: string };
 
 /**
- * Pure decision: does THIS tool call mean verification has started (move to the thinking lane)
+ * Pure decision: does THIS tool call mean verification has started (move to the advisor lane)
  * or that coding resumed (hand the code lane back)? No I/O, no lane touched — the caller acts.
  *
  * `task` is read for the agent kind on every shape the host sends: a top-level `agent: "reviewer"`,
  * a flat `items: [{ agent }]`, and the phased form `list: [{ phase, items: [{ agent }] }]` — a
  * delegated batch names the kind per item, one phase deep.
  */
-export function verifyTrigger(toolName: string | undefined, input: Record<string, unknown> | undefined, think = THINK_LANE, code = CODE_LANE): VerifyTrigger {
+export function verifyTrigger(toolName: string | undefined, input: Record<string, unknown> | undefined, verify = VERIFY_LANE, code = CODE_LANE): VerifyTrigger {
 	if (!LANE_ON_VERIFY) return { none: "FADE_ORCHESTRATE_LANE_ON_VERIFY=off" };
 	const name = toolName ?? "";
 	const op = typeof input?.op === "string" ? input.op : "";
 	if (name === "frontier") {
-		if (VERIFY_IN_OPS.includes(op)) return { lane: think, reason: `frontier op=${op} asks for the verdict — the thinking lane answers it` };
+		if (VERIFY_IN_OPS.includes(op)) return { lane: verify, reason: `frontier op=${op} asks for the verdict — the advisor lane answers it` };
 		if (VERIFY_OUT_OPS.includes(op)) return { lane: code, reason: `frontier op=${op} is coding work resuming` };
 		return { none: `frontier op=${op || "?"} is not a verdict act` };
 	}
@@ -855,7 +928,7 @@ export function verifyTrigger(toolName: string | undefined, input: Record<string
 			}
 		}
 		const hit = [...kinds].filter((k) => VERIFY_AGENTS.includes(k));
-		if (hit.length) return { lane: think, reason: `task carries ${hit.join(", ")} — verification runs on the thinking lane` };
+		if (hit.length) return { lane: verify, reason: `task carries ${hit.join(", ")} — verification runs on the advisor lane` };
 		return { none: `task names ${[...kinds].join(", ") || "no agent kind"}: not a verification agent` };
 	}
 	return { none: `${name || "tool"} is not a verdict surface` };
