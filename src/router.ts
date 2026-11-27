@@ -412,8 +412,9 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 			// here (dev_build_no_evict), and a lane a peer pair owns is `lease_held` naming
 			// the holder, which is the refusal a review turn must surface, never swap past.
 			// Minting the lease IS the swap on the supervisor plane, so this swap is the loop's own.
-			markOwnSwap(resident, lane);
+			markOwnSwap(lane);
 			const lease = await acquireLease(lane, opts.mintLease.ttlSec, sid);
+			clearOwnSwap(lane); // the mint blocks through the swap; whatever the polls saw is already booked
 			token = lease.ok ? lease.token : undefined;
 			minted = !!token;
 			if (!token) {
@@ -457,8 +458,9 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 		const jobPath = join(dir, "job.json");
 		await writeFile(jobPath, JSON.stringify({ schema: "farol.job/1", engagement: "ENG-LOCAL-GPU", run: `omp-${Date.now()}`, task: "lane-swap", data_class: "internal", model: lane, swap: true, ...(opts.lease ? { lease: true } : {}) }));
 		// The ctl byte is issued by this process, so the swap it causes is not churn.
-		markOwnSwap(resident, lane);
+		markOwnSwap(lane);
 		const { code, stdout, stderr } = await runSwap(`${SWAP_CMD} '${jobPath}'`);
+		clearOwnSwap(lane); // the ctl byte blocks through the swap; an unobserved swap leaves no mark
 		const final = stdout.trim().split("\n").pop() ?? "";
 		const text = `${stdout}${stderr}`.replace(/\s+/g, " ").trim();
 		const ok = code === 0 && final === lane;
@@ -476,13 +478,14 @@ export async function releaseLease(lane: string): Promise<{ ok: boolean; detail:
 	try {
 		// The hand-back lands the default lane: the loop's own swap too, marked so the release is
 		// never read as a client flipping the box.
-		markOwnSwap(await residentLane(), lane);
+		markOwnSwap(lane);
 		const r = await fetch(`${ROUTER}/v1/load`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ model: lane, lease: false }),
 			signal: AbortSignal.timeout(10_000),
 		});
+		clearOwnSwap(lane);
 		const text = await r.text();
 		return { ok: r.ok, detail: `http ${r.status} ${text.slice(0, 200)}` };
 	} catch (e) {
@@ -968,18 +971,26 @@ export function switchPlan(resident: string | undefined, lane: string): SwitchPl
 	if (resident === lane) return { gate: false, load: false, reason: `already resident: ${lane}; no load to gate` };
 	return { gate: true, load: true, reason: `${lane} is not resident${resident ? ` (resident: ${resident})` : " (the router names no loaded entry)"}: gate, then swap` };
 }
-/** The swaps THIS process issued through `loadLane`/`releaseLease`, keyed `from->to` and consumed
- *  once each. The churn the guard counts is the churn the router does for OTHER clients (block 19
- *  of the gate rig names the class: the host's title generator, a memory completion, resolved onto
- *  another lane). The loop's own swaps are not that churn, and counting them let the guard refuse
- *  the loop's own next load: on a 2-core runner a verification boundary's four swaps reach the
- *  shipped `FLIP_MIN_SWAPS = 2` inside the window, and the act that was paying them came back
- *  `no swap issued — FLIP GUARD: 4 swaps in 60s` with zero pins and zero pages (CI run
- *  45957020140). Marks expire with the window, and a load refused before it issues is never marked,
- *  so an external flip of the same pair is recorded the moment the loop is not the one making it. */
-const ownSwaps = new Map<string, number>();
-function markOwnSwap(from: string | undefined, to: string): void {
-	ownSwaps.set(`${from ?? "?"}->${to}`, Date.now());
+/** The lanes THIS process asked the router to load, through `loadLane`/`releaseLease`, each
+ *  consumed once by the recorder and cleared when the issuing call returns. The churn the guard
+ *  counts is the churn the router does for OTHER clients (block 19 of the gate rig names the class:
+ *  the host's title generator, a memory completion, resolved onto another lane). The loop's own
+ *  swaps are not that churn, and counting them let the guard refuse the loop's own next load: on a
+ *  2-core runner a verification boundary's four swaps reach the shipped `FLIP_MIN_SWAPS = 2` inside
+ *  the window, and the act paying them came back `no swap issued — FLIP GUARD: 4 swaps in 60s` with
+ *  zero pins and zero pages (CI runs 45957020140, 45958633125). The mark keys the TARGET lane, not
+ *  the `from->to` pair: the recorder's `from` is what the router publishes mid-swap, and a pair mark
+ *  missed when the loop's own resident read landed inside the swap window — `?->lane` against
+ *  `flash-next->lane` — which is what kept the CI runner red after the pair mark shipped. Marks
+ *  expire with the window and die with the issuing call, so a swap the polls never saw leaves no
+ *  residue: an external flip onto the same lane is recorded the moment the loop is not the one
+ *  making it. */
+const ownSwapTo = new Map<string, number>();
+function markOwnSwap(to: string): void {
+	ownSwapTo.set(to, Date.now());
+}
+function clearOwnSwap(to: string): void {
+	ownSwapTo.delete(to);
 }
 
 /**
@@ -992,13 +1003,13 @@ export async function observeSwaps(windowMs = FLIP_WINDOW_MS): Promise<FlipState
 	const h = await laneHealth();
 	const s = h?.swap;
 	const now = Date.now();
-	for (const [k, v] of ownSwaps) if (v < now - windowMs) ownSwaps.delete(k);
+	for (const [k, v] of ownSwapTo) if (v < now - windowMs) ownSwapTo.delete(k);
 	if (s && s.to) {
 		const sig = `${s.from ?? "?"}->${s.to}`;
 		if (sig !== lastSwapSig) {
-			const at = ownSwaps.get(sig);
-			if (at !== undefined) ownSwaps.delete(sig); // the loop's own swap: paid, never churn
-			else swapLog.push({ from: s.from ?? "?", to: s.to, at: Date.now(), waiting: finite(s.waiting) });
+			if (ownSwapTo.delete(s.to)) {
+				// the swap this process asked for, landing: paid, and never churn
+			} else swapLog.push({ from: s.from ?? "?", to: s.to, at: Date.now(), waiting: finite(s.waiting) });
 		}
 		lastSwapSig = sig;
 	} else {

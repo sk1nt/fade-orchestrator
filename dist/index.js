@@ -419,8 +419,9 @@ async function loadLane(lane, opts = {}) {
           flip
         };
       }
-      markOwnSwap(resident, lane);
+      markOwnSwap(lane);
       const lease = await acquireLease(lane, opts.mintLease.ttlSec, sid);
+      clearOwnSwap(lane);
       token = lease.ok ? lease.token : void 0;
       minted = !!token;
       if (!token) {
@@ -455,8 +456,9 @@ async function loadLane(lane, opts = {}) {
     const dir = await mkdtemp(join(tmpdir(), "fade-swap-"));
     const jobPath = join(dir, "job.json");
     await writeFile(jobPath, JSON.stringify({ schema: "farol.job/1", engagement: "ENG-LOCAL-GPU", run: `omp-${Date.now()}`, task: "lane-swap", data_class: "internal", model: lane, swap: true, ...opts.lease ? { lease: true } : {} }));
-    markOwnSwap(resident, lane);
+    markOwnSwap(lane);
     const { code, stdout, stderr } = await runSwap(`${SWAP_CMD} '${jobPath}'`);
+    clearOwnSwap(lane);
     const final = stdout.trim().split("\n").pop() ?? "";
     const text = `${stdout}${stderr}`.replace(/\s+/g, " ").trim();
     const ok = code === 0 && final === lane;
@@ -708,21 +710,23 @@ function switchPlan(resident, lane) {
   if (resident === lane) return { gate: false, load: false, reason: `already resident: ${lane}; no load to gate` };
   return { gate: true, load: true, reason: `${lane} is not resident${resident ? ` (resident: ${resident})` : " (the router names no loaded entry)"}: gate, then swap` };
 }
-var ownSwaps = /* @__PURE__ */ new Map();
-function markOwnSwap(from, to) {
-  ownSwaps.set(`${from ?? "?"}->${to}`, Date.now());
+var ownSwapTo = /* @__PURE__ */ new Map();
+function markOwnSwap(to) {
+  ownSwapTo.set(to, Date.now());
+}
+function clearOwnSwap(to) {
+  ownSwapTo.delete(to);
 }
 async function observeSwaps(windowMs = FLIP_WINDOW_MS) {
   const h = await laneHealth();
   const s = h?.swap;
   const now = Date.now();
-  for (const [k, v] of ownSwaps) if (v < now - windowMs) ownSwaps.delete(k);
+  for (const [k, v] of ownSwapTo) if (v < now - windowMs) ownSwapTo.delete(k);
   if (s && s.to) {
     const sig = `${s.from ?? "?"}->${s.to}`;
     if (sig !== lastSwapSig) {
-      const at = ownSwaps.get(sig);
-      if (at !== void 0) ownSwaps.delete(sig);
-      else swapLog.push({ from: s.from ?? "?", to: s.to, at: Date.now(), waiting: finite(s.waiting) });
+      if (ownSwapTo.delete(s.to)) {
+      } else swapLog.push({ from: s.from ?? "?", to: s.to, at: Date.now(), waiting: finite(s.waiting) });
     }
     lastSwapSig = sig;
   } else {
