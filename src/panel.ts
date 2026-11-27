@@ -239,6 +239,16 @@ function headerBlock(d: ScreenData, theme: PanelTheme | undefined, width: number
 	}
 	const laneRow = d.lanes.map((l) => `${l.model}=${l.role}${l.resident ? " ◆resident" : ""}`).join(" · ");
 	lines.push(fit(`lanes: ${laneRow}`, width));
+	// The switch row, and the reason the screen exists during a swap: the loop's pack switch costs
+	// 13-25 s, and this is where the operator reads what that load is doing. `d.swap` is set by the
+	// wiring layer for exactly as long as a load is in flight, so the row never advertises a swap
+	// that already landed, and every number under it is the last measured one — the screen says so
+	// instead of going blank.
+	if (d.swap) {
+		const pct = d.swap.percent != null ? ` ${Math.round(d.swap.percent)}%` : "";
+		const text = `switching ${d.swap.from} → ${d.swap.to}${pct} — HOLDING PAGE: the pack is loading, and the loop's completion waits it out (no client timeout, no 404). The numbers below are the last measured.`;
+		lines.push(theme ? theme.fg("warning", fit(text, width)) : fit(text, width));
+	}
 	if ((run.protocol_retries ?? 0) > 0) {
 		lines.push(fit(`protocol: ${run.protocol_retries} turn(s) ended without fade_phase · consecutive stalls ${run.stall_count ?? 0}/3${run.synthesized ? ` · auto-synthesized ${run.synthesized.phase} at round ${run.synthesized.round}` : ""}`, width));
 	}
@@ -378,10 +388,51 @@ export function isClose(data: string): boolean {
 	return false;
 }
 
-/** Minimal view of the host's TUI: the panel needs the height and the render kick, nothing else. */
+/**
+ * Minimal view of the host's TUI: the panel needs the height and the render kick, nothing else.
+ *
+ * `terminal` is OPTIONAL because the host does not always have one to hand when it renders an
+ * extension component. Measured 2026-11-26 on the live box: the Alt+F overlay of a session that
+ * opened the panel during extension load threw `undefined is not an object (evaluating
+ * 'this.tui.terminal.rows')` out of `getHeight`, and the host's per-frame catch painted
+ * `extension render failed: …` in place of the screen — every frame, so the overlay opened nothing
+ * and the keystroke looked dead. The host's loading-phase surface is exactly this shape: a stub
+ * whose members answer `undefined` and whose action methods throw on the call.
+ */
 export interface PanelTui {
-	terminal: { rows: number; columns: number };
+	terminal?: { rows: number; columns: number };
 	requestRender(force?: boolean): void;
+}
+
+/** The box the panel draws when the host reports no size: the panel's own default. */
+export const PANEL_FALLBACK_ROWS = 24;
+export const PANEL_FALLBACK_COLUMNS = 120;
+
+/**
+ * The ONE wrapper every terminal read goes through: a TUI-shaped object, and the size it is
+ * willing to disclose. A missing `terminal`, a stub that answers `undefined`, a detached TUI that
+ * answers `0`, and a proxy that THROWS on the property GET are all the same non-answer, and all
+ * get the fallback — the throwing case is why the reads sit inside `try`, the same guard the
+ * wiring layer carries for the host's loading-phase action methods.
+ *
+ * Exported because it is the contract the panel's height and width obey, and the rig drives each
+ * non-answer shape directly.
+ */
+export function terminalSize(tui: PanelTui | undefined): { rows: number; columns: number } {
+	let rows: unknown;
+	let columns: unknown;
+	try {
+		const t = tui?.terminal as { rows?: unknown; columns?: unknown } | undefined;
+		rows = t?.rows;
+		columns = t?.columns;
+	} catch {
+		rows = undefined;
+		columns = undefined;
+	}
+	// A host-reported size is only a size when it is a positive finite number: `0`, `null`, `"40"`
+	// and a stub's `undefined` all mean "not measured", and the panel draws its own box.
+	const size = (v: unknown, fallback: number): number => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback);
+	return { rows: size(rows, PANEL_FALLBACK_ROWS), columns: size(columns, PANEL_FALLBACK_COLUMNS) };
 }
 
 /**
@@ -436,11 +487,16 @@ export class PanelComponent {
 	}
 
 	getHeight(): number {
-		return Math.max(8, (this.tui.terminal.rows || 24) - 2);
+		// The wrapper, never a raw `this.tui.terminal.rows`. The host calls this inside its own
+		// render pass and catches the throw as `extension render failed: …`, so a size the host
+		// cannot supply has to be a fallback: a throw here is a panel that never paints.
+		return Math.max(8, terminalSize(this.tui).rows - 2);
 	}
 
 	render(width: number): string[] {
-		const r = panelLines(this.data, width, { sel: this.sel }, this.theme);
+		// The width arrives from the host's overlay geometry; clamp it to the columns the wrapper
+		// reports, so a TUI that reports none still draws the panel's own 120-column box.
+		const r = panelLines(this.data, Math.min(width, terminalSize(this.tui).columns), { sel: this.sel }, this.theme);
 		this.body = r.lines;
 		this.taskRows = r.taskRows;
 		const h = this.getHeight();
@@ -500,7 +556,7 @@ export class PanelComponent {
  * `PanelTui`/`PanelTheme` are the two members the panel actually uses, so the tests drive it
  * without a terminal.
  */
-export async function openPanel(ctx: ExtensionContext, provider: () => Promise<ScreenData>, onAction?: (a: PanelAction) => void, headless = process.env.FADE_ORCHESTRATE_HEADLESS === "1"): Promise<void> {
+export async function openPanel(ctx: ExtensionContext, provider: () => Promise<ScreenData>, onAction?: (a: PanelAction) => void, headless = process.env.FADE_ORCHESTRATE_HEADLESS === "1", holding?: () => ScreenData): Promise<void> {
 	// The first read is the router plus the run's ledgers. A provider that never answers while
 	// `panelOpen` is set is the second overlay trap: `ctx.ui.custom` is never mounted, so no key —
 	// not even Ctrl+C — can leave. `openPanelGuarded`'s `finally` clears the flag on this return.
@@ -511,8 +567,21 @@ export async function openPanel(ctx: ExtensionContext, provider: () => Promise<S
 	// loop drain around a provider that never answers — the test rig dies with the promise
 	// pending and the operator's keystroke hangs with it. The timer is cleared the moment the
 	// race ends.
-	const initial = await Promise.race([provider(), firstTimeout]);
+	let initial = await Promise.race([provider(), firstTimeout]);
 	clearTimeout(firstTimer);
+	// THE HOLDING PAGE, built by the wiring layer from the SAME state the status row paints its
+	// switch from. The measured case for a slow first read is a phase boundary's swap: the panel's
+	// first read IS the router, and during a 13-25 s pack load that process is being replaced while
+	// the two ledgers append. The operator presses the chord at exactly that moment — the moment the
+	// screen matters most. `holding` is the cheap read (the run's own state, the metrics snapshot
+	// the tick already paid for, the swap's percent: no router fetch, no ledger parse), so the
+	// overlay MOUNTS, and the page says what it is. The component's refresh tick replaces it with
+	// the live screen the moment the read answers. With no `holding` to fall back on, the refusal
+	// stays named.
+	if (initial === undefined && holding) {
+		const page = holding();
+		initial = { ...page, missing: [...arr(page.missing), `the live read did not answer in ${firstFetchMs / 1000}s — this page is the state in hand${page.swap ? `, and ${page.swap.from} → ${page.swap.to} is loading` : ""}; the screen replaces itself when the read answers`] };
+	}
 	if (initial === undefined) {
 		ctx.ui.notify(`panel: the first read did not answer in ${firstFetchMs / 1000}s — the screen did not open; the keystroke retries`, "warning");
 		return;

@@ -257,6 +257,13 @@ process.env.FADE_ORCHESTRATE_VERIFY_LANE = "hy4-flash";
 // rig's blocks set `resident` by hand before a start, so the proof lands on its first poll; the
 // short ceiling is a fuse, never a lever: a proof that misses is a rig bug, named by detail.
 process.env.FADE_ORCHESTRATE_START_PROOF_WAIT_MS = "800";
+// The serve-hold the SWITCH runs (the boundary's holding page, the same wrapper
+// `before_agent_start` uses for the completion). Its ceiling in production is the daemon's
+// readiness window, so the rig pins it in milliseconds: a hold that never ends is a rig defect
+// named in 1.5 s, never a suite that sits for 15 minutes. The keep-alive clock is 50 ms so a page
+// is observable inside one block.
+process.env.FADE_ORCHESTRATE_SERVE_WAIT_MS = "1500";
+process.env.FADE_ORCHESTRATE_KEEPALIVE_MS = "50";
 
 // The idle gate and the THRASH BREAKER are configuration, so the rig runs their windows in
 // milliseconds (the convention `test/pty_rig.mjs` carries for the metrics tick). They MUST be set
@@ -703,9 +710,24 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
 	await commands.orchestrate.handler("verify", ctx);
 	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
+	await new Promise((r) => setTimeout(r, 120)); // the ctl child (spawn + POST) lands before the assertions read the pin
 	// The boundary pays the swap: `setModel` lands first, then the ctl stub (a child process:
 	// spawn + POST) completes and `applyToolPolicy` strips the writers. 150 ms lost that race.
 	await new Promise((r) => setTimeout(r, 600));
+	// The boundary pays the swap IN ONE ACT: the ctl stub (a child process: spawn + POST) lands and
+	// `setModel` + `setThinkingLevel` + `applyToolPolicy` + the briefing follow in the same
+	// generation, with NO residency read in front of them. The rig dials a 150 ms transit so the
+	// window is observable: the pin must land while the stub router STILL lists the code pack.
+	// Prove-then-pin — the shape this file documented until 2026-11-26 — is the halt's other half:
+	// it left the pin and the briefing naming the PREVIOUS pack for the whole load, and the next
+	// completion answered `404 The model 'flash-next' does not exist`.
+	const modelBase = modelCalls.length;
+	const sentBase = sent.length;
+	const thinkBase = thinkingLevels.length;
+	const pinsBase = pinsAt.length;
+	swapDelayMs = 150;
+	await new Promise((r) => setTimeout(r, 900));
+	ok("the boundary's setModel names the verifier lane", pin13?.id === "hy4-flash", JSON.stringify(pinsAt.slice(pinsBase)));
 	ok("the verifier lane's active set carries no writers (delegation stays)", !activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
 	const blocked = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "x", input: {} }, ctx);
 	ok("a verifier edit is BLOCKED with the rule named", blocked?.block === true && /read-only/.test(blocked.reason ?? ""), JSON.stringify(blocked));
@@ -909,7 +931,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 // while the churn runs. The router module is imported fresh here so its swap log is this block's
 // own.
 {
-  const rt = await import("../.test-build/router.mjs");
+  const rt = await import("../.test-build/router.mjs?case=gate-rt");
   const l19 = loads();
 
   // A quiet lane reports no flip.
@@ -1642,7 +1664,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await commands.orchestrate.handler("stop --clear", ctx); // leave no run: the no-run path
   await settleLoads(stopBase, 1); // a stop hands the lane back; that load lands before the cases
   delete process.env.PI_SESSION_FILE;
-  const rt = await import("../.test-build/router.mjs");
+  const rt = await import("../.test-build/router.mjs?case=gate-flip");
   rt.resetFlipLedger();
 
   // (a) the thinking lane is the session's model: one setModel + one load, no message sent

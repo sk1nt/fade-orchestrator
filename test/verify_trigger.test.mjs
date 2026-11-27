@@ -7,7 +7,7 @@
  * lane_command.test.mjs (resident → zero bytes, breaker → zero bytes, admitted → acquire/swap/
  * release with the served id proven).
  */
-import "./env.mjs";
+import "./env.mjs?suite=verify_trigger";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 

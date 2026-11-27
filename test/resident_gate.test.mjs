@@ -15,7 +15,7 @@
  * are the hits it recorded — which bytes arrived, under which build header, with which token, and
  * which bytes never arrived.
  */
-import "./env.mjs";
+import "./env.mjs?suite=resident_gate";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

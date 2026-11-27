@@ -14,20 +14,16 @@
  *     pack answering its own verdict act is a lane economy choice, not a collapse);
  *   - every thinking lane thinks at `high`, the coder at `low`.
  */
-import "./env.mjs";
+import { resetLaneEnv } from "./env.mjs?suite=lane_identity";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-const LANE_KEYS = [
-	"FADE_ORCHESTRATE_PROVIDER",
-	"FADE_ORCHESTRATE_THINK_LANE",
-	"FADE_ORCHESTRATE_CODE_LANE",
-	"FADE_ORCHESTRATE_VERIFY_LANE",
-];
-
-/** A fresh router module per env shape: the lanes resolve at IMPORT, so the import is the test. */
+/** A fresh router module per env shape: the lanes resolve at IMPORT, so the import is the test.
+ *  `resetLaneEnv()` is load-bearing HERE, not just at file top: every suite file evaluates
+ *  before any test body runs, so a rig's exported windows (`START_PROOF_WAIT_MS=600`) are in
+ *  the environment when this helper imports — and this suite asserts the production default. */
 const fresh = async (tag, env) => {
-	for (const k of LANE_KEYS) delete process.env[k];
+	resetLaneEnv();
 	Object.assign(process.env, env);
 	return await import(`../.test-build/router.mjs?case=${tag}`);
 };

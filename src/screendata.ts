@@ -18,7 +18,7 @@ import { fetchMetrics, tiersFromMetrics, type MetricsSnapshot } from "./livedata
 import { drafterRow, moeBalanceRows, moeRows } from "./moe.ts";
 import { classWarmth } from "./taskmoe.ts";
 import { ROUTER } from "./router.ts";
-import { modelLabel, type FlipBadge, type TierRow } from "./ui.ts";
+import { modelLabel, type FlipBadge, type SwapPill, type TierRow } from "./ui.ts";
 
 /** How many ledger rows the screen carries: enough for a sparkline and the last turns. */
 export const SCREEN_TURNS = 12;
@@ -67,6 +67,10 @@ export interface ScreenData {
 	/** The last verifier critique, verbatim. */
 	critique?: string;
 	flip?: FlipBadge;
+	/** The pack load in flight, as the row renders it. The header paints its holding-page row from
+	 *  this — the panel is where an operator reads a 13-25 s swap, and the numbers under that row
+	 *  are the last measured ones, which the row says out loud. */
+	swap?: SwapPill;
 	/** Who holds the router's lane-switching right now. The screen is where an operator looks after
 	 *  a start is refused, so the holder is named, not summarized. */
 	claim?: InstanceLock | null;
@@ -89,6 +93,8 @@ export interface ScreenSource {
 	turns?: TurnRecord[];
 	/** The flip guard's badge, as the wiring layer renders it. */
 	flip?: FlipBadge;
+	/** The load in flight, as the wiring layer reads it: `undefined` when nothing is loading. */
+	swap?: SwapPill;
 	/** The router claim as the wiring layer reads it: the holder, `null` for a free router, and
 	 *  `undefined` when the caller never looked — the row says so instead of guessing free. */
 	claim?: InstanceLock | null;
@@ -233,20 +239,22 @@ export function nameResidentRow(tiers: MetricRow[], metrics: MetricsSnapshot | u
 }
 
 /**
- * The whole screen, assembled. Every source is read once; the router request is the only network
- * call, and it is skipped when the caller already holds a snapshot. The two ledgers
- * (`swap_history.json`, the `metrics.jsonl` tail) are read ASYNC and TOGETHER — this runs on the
- * Alt+F keystroke and on the panel's 2 s refresh tick, and the old synchronous whole-file reads
- * there were the worst freeze in the product: the keystroke painted nothing while the append-only
- * ledger was parsed line by line.
+ * The whole screen from data the caller ALREADY holds — no await, no disk, no network.
+ *
+ * This is the half the HOLDING PAGE needs: a pack load runs 13-25 s, the panel's live read IS that
+ * router (whose process is being replaced for the window) plus two ledger parses, and the keystroke
+ * pressed mid-swap must answer with a screen, not a warning. `collectScreen` is this builder with
+ * the three fetched inputs put in first, so there is ONE body and no drift between the page and
+ * the live screen.
  */
-export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
+export function assembleScreen(src: ScreenSource): ScreenData {
 	const now = (src.now ?? (() => new Date()))();
-	const [metrics, swaps, turns] = await Promise.all([
-		src.metrics ?? fetchMetrics(),
-		src.swaps ?? readSwaps(src.runDir),
-		src.turns ?? readTurns(src.runDir, SCREEN_TURNS),
-	]);
+	// A caller that supplies no ledgers gets empty ones, and the screen NAMES them (`no swaps
+	// recorded`, `no turn telemetry`) rather than printing a zero — the page's own staleness row
+	// says the live read is still owed.
+	const metrics = src.metrics;
+	const swaps = src.swaps ?? [];
+	const turns = src.turns ?? [];
 	const moe = [
 		...moeRows([src.lanes.think, src.lanes.code], { configPath: src.moeConfigPath }),
 		// GPU placement: the serve config names each alias's `gpu` and reserves, so the row exists for
@@ -310,9 +318,28 @@ export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
 		gate: src.run.gate_last,
 		critique,
 		flip: src.flip,
+		// The load in flight rides through to the header's holding-page row.
+		swap: src.swap,
 			claim: src.claim ?? null,
 		missing,
 	};
+}
+
+/**
+ * The whole screen, assembled. Every source is read once; the router request is the only network
+ * call, and it is skipped when the caller already holds a snapshot. The two ledgers
+ * (`swap_history.json`, the `metrics.jsonl` tail) are read ASYNC and TOGETHER — this runs on the
+ * Alt+F keystroke and on the panel's 2 s refresh tick, and the old synchronous whole-file reads
+ * there were the worst freeze in the product: the keystroke painted nothing while the append-only
+ * ledger was parsed line by line.
+ */
+export async function collectScreen(src: ScreenSource): Promise<ScreenData> {
+	const [metrics, swaps, turns] = await Promise.all([
+		src.metrics ?? fetchMetrics(),
+		src.swaps ?? readSwaps(src.runDir),
+		src.turns ?? readTurns(src.runDir, SCREEN_TURNS),
+	]);
+	return assembleScreen({ ...src, metrics, swaps, turns });
 }
 
 /** The router's claim in the operator's terms: this run, a NAMED foreign holder, free, or not

@@ -83,7 +83,7 @@ import { coldHot, fetchMetrics, fetchTurnMetrics, laneBestRate, persistMetrics, 
 import { handoverText } from "./core.ts";
 import { engineProofInvalidate, laneMoe, moeBalanceRows } from "./moe.ts";
 import { openPanel, type PanelAction } from "./panel.ts";
-import { collectScreen, formatElapsed, type ScreenData } from "./screendata.ts";
+import { assembleScreen, collectScreen, formatElapsed, type ScreenData } from "./screendata.ts";
 import { RUNS_DIRNAME, archiveRun, listRuns } from "./runs.ts";
 import { classOf, classWarmth, versionLine } from "./taskmoe.ts";
 
@@ -325,9 +325,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		const active = pi.getActiveTools();
 		if (isThinkingLane(lane)) {
 			verifierTools = active;
-			const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true);
-			if (!readOnly.includes("fade_phase")) readOnly.push("fade_phase");
-			if (readOnly.length !== active.length) await pi.setActiveTools(readOnly);
+			const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true && t !== "fade_phase");
+			readOnly.push("fade_phase");
+			// CONTENTS, not length: the verifier set removes the writers and adds `fade_phase`,
+			// and at equal length a length test is a silent no-op — edit stays live and the
+			// phase tool never lands, measured with [read, bash, edit, task].
+			const was = new Set(active);
+			if (readOnly.length !== was.size || readOnly.some((t) => !was.has(t))) await pi.setActiveTools(readOnly);
 			return;
 		}
 		if (verifierTools && verifierTools.length > 0) {
@@ -981,27 +985,86 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
 			return;
 		}
+		// THE TOOL POLICY RIDES THE SAME ACT AS THE PIN. The verifier lane has no writers: the
+		// strip is part of what "the session is on the advisor pack" MEANS, so it goes out at
+		// admit, with `setThinkingLevel`, before the serve-hold. Applied only after the pack
+		// serves, the window between the pin and the strip is a verifier with `edit` and `write`
+		// live — and the lane-switch rig asserts the strip while the swap is in flight, because
+		// that is the window the operator's screen shows.
+		await applyToolPolicy(lane);
+		// THE SAME WRAPPER THE COMPLETION USES, RUN AT THE BOUNDARY THAT ASKED FOR THE LANE.
+		// `before_agent_start` holds the host's completion with `laneServeHold`; running it here
+		// gives the SWITCH its holding page for the whole 13-25 s — the working message and the
+		// multicolored pill carrying the router's own percent — and it means the briefing and the
+		// first completion are issued only once the lane serves the pack the pin names. Basalt's
+		// shape, so the normal case costs ONE `/v1/models` read: a lane that already serves the pin
+		// returns at once, says nothing, and the switch proceeds exactly as before.
+		const hold = await laneServeHold(lane, {
+			pollMs: LANE_POLL_MS,
+			// The daemon's readiness window is the ceiling — the same fuse the start's proof uses,
+			// never a client timeout.
+			waitMs: START_PROOF_WAIT_MS,
+			progress: (m, percent) => {
+				// A superseded generation paints nothing: the row and the pill belong to the switch
+				// that replaced it.
+				if (gen !== switchGen) return;
+				ctx.ui.setWorkingMessage(m);
+				if (swapPill) swapPill = { ...swapPill, ...(percent !== undefined ? { percent } : {}) };
+				paint(ctx);
+			},
+		});
 		if (from && runDir && from !== lane) {
+			// The swap's cost is booked whichever way the serve check ends: the load was PAID, and a
+			// pack that admitted and never came up is the most expensive case there is.
 			turnSwapMs += Math.round(loaded.elapsed_s * 1000);
 			void watch?.finish(from, lane, loaded.elapsed_s, runDir, run?.run_id, windowClass(run)).then(() => paint(ctx));
+		}
+		if (gen !== switchGen) {
+			watch?.cancel();
+			return;
+		}
+		if (!hold.ok) {
+			// The 503 class, or the readiness window spent: the lane does not serve the pack the pin
+			// names, so NO briefing on it and no `run.lane` claim. The lane stays owed in `pending`,
+			// and the screen follows the lane that IS serving when that is one of the three.
+			const fall = hold.served_id !== undefined && isServedLane(hold.served_id) ? hold.served_id : undefined;
+			if (fall) {
+				const fm = ctx.modelRegistry.find(PROVIDER, fall);
+				if (fm) await pi.setModel(fm);
+			}
+			fail(ctx, `lane ${lane} was admitted and pinned, but does not serve: ${hold.reason}${fall ? ` — the screen follows ${fall}, and ${lane} stays owed` : " — no briefing sent"}`);
+			return;
 		}
 		if (handBack && verifyLeaseToken && !leaseToken) await returnVerifyLease();
 		if (run) run.lane = lane;
 		await persist();
 		paint(ctx);
-		await applyToolPolicy(lane);
+		// The tool policy rode the ADMIT act above, with the pin and the thinking level: the
+		// serve-hold is the wait, not a second act.
 		if (gen !== switchGen) return;
 		setTimeout(async () => {
 			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
 			// A QUIET switch carries no briefing: the hand-back lands a lane the operator did not ask
 			// about, and a page sent for it would be a queued request naming the lane just left.
 			if (quiet) return;
-			// A PLAIN session (no run) has no round, no desk, no protocol debt: the lane move IS the
-			// deliverable. The briefing below reads `run!` — measured 2026-11-25, a verdict act in a
-			// session with no run reached this timer with `run === undefined` and threw inside a
-			// host timer (unhandled rejection: `Cannot read properties of undefined (reading
-			// 'state')`), which is the plain-session verification path dying on the host.
-			if (!run) return;
+			// A PLAIN session (no run) has no round, no desk, no protocol debt: the lane move IS
+			// the deliverable. The briefing below reads `run!` — measured 2026-11-25, a verdict act
+			// in a session with no run reached this timer with `run === undefined` and threw inside
+			// a host timer (unhandled rejection: `Cannot read properties of undefined (reading
+			// 'state')`), which is the plain-session verification path dying on the host. So the
+			// run-free landing takes the fixed page it can answer with, and NEVER touches `run!`:
+			//  - a THINKING lane landed = the session's own verdict act came due. The model must be
+			//    told it is answering from the advisor pack, or it reviews on a pack it cannot see;
+			//  - a CODE lane landed (the operator's `/lane c`, a hand-back) needs no page: nothing
+			//    in the session is waiting on it.
+			if (!run) {
+				if (isThinkingLane(lane)) {
+					pi.sendUserMessage(
+						`fade_orchestrate: the advisor lane (${lane}) is loaded and serving, and this session has no run. Answer the verification acts this session delegated — the reviewer rounds it started, the verdicts it owes — from this pack. End the turn when they are answered; the code lane returns at the next boundary.`,
+					);
+				}
+				return;
+			}
 			await ensurePhaseTool();
 			// A batch briefing is owed to exactly ONE landing: the switch the desk dispatch asked
 			// for. The flag is consumed here, so a later switch to the same lane re-briefs the
@@ -1061,12 +1124,48 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				context: ctx.getContextUsage(),
 				metrics,
 				flip: flipBadge,
+				// The load in flight, so the screen paints its holding page: the chord pressed
+				// mid-swap is the keystroke that needs a screen, and the panel is where the operator
+				// reads what the 13-25 s load is doing.
+				swap: swapPill,
 				// The panel names who holds the router. `readInstanceLock` is a 400-byte read of the
 				// claim file, and `null` (absent/parsable-free) is a real answer, not a missing row.
 				claim: readInstanceLock(instanceLockDir(ROUTER)) ?? null,
 				...(process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}),
 			});
 		};
+	};
+
+	/**
+	 * The page the overlay mounts when the LIVE read is the thing that is slow — the case the panel
+	 * exists for. A phase boundary's pack swap runs 13-25 s, and the panel's first read is the
+	 * router (whose process is being replaced for that window) plus the two ledger parses. So the
+	 * keystroke that matters most is the one that lands mid-swap, and it must answer with a screen,
+	 * not a warning.
+	 *
+	 * This builder touches none of the slow path: the run's own in-memory state, the `metrics`
+	 * snapshot the tick already paid for, the swap pill, and empty ledgers — which the screen names
+	 * as `no swaps recorded` / `no turn telemetry`, never as a zero. No `claim` read either, so the
+	 * claim row says `not measured` rather than inventing a free router.
+	 */
+	const panelHolding = (ctx: ExtensionContext): (() => ScreenData) | undefined => {
+		if (!run || !runDir) return undefined;
+		const state = run;
+		const dir = runDir;
+		return () =>
+			assembleScreen({
+				run: state,
+				runDir: dir,
+				lanes: { think: THINK_LANE, code: CODE_LANE },
+				names: { [THINK_LANE]: ctx.modelRegistry.find(PROVIDER, THINK_LANE)?.name, [CODE_LANE]: ctx.modelRegistry.find(PROVIDER, CODE_LANE)?.name },
+				context: ctx.getContextUsage(),
+				metrics,
+				swaps: [],
+				turns: [],
+				flip: flipBadge,
+				swap: swapPill,
+				...(process.env.FADE_ORCHESTRATE_BASALT_CONFIG ? { moeConfigPath: process.env.FADE_ORCHESTRATE_BASALT_CONFIG } : {}),
+			});
 	};
 
 	/** The extension's own version, read when the verb asks. An installed extension file has no
@@ -1133,7 +1232,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			return;
 		}
 		try {
-			await openPanel(ctx, provider, (a) => actOnPanel(ctx, a), process.env.FADE_ORCHESTRATE_HEADLESS === "1");
+			await openPanel(ctx, provider, (a) => actOnPanel(ctx, a), process.env.FADE_ORCHESTRATE_HEADLESS === "1", panelHolding(ctx));
 		} catch (e) {
 			// The panel renders from six sources and a bare message names the expression, not
 			// the caller; two stack lines ride along so the failure is locatable.
@@ -2347,7 +2446,16 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				pendingVerifyLane = undefined;
 				traceTrigger("paid", want, undefined, ctx);
 				ctx.ui.notify(`lane on verification: ${want} — the verdict act lands at the turn boundary`, "info");
-				requestLane(want, ctx, want !== THINK_LANE);
+				// The quiet flag means "no run briefing", and a plain session has no run — which
+				// is why this call carried `quiet: true` while the plain landing was silent. It is
+				// not silent now: the plain verify landing has its page, and this move IS its
+				// briefing. The discriminator is the pack the SESSION sits on:
+				//  - on a CODE pack, the session delegated the verdict and must ANSWER it on the
+				//    advisor pack → the page is owed;
+				//  - already on a THINKING pack, the host resolved the verdict role itself and the
+				//    move is bookkeeping → quiet, as the superseded-pair contract keeps it.
+				const briefs = ctx.model?.provider === PROVIDER && !isThinkingLane(ctx.model.id);
+				requestLane(want, ctx, !briefs);
 				return;
 			}
 			// THE NON-RUN HAND-BACK. A session whose turn ran on the planning or advisor lane hands

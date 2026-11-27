@@ -26,9 +26,9 @@ const account = () => {
 		return "";
 	}
 };
-import "./env.mjs";
+import "./env.mjs?suite=panel";
 import test from "node:test";
-import { isClose, isEscape, openPanel, PanelComponent, panelLines, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
+import { isClose, isEscape, openPanel, PanelComponent, panelLines, PANEL_FALLBACK_COLUMNS, PANEL_FALLBACK_ROWS, terminalSize, TWO_COLUMN_MIN_WIDTH, visibleWidth, WIDGET_WIDTH } from "../.test-build/panel.mjs";
 
 const task = (id, status, over = {}) => ({ id, objective: `${id} objective: ${"long ".repeat(12)}text`, files: [`${id}.ts`], acceptance: `${id} acceptance: run the rig and read the frame`, dependencies: id === "T2" ? ["T1"] : [], round: 1, status, ...over });
 
@@ -575,4 +575,136 @@ test("the swap block bills a run whose ledger rows carry its id", () => {
 	const stamped = data({ swaps: [{ ...data().swaps[0], run_id: "20300101T113829Z-gbut" }] });
 	const s = joined(panelLines(stamped, 120, { sel: 0 }));
 	assert.ok(hasRow(s, "swaps this run 1 · 14.2s paid"), s.slice(0, 400));
+});
+
+// ── the terminal-size wrapper: the screen paints on a host that reports nothing ─────────────
+// Measured 2026-11-26 on the live box, at extension load: the host's render pass called
+// `getHeight()`, `this.tui.terminal` was `undefined`, and the host's per-frame catch painted
+//   extension render failed: undefined is not an object (evaluating 'this.tui.terminal.rows')
+// in place of the screen — every frame, so Alt+F opened nothing. The host's loading-phase surface
+// is exactly this shape (a stub whose members answer `undefined` and whose action methods throw on
+// the call), and a TUI that is detaching answers `0`. Every one is a NON-ANSWER: the panel draws
+// its own box. A throw here is the one failure mode a status line cannot have — it is the surface
+// the operator reads a pack load on.
+const FALLBACK_BOX = { rows: PANEL_FALLBACK_ROWS, columns: PANEL_FALLBACK_COLUMNS };
+
+test("terminalSize: every shape the host answers when it has no terminal gets the fallback box", () => {
+	const shapes = [
+		["no terminal member", {}],
+		["the loading-phase stub (undefined members)", { terminal: undefined }],
+		["a detaching TUI (zeroes)", { terminal: { rows: 0, columns: 0 } }],
+		["a stub answering null", { terminal: { rows: null, columns: null } }],
+		["text where numbers belong", { terminal: { rows: "40", columns: "120" } }],
+		["NaN", { terminal: { rows: NaN, columns: NaN } }],
+		["negative", { terminal: { rows: -24, columns: -1 } }],
+	];
+	for (const [name, t] of shapes) assert.deepEqual(terminalSize(t), FALLBACK_BOX, `${name} must draw the panel's own box, never a 0-row panel`);
+	assert.deepEqual(terminalSize(undefined), FALLBACK_BOX, "no TUI at all is the same non-answer");
+	assert.deepEqual(terminalSize({ terminal: { rows: 45.7, columns: 150 } }), { rows: 45, columns: 150 }, "a real size passes through, floored");
+});
+
+test("terminalSize: a proxy that THROWS on the terminal read is a non-answer, not a crash", () => {
+	// The same shape `src/index.ts` guards for the host's loading-phase action methods: a property
+	// GET that throws. The panel reads the size inside a host render pass, where the throw becomes
+	// a dead screen.
+	const hostile = {
+		get terminal() {
+			throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
+		},
+		requestRender() {},
+	};
+	assert.deepEqual(terminalSize(hostile), FALLBACK_BOX, "the getter throw answers the fallback, and the screen paints");
+});
+
+for (const [name, tui] of [
+	["a TUI with no terminal member", { requestRender() {} }],
+	["a TUI whose terminal getter throws", { get terminal() { throw new Error("not initialized"); }, requestRender() {} }],
+]) {
+	test(`the component renders on ${name} — a sizeless TUI never produces an extension-render-failed frame`, () => {
+		const c = new PanelComponent(data(), async () => data(), undefined, tui, () => undefined, 60000);
+		const lines = c.render(200);
+		assert.ok(lines.length > 0 && lines.length <= PANEL_FALLBACK_ROWS - 2, `the frame is bounded by the fallback height: ${lines.length} rows`);
+		for (const l of lines) assert.ok(visibleWidth(l) <= PANEL_FALLBACK_COLUMNS, `the width is clamped to the fallback columns: ${visibleWidth(l)}`);
+		assert.ok(lines.some((l) => l.includes("fade-orchestrator 20300101T113829Z-gbut")), "the screen paints the run, not an error frame");
+		// The keys go through the same height read, so they must survive the shape too.
+		c.handleInput("j");
+		c.handleInput("\x1b[6~");
+		c.handleInput("G");
+		assert.ok(c.render(200).length > 0, "scrolling on a sizeless TUI still answers a frame");
+		c.dispose();
+	});
+}
+
+// ── the holding page: a pack load is 13-25 s, and this is the screen that reads it ──────────
+test("the header paints the switch as a HOLDING PAGE while a pack loads", () => {
+	const d = data({ swap: { from: "deepseek", to: "flash-next", percent: 47 } });
+	const s = joined(panelLines(d, 120, { sel: 0 }));
+	assert.ok(s.includes("switching deepseek → flash-next 47%"), s.slice(0, 700));
+	assert.ok(s.includes("HOLDING PAGE"), "the row says the numbers under it are the last measured, not live");
+	// A screen that advertises a swap that already landed is a lie, so the row is load-scoped.
+	assert.ok(!joined(panelLines(data(), 120, { sel: 0 })).includes("HOLDING PAGE"), "no load in flight, no switch row");
+	const noPercent = joined(panelLines(data({ swap: { from: "deepseek", to: "flash-next" } }), 120, { sel: 0 }));
+	assert.ok(noPercent.includes("switching deepseek → flash-next —") && !noPercent.includes("null%"), "a router that reports no percent prints no percent, never a null");
+});
+
+test("openPanel: a first read that does not answer mounts the HOLDING PAGE, not a warning", async () => {
+	// The chord pressed at a phase boundary is the keystroke that matters, and the panel's first
+	// read IS the router: mid-swap the process is being replaced, and the two ledgers are appending.
+	// The fuse (`FADE_ORCHESTRATE_PANEL_FIRST_MS`) ends the wait; `holding` is the wiring's cheap
+	// read — the run's state, the cached metrics, the swap pill, empty ledgers.
+	const notes = [];
+	const calls = [];
+	const ctx = {
+		hasUI: false,
+		ui: {
+			setWidget: (key, lines, opts) => calls.push({ key, lines, opts }),
+			notify: (m) => notes.push(m),
+			custom: async () => {
+				throw new Error("headless must not open an overlay");
+			},
+		},
+	};
+	const prev = process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS;
+	process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS = "20";
+	try {
+		await openPanel(
+			ctx,
+			() => new Promise((res) => setTimeout(() => res(data()), 5000)),
+			undefined,
+			true,
+			() => data({ swap: { from: "deepseek", to: "flash-next", percent: 12 }, swaps: [], turns: [] }),
+		);
+	} finally {
+		if (prev === undefined) delete process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS;
+		else process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS = prev;
+	}
+	assert.equal(calls.length, 1, "a slow router is a page, never a warning-only keystroke");
+	const s = calls[0].lines.join("\n");
+	assert.ok(s.includes("switching deepseek → flash-next 12%"), s.slice(0, 700));
+	assert.ok(s.includes("the live read did not answer in 0.02s"), "the page names its own staleness and the fuse that ended the wait");
+	assert.ok(s.includes("no swaps recorded"), "the empty ledgers are NAMED, never printed as a zero");
+	assert.equal(notes.length, 0, `no refusal when a page exists: ${notes.join(" | ")}`);
+});
+
+test("openPanel: with no page in hand, the refusal stays named", async () => {
+	const notes = [];
+	const calls = [];
+	const ctx = {
+		hasUI: false,
+		ui: {
+			setWidget: (key, lines) => calls.push(lines),
+			notify: (m) => notes.push(m),
+			custom: async () => undefined,
+		},
+	};
+	const prev = process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS;
+	process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS = "20";
+	try {
+		await openPanel(ctx, () => new Promise(() => undefined), undefined, true);
+	} finally {
+		if (prev === undefined) delete process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS;
+		else process.env.FADE_ORCHESTRATE_PANEL_FIRST_MS = prev;
+	}
+	assert.equal(calls.length, 0, "nothing to show, nothing painted");
+	assert.ok(notes.some((n) => n.includes("the screen did not open")), `the refusal is named: ${notes.join(" | ")}`);
 });

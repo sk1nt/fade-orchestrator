@@ -491,6 +491,7 @@ docs/OVERLAY.md   the surface: layout, metrics, keys, redaction, proof inventory
 docs/quant-choice.md the IQ1_M pin: the measurement, the method, the reproduce commands
 docs/FEATURES.md  the feature sweep: each proposal, the code that shows the gap, its cost, the command that accepts it
 docs/DELEGATION.md the verification desk: schema, closure rules, the churn route, the invariants
+docs/overlay-holding-page-2026-11-26.md the loading-phase proxy TUI, the `terminalSize` wrapper, and the switch's holding page
 ```
 
 ## License

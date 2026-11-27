@@ -12,7 +12,7 @@
  * and no real router is touched; `resident` is injected so the residency rule is testable without a
  * router at all.
  */
-import "./env.mjs";
+import "./env.mjs?suite=thinklane";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { answerText, askLane, probeThink, resolveAskSpec } from "../.test-build/thinklane.mjs";

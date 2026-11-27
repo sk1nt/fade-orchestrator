@@ -16,7 +16,7 @@
  * served id are each failures that NAME their class. The proof reads: it takes no lease, issues
  * no swap, and never kills a load in flight — the window is a fuse, not a lever.
  */
-import "./env.mjs";
+import "./env.mjs?suite=preflight_proof";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -89,7 +89,7 @@ process.env.FADE_ORCHESTRATE_ROUTER = rt.url;
 process.env.FADE_ORCHESTRATE_START_PROOF_WAIT_MS = "300";
 process.env.FADE_ORCHESTRATE_LANE_POLL_MS = "50";
 
-const m = await import("../.test-build/router.mjs");
+const m = await import("../.test-build/router.mjs?case=preflight");
 const prove = (target) => m.proveResident(target, { sessionId: "pp-session", waitMs: 300, pollMs: 50 });
 
 test("the proof is BOTH: daemon RESIDENT for the target AND the router serving its id", async () => {

@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import "./env.mjs";
+import "./env.mjs?suite=switchplan";
 import { switchPlan } from "../.test-build/router.mjs";
 
 test("a resident target pays no idle gate and no load, and names the reason", () => {

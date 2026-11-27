@@ -19,7 +19,7 @@
  * gate is pointed at a MISSING binary, so any load routed through it fails by name — a green here
  * is proof the supervisor plane served every byte.
  */
-import "./env.mjs";
+import { resetLaneEnv } from "./env.mjs?suite=verify_lease";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -82,6 +82,27 @@ const daemon = async () => {
 	return { dir, sock, hits, state, close: () => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); } };
 };
 
+/** Bind a PROBED port in a low, fixed band. `listen(0)` hands out the OS's ephemeral band, and
+ *  a donor suite in the same process (bun runs all 27 files as one) frees its stub port at its
+ *  close — the OS recycles that exact port to THIS stub seconds later, and the runner's fetch
+ *  pool keeps a socket to the port, not to the server: the pre-unload gate reads `/health` on
+ *  the donor's dead keep-alive and the load refuses at a port a FRESH connect reaches
+ *  (measured 2026-11-26: "router unreachable at http://127.0.0.1:40901"). A probed port in a
+ *  low band is never in the ephemeral range the donors use. The probing is the convention: a
+ *  bare constant races TIME_WAIT and foreign binders, so `listen` IS the probe. */
+const listenProbed = async (server) => {
+	for (let port = 20000; port < 20100; port++) {
+		const bound = await new Promise((r) => {
+			const done = (v) => () => r(v);
+			server.once("listening", done(true));
+			server.once("error", done(false));
+			server.listen(port, "127.0.0.1");
+		});
+		if (bound) return port;
+	}
+	throw new Error("no probed port 20000-20099 is bindable");
+};
+
 /** The router the plugin reads: CODE loaded, THINK absent, slot free. */
 const routerStub = async (laneState) => {
 	const server = http.createServer((req, res) => {
@@ -92,8 +113,7 @@ const routerStub = async (laneState) => {
 		// idle gate defers the load forever, which is a harness defect, not a plugin one.
 		return res.end(JSON.stringify({ error: "no route" }));
 	});
-	await new Promise((r) => server.listen(0, "127.0.0.1", r));
-	const port = server.address().port;
+	const port = await listenProbed(server);
 	return { url: `http://127.0.0.1:${port}`, close: () => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); } };
 };
 
@@ -106,11 +126,19 @@ the plugin said:\n${notes.join("\n")}`);
 	}
 };
 
-test("a verification turn holds its lease: recorded mid-turn, paid at the boundary, returned at hand-back", async () => {
+// The runner ceiling must sit ABOVE the suite's own `settled()` budget (15 s): the wire is the
+// proof, and a runner that kills the test at its 5 s default (bun) reports a timeout with an
+// empty journal. node's default is no ceiling; the option is honored by both runners.
+test("a verification turn holds its lease: recorded mid-turn, paid at the boundary, returned at hand-back", { timeout: 20_000 }, async () => {
 	const sup = await daemon();
 	const rt = await routerStub(sup.state);
 	const cwd = mkdtempSync(join(tmpdir(), "fade-vl-cwd-"));
 	const missingCtl = join(cwd, "no-such-ctl");
+	// Clear every rig/live key FIRST: the fixture then names its own windows, and the bundle
+	// instance imported below freezes exactly them. A leaked `FLIP_WINDOW_MS=0` from another
+	// rig's fixture is a breaker that refuses this suite's swap; a leaked mint TTL is a lease
+	// that expires mid-verdict.
+	resetLaneEnv();
 	Object.assign(process.env, {
 		PI_SESSION_FILE: "",
 		FADE_SUPERVISOR_SOCK: sup.sock,
@@ -146,7 +174,12 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 	setModel: () => true, setThinkingLevel: () => true, getActiveTools: () => ["read"], setActiveTools: noop,
 			sendUserMessage: noop, getShortcuts: () => [], getShortcutConflict: () => null,
 		};
-		const { default: factory } = await import(`${built.href}?case=vl-${Date.now()}`);
+		// The cache-bust must ride a RELATIVE specifier: bun normalizes a `file:` URL by
+		// dropping its query, so `${built.href}?case=` returns the FIRST importer's instance —
+		// measured: this fixture's factory carried a donor rig's frozen `ROUTER` (36817) while
+		// its own env named 20000, and the pre-unload gate refused on the donor's dead port.
+		// `import.meta.url`-relative specifiers keep the query.
+		const { default: factory } = await import(`../.test-build/index.mjs?case=vl-${Date.now()}`);
 		factory(pi);
 		assert.ok(hooks.tool_call && hooks.agent_end, "the boundary hooks are bound");
 

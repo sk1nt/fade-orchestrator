@@ -138,7 +138,7 @@ test("a refused lease mints no swap and leaves no lease behind", async () => {
 
 // ---------------------------------------------------------------- the stubs
 
-import "./env.mjs";
+import "./env.mjs?suite=lane_command";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
