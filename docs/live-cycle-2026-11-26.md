@@ -1,4 +1,4 @@
-# Frontier live-cycle verification — 2026-11-26
+# Frontier live-cycle verification
 
 The supervised live cycle the operator ordered: a real frontier task (this repo,
 auto-granted, one planned test `bun test`) run end to end on the box, with the

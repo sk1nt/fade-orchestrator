@@ -1,4 +1,4 @@
-# The overlay survives the loading phase, and the switch owns its holding page — 2026-11-26
+# The overlay survives the loading phase, and the switch owns its holding page
 
 ## 1. The crash: `extension render failed: undefined is not an object (evaluating 'this.tui.terminal.rows')`
 

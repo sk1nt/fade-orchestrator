@@ -198,7 +198,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let leaseSession = "";
 	/** The capability a NON-RUN move minted (a verification/escalation turn, the panel). Held
 	 *  across the turn it protects and returned at hand-back/shutdown — releasing inside the
-	 *  load left the lane free before the review ran (measured 2026-11-25). */
+	 *  load left the lane free before the review ran (measured). */
 	let verifyLeaseToken: string | undefined;
 	let verifyLeaseSession = "";
 	let verifyLeaseRemainingS = 0;
@@ -979,7 +979,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		//  3. a mint under this session's own identity, KEPT (never released here) for the turn
 		//     the load protects. The old `finally` released it before the review ran a byte,
 		//     which left `lease=free` and let the next peer session take the lane back
-		//     (measured 2026-11-25). A minted lease is returned at the hand-back/shutdown.
+		//     (measured). A minted lease is returned at the hand-back/shutdown.
 		const presentToken = leaseToken ?? verifyLeaseToken;
 		const loaded = await loadLane(lane, {
 			...(presentToken ? { leaseToken: presentToken } : { mintLease: { ttlSec: LEASE_MINT_TTL_S } }),
@@ -1014,7 +1014,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// ADMITTED IS THE MOMENT TO PIN. The pack switch and the session prompt are ONE act: the
 		// load goes out and `setModel` + `setThinkingLevel` + the tool policy + the phase briefing
 		// follow in the same generation, on the same turn boundary, with NO residency read in front
-		// of them. Proving first — the shape this file carried on 2026-11-26 — is the halt's other
+		// of them. Proving first — the shape this file carried before the fix — is the halt's other
 		// half: it left the pin and the briefing naming the PREVIOUS pack for the whole 13-25 s
 		// load, so a review round opened naming `hy4-flash` while this session's pin was still
 		// `flash-next`, and the completion answered `404 The model 'flash-next' does not exist`.
@@ -1094,7 +1094,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// about, and a page sent for it would be a queued request naming the lane just left.
 			if (quiet) return;
 			// A PLAIN session (no run) has no round, no desk, no protocol debt: the lane move IS
-			// the deliverable. The briefing below reads `run!` — measured 2026-11-25, a verdict act
+			// the deliverable. The briefing below reads `run!` — measured, a verdict act
 			// in a session with no run reached this timer with `run === undefined` and threw inside
 			// a host timer (unhandled rejection: `Cannot read properties of undefined (reading
 			// 'state')`), which is the plain-session verification path dying on the host. So the

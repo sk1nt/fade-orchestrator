@@ -8,7 +8,7 @@
  * such a suite — ESM evaluates imports in declaration order, so the deletes land before the bundle
  * is evaluated — and the suite measures the documented defaults in every environment.
  *
- * The rule this file enforces, widened 2026-11-26: the runner evaluates EVERY suite file in ONE
+ * The rule this file enforces, widened: the runner evaluates EVERY suite file in ONE
  * process, and the bundles resolve their endpoints, sockets and windows at MODULE IMPORT. A rig
  * file that exports its stub values at module top therefore freezes them into the singleton every
  * later suite imports — measured as `served_id: undefined` (the proof polled a stub server that

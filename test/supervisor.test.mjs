@@ -236,7 +236,7 @@ test("a dead socket is a transport error, never a fabricated success", async () 
 //
 // The metrics tick is 30 s and the lease TTL is 1800 s. An ungated renew is a
 // round trip and a daemon `msg=decision … decision=RENEWED` journal line every
-// 30 s — ~60 per held hour — which is measured 2026-11-25 as the lease records
+// 30 s — ~60 per held hour — which is measured as the lease records
 // drowning the one question the journal answers: who owns the lane, and since
 // when. So the client renews below a third of the TTL, and the number it
 // compares is the DAEMON's published `remaining_sec`, never a client clock.

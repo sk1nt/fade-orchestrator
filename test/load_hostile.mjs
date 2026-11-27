@@ -59,7 +59,7 @@ process.env.FADE_ORCHESTRATE_ROUTER = `http://127.0.0.1:${port}`;
 // Hermetic against the host: on a box with the live fade-supervisor, the daemon's RESIDENT answer
 // short-circuits `loadLane` ("resident per supervisor; no swap issued") for a target the box
 // really is serving, and the hostile health gate is never reached — the rig grades the daemon,
-// not the gate (measured 2026-11-26: `error` mode returned ok=true). Pin the supervisor socket to
+// not the gate (measured: `error` mode returned ok=true). Pin the supervisor socket to
 // a path that does not exist (a pinned value wins outright and is never probed, so a NO ANSWER
 // falls through to the gate) and ride the swap on the ctl plane through `swap_stub.mjs`, so the
 // POST lands on the rig's router and the load counter keeps its meaning.

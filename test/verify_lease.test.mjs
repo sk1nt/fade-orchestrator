@@ -1,7 +1,7 @@
 /**
  * The verification lease is HELD across the turn — the extension level.
  *
- * The defect, measured on the box 2026-11-25: a non-run verification move minted a lease, landed
+ * The defect, measured on the box: a non-run verification move minted a lease, landed
  * the pack, and released the lease in the SAME call. The journal read `lease=free` while the
  * review was still running, and the next peer session took the lane back mid-verdict — the verdict
  * then ran on the pack it had just displaced. The load was paying for the switch, never for the
@@ -87,7 +87,7 @@ const daemon = async () => {
  *  close — the OS recycles that exact port to THIS stub seconds later, and the runner's fetch
  *  pool keeps a socket to the port, not to the server: the pre-unload gate reads `/health` on
  *  the donor's dead keep-alive and the load refuses at a port a FRESH connect reaches
- *  (measured 2026-11-26: "router unreachable at http://127.0.0.1:40901"). A probed port in a
+ *  (measured: "router unreachable at http://127.0.0.1:40901"). A probed port in a
  *  low band is never in the ephemeral range the donors use. The probing is the convention: a
  *  bare constant races TIME_WAIT and foreign binders, so `listen` IS the probe. */
 const listenProbed = async (server) => {

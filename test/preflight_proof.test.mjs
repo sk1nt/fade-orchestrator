@@ -2,7 +2,7 @@
 /**
  * The start preflight PROVES the planning lane, it does not census it.
  *
- * The defect (measured 2026-11-26): `/orchestrate <goal>` ran a ONE-SHOT census and skipped the
+ * The defect (measured): `/orchestrate <goal>` ran a ONE-SHOT census and skipped the
  * check whenever the census errored; a session then pinned `basalt/deepseek`, sent the planning
  * briefing while the lane still served `flash-next`, and the router answered
  * `404 The model 'basalt/deepseek' does not exist` — a start that paid the claim and the gate for

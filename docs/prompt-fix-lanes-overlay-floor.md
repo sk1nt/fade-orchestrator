@@ -10,7 +10,7 @@ Two files already have a **partial** start (`git diff`): `src/panel.ts` (close e
 
 ## 1. Symptom: `/orchestrate` never calls `deepseek` or `hy4-flash`
 
-**Measured 2026-11-26.**
+**Measured.**
 
 Live `:18014` health: `model: flash-next`, `loaded: true`. Supervisor residency: `lane_state=RESIDENT`, `active_pack=flash-next`. Lease held by `fade-orchestrator` session `20261126T063911Z-m5or`.
 
@@ -30,7 +30,7 @@ export const THINK_LANE = process.env.FADE_ORCHESTRATE_THINK_LANE ?? "deepseek";
 export const CODE_LANE  = process.env.FADE_ORCHESTRATE_CODE_LANE  ?? "flash-next";
 ```
 
-`~/.config/inference-keys.env` (sourced from `.bashrc` with `set -a`) still has the 2026-11-22 single-lane poison:
+`~/.config/inference-keys.env` (sourced from `.bashrc` with `set -a`) still has the single-lane poison:
 
 ```
 export FADE_ORCHESTRATE_THINK_LANE="flash-next"

@@ -468,7 +468,7 @@ export async function acquireLease(
 /** The renew gate: renew only when the lease is running down, never on every
  *  poll. The metrics tick is 30 s and the TTL is 1800 s, so an ungated renew is
  *  ~60 round trips and ~60 `msg=decision … decision=RENEWED` journal lines per
- *  held hour — measured 2026-11-25, where the lease records in the daemon's
+ *  held hour — measured, where the lease records in the daemon's
  *  journal were renewal noise, and the operator's one question ("who owns the
  *  lane, and since when") was buried under the client's own heartbeat.
  *

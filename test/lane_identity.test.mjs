@@ -2,7 +2,7 @@
 /**
  * The three-lane identity: coder / planner / advisor, and the refusal rule that keeps them three.
  *
- * Measured 2026-11-26, run 20261126T063911Z-m5or: `~/.config/inference-keys.env` exports
+ * Measured on run 20261126T063911Z-m5or: `~/.config/inference-keys.env` exports
  * `FADE_ORCHESTRATE_THINK_LANE=flash-next`, the think lane became the code lane, `loadLane`
  * short-circuited on the resident pack, NO swap was ever issued, and planning plus coding both ran
  * on the coder's 52 GiB pack at `THINKING=low` — the loop churned with zero thinking. The rule this

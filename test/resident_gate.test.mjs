@@ -254,7 +254,7 @@ test("a minted lease is KEPT when the swap lands, and the swap byte rides the to
 		assert.equal(r.leaseToken, "T-OK", "the minted capability is returned, not consumed");
 		assert.equal(r.leaseSession, "sess-turn", "the minting identity rides back for the release");
 		assert.equal(sup.hits.filter((h) => h.includes("release")).length, 0,
-			"the success path releases NOTHING: releasing here freed the lane before the turn the load protects ran (measured 2026-11-25)");
+			"the success path releases NOTHING: releasing here freed the lane before the turn the load protects ran (measured)");
 		assert.equal(sup.hits.filter((h) => h.includes("acquire")).length, 1, "one acquire, no retry storm");
 		assert.match(sup.hits.find((h) => h.includes(R_SWAP)), /token=T-OK/, "the swap byte rides the minted token");
 		assert.ok(!existsSync(ctl.log), "a supervisor-path swap never falls to the ctl fleet gate");

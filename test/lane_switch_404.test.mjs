@@ -2,7 +2,7 @@
 /**
  * The pack switch and the session prompt are ONE act, and the COMPLETION is what waits.
  *
- * The halt, measured live 2026-11-26:
+ * The halt, measured live:
  *
  *   lane on verification: hy4-flash — the verdict act lands at the turn boundary
  *   frontier: review round 2 opens on the planner that did not write this plan: :18014 → hy4-flash
@@ -147,7 +147,7 @@ const supServer = http.createServer((req, res) => {
 			// ADMIT IS THE MOMENT THE BOX STARTS REPLACING THE `:18014` PROCESS. The lane keeps
 			// answering the OLD id for `swapDelayMs` and then carries exactly the new one, which is
 			// the measured shape: the daemon's RESIDENT answer and the router's LISTING disagree
-			// while the swap is in flight, and that window is where the 2026-11-26 404 was born.
+			// while the swap is in flight, and that window is where the recorded 404 was born.
 			st.admitted.push(p.pack);
 			st.loading = true;
 			st.percent = 0;

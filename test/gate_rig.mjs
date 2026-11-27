@@ -145,7 +145,7 @@ let swapLine = null;
 /** The swap's transit, in rig milliseconds. `0` (the default, every block but the verification
  *  boundary) flips the resident pack the instant the POST lands, which is what every settle reads.
  *  The verification boundary dials it: the real box replaces the `:18014` process over 13-25 s, and
- *  the halt of 2026-11-26 lives INSIDE that window — the pack was swapped, the session pin named
+ *  the recorded halt lives INSIDE that window — the pack was swapped, the session pin named
  *  the old id, the completion answered 404. A rig that flips instantly cannot see the window, so
  *  it cannot grade the fix. */
 let swapDelayMs = 0;
@@ -233,7 +233,7 @@ process.env.FADE_ORCHESTRATE_HEADLESS = "1";
 // ---- stub supervisor: the lane authority, in tmp ----
 // The rig MUST own this socket. Pinned to nothing, the plugin's `getSocketPath` probes the LIVE
 // `/run/fade/supervisor.sock`, then `/tmp/fade-supervisor.sock` — the trading box's real daemon
-// (measured 2026-11-26: the rig's `loadLane("flash-next")` answered `resident per supervisor`
+// (measured: the rig's `loadLane("flash-next")` answered `resident per supervisor`
 // from the live daemon and the block's swap assertions died against a daemon the rig never
 // drove). Pinned here, the residency answer MIRRORS the rig's own `resident` variable, so the
 // residency short-circuit and the census never disagree, and every swap rides the ctl stub.
@@ -778,7 +778,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// `setModel` + `setThinkingLevel` + `applyToolPolicy` + the briefing follow in the same
 	// generation, with NO residency read in front of them. The rig dials a 150 ms transit so the
 	// window is observable: the pin must land while the stub router STILL lists the code pack.
-	// Prove-then-pin — the shape this file documented until 2026-11-26 — is the halt's other half:
+	// Prove-then-pin — the shape this file documented before the fix — is the halt's other half:
 	// it left the pin and the briefing naming the PREVIOUS pack for the whole load, and the next
 	// completion answered `404 The model 'flash-next' does not exist`.
 	const modelBase = modelCalls.length;
@@ -848,7 +848,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	process.env.PI_SESSION_FILE = nested;
 	// Drain the previous block's async tail first: the accepted verification paid a lane switch,
 	// and `runSwitch`'s persist lands a tick after the block returns. Seeding before that write
-	// lets the previous run's counters win the file race (measured 2026-11-26: seed 0 read back 3
+	// lets the previous run's counters win the file race (measured: seed 0 read back 3
 	// while the delegated hooks persisted nothing). The seed must own the file when it writes it.
 	await new Promise((r) => setTimeout(r, 150));
 	const base = loads();

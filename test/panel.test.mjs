@@ -578,7 +578,7 @@ test("the swap block bills a run whose ledger rows carry its id", () => {
 });
 
 // ── the terminal-size wrapper: the screen paints on a host that reports nothing ─────────────
-// Measured 2026-11-26 on the live box, at extension load: the host's render pass called
+// Measured on the live box, at extension load: the host's render pass called
 // `getHeight()`, `this.tui.terminal` was `undefined`, and the host's per-frame catch painted
 //   extension render failed: undefined is not an object (evaluating 'this.tui.terminal.rows')
 // in place of the screen — every frame, so Alt+F opened nothing. The host's loading-phase surface

@@ -392,7 +392,7 @@ export function isClose(data: string): boolean {
  * Minimal view of the host's TUI: the panel needs the height and the render kick, nothing else.
  *
  * `terminal` is OPTIONAL because the host does not always have one to hand when it renders an
- * extension component. Measured 2026-11-26 on the live box: the Alt+F overlay of a session that
+ * extension component. Measured on the live box: the Alt+F overlay of a session that
  * opened the panel during extension load threw `undefined is not an object (evaluating
  * 'this.tui.terminal.rows')` out of `getHeight`, and the host's per-frame catch painted
  * `extension render failed: …` in place of the screen — every frame, so the overlay opened nothing
