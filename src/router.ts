@@ -8,7 +8,7 @@
  *   FADE_ORCHESTRATE_THINK_LANE default deepseek   (plans)
  *   FADE_ORCHESTRATE_VERIFY_LANE default hy4-flash (verifies; never the code lane)
  *   FADE_ORCHESTRATE_CODE_LANE  default flash-next (codes)
- *   FADE_ORCHESTRATE_SWAP_CMD default /home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh
+ *   FADE_ORCHESTRATE_SWAP_CMD default unset      (the host points it at the fleet gate)
  */
 import { exec } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
@@ -25,7 +25,7 @@ export const ROUTER = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:1
  *  `slow`/`plan` = `basalt/deepseek`), and `basalt` is the provider that declares every alias of
  *  the lane. `strata-flash` is the legacy block: it names only `flash-next`, so a thinking-lane
  *  `setModel` there cannot resolve and every lane move dies at the registry lookup. Measured
- *  2026-11-25: the verdict-lane move was inert until this default was corrected. */
+ *  the verdict-lane move was inert until this default was corrected. */
 export const PROVIDER = process.env.FADE_ORCHESTRATE_PROVIDER ?? "basalt";
 /** Every lane env the plugin refused, in the words the operator reads. Flushed once per session at
  *  `session_start`; empty when the env is honest. */
@@ -34,7 +34,7 @@ export const ENV_NOTICES: string[] = [];
 /** A lane env is honored only when it does not collapse the loop. `FADE_ORCHESTRATE_THINK_LANE=
  *  flash-next` (the value `~/.config/inference-keys.env` still exports on this box) makes the think
  *  lane the code lane: `loadLane` short-circuits on the resident pack, no swap is issued, and
- *  planning runs on the coder's 52 GiB pack with `THINKING` collapsed to `low` — measured 2026-11-26
+ *  planning runs on the coder's 52 GiB pack with `THINKING` collapsed to `low` — measured
  *  on run 20261126T063911Z-m5or, `planning_done` and `coding_done` both on flash-next. The refused
  *  value is named once, and the documented lane wins. */
 const resolveLane = (name: string, label: string, fallback: string, forbidden: string[], forbiddenLabel: string): string => {
@@ -78,13 +78,17 @@ export const msg = (e: unknown): string => (e instanceof Error ? e.message : Str
  * authoritative one. Rigs point this at a stub over their fake router, keeping the
  * "exactly ONE / ZERO POST /v1/load" proofs honest.
  */
-export const SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "/home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh";
+/** The fleet gate a swap rides. NO DEFAULT SHIPS HERE: the literal this carried named the private
+ *  repo and a host username inside a public package, which is exactly what the provenance sweep
+ *  exists to stop. The host configures it in `FADE_ORCHESTRATE_SWAP_CMD`; an unset value is a named
+ *  refusal at the call site, never a command line that quietly execs an empty string. */
+export const SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "";
 
 /** Which plane issues the lane swap. `supervisor` (the default) rides the
  *  fade-supervisor lane lease exclusively: a load with no token is REFUSED, never
  *  handed to the ctl fleet gate, because a ctl load takes no lease and is exactly
  *  the bypass that let a peer session evict the lane under a held lease
- *  (measured 2026-11-25). `ctl` preserves the basalt-ctl.sh fleet gate (VRAM
+ *  (measured). `ctl` preserves the basalt-ctl.sh fleet gate (VRAM
  *  floor, circuit, minted nonce) verbatim, and is chosen, never fallen into. */
 export const SWAP_VIA = process.env.FADE_ORCHESTRATE_SWAP_VIA === "ctl" ? "ctl" : "supervisor";
 
@@ -345,7 +349,7 @@ async function gateBusyLoop(lane: string, opts: GateOpts, budgetMs: number, poll
  *  caller returns it at the hand-back. Releasing inside the load (the old
  *  `finally`) dropped the guard before the review turn had run a byte, and the
  *  very next peer session minted its own lease and swapped the lane back
- *  (measured 2026-11-25). */
+ *  (measured). */
 export type LaneLoad = { ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState; leaseToken?: string; leaseSession?: string; minted?: boolean };
 
 // `lease: true` asks the router for the DURABLE load: the lane stays resident until
@@ -385,7 +389,7 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 	// falls through to the ctl fleet gate. A load with no token and no mint request
 	// is REFUSED — a ctl load takes no lease, so it would swap a lane another
 	// caller's lease owns, which is the bypass that evicted a held deepseek lane
-	// (measured 2026-11-25: the peer minted 300 s and landed flash-next unconditionally).
+	// (measured: the peer minted 300 s and landed flash-next unconditionally).
 	// A load that carries no run token MINTS under its own identity and KEEPS the
 	// lease: the capability must outlive the load by the turn the caller is about to
 	// run (`LaneLoad.minted`), or the next peer takes the lane before the turn starts.
@@ -441,6 +445,9 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 	}
 	// The ctl plane is reached only by FADE_ORCHESTRATE_SWAP_VIA=ctl — the operator's
 	// explicit choice. It takes no supervisor lease, so it is never a fallback.
+	if (!SWAP_CMD) {
+		return { ok: false, detail: `swap plane unconfigured: FADE_ORCHESTRATE_SWAP_CMD is unset (the host points it at the fleet gate; no path ships in the plugin)${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
+	}
 	try {
 		// One swap, one lease: the ctl script gates, mints, grants, burns, loads, and the minted
 		// approval nonce rides the service lease the census audits.

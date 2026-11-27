@@ -270,7 +270,7 @@ var VERIFY_LANE = resolveLane("FADE_ORCHESTRATE_VERIFY_LANE", "verification", "h
 var isThinkingLane = (lane) => lane === THINK_LANE || lane === VERIFY_LANE;
 var THINKING = { [THINK_LANE]: "high", [VERIFY_LANE]: "high", [CODE_LANE]: "low" };
 var msg = (e) => e instanceof Error ? e.message : String(e);
-var SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "/home/rwest/projects/fadetheworld/deploy/ops/basalt-ctl.sh";
+var SWAP_CMD = process.env.FADE_ORCHESTRATE_SWAP_CMD ?? "";
 var SWAP_VIA = process.env.FADE_ORCHESTRATE_SWAP_VIA === "ctl" ? "ctl" : "supervisor";
 async function runSwap(command) {
   try {
@@ -446,6 +446,9 @@ async function loadLane(lane, opts = {}) {
       flip,
       ...minted ? { leaseToken: token, leaseSession: sid, minted: true } : {}
     };
+  }
+  if (!SWAP_CMD) {
+    return { ok: false, detail: `swap plane unconfigured: FADE_ORCHESTRATE_SWAP_CMD is unset (the host points it at the fleet gate; no path ships in the plugin)${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1e3, guarded, flip };
   }
   try {
     const dir = await mkdtemp(join(tmpdir(), "fade-swap-"));
