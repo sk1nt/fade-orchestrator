@@ -454,6 +454,16 @@ const settlePins = async (from, cap = 8000) => {
 	while (pinsAt.length <= from && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
 	return pinsAt[from];
 };
+/** The stub router publishes the swap in flight on its health line, and the plugin's poll observes
+ *  it (`observeSwaps` → `swapLog`). `resetFlipLedger` clears `lastSwapSig` along with the log, so a
+ *  swap that is still in flight when the ledger is cleared is recorded again as a BRAND-NEW flip:
+ *  clearing mid-swap manufactures the count it was meant to clear. Settle on the line going quiet,
+ *  bounded, so a clear lands on an empty window. */
+const settleSwapQuiet = async (cap = 4000) => {
+	const t0 = Date.now();
+	while (swapLine !== null && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
+	return swapLine === null;
+};
 const exec = (phase, payload) => tools.fade_phase.execute("id", { phase, payload: JSON.stringify(payload) }, null, null, ctx);
 
 const mod = await import("../.test-build/index.mjs");
@@ -759,19 +769,24 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 // 13. The verifier sandbox: the thinking lane has no writers, and the guard enforces it.
 {
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
-	// The churn guard reads the LIVE ledger over a 60 s WALL window, and the rig's whole run fits
-	// inside 60 s: every swap blocks 1-12 paid is in the window when this block asks the boundary to
-	// pay one. `flipGuarded` arms at FLIP_MIN_SWAPS (2), and an armed guard makes `loadLane` return
-	// `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next` — no swap, no
-	// `setModel`, so the four cases below read `pinsAt.slice(pinsBase) = []`. That is what the CI run
-	// recorded, and the local A/B reproduced it in BOTH rigs (HEAD's and the settled one) at load
-	// average 18, which is why the sleep was never the cause: clearing the ledger is.
-	// Block 13 measures the boundary's swap act — the pin, the thinking level and the briefing going
-	// out together — so the block starts from a ledger the guard cannot arm. The breaker's own
-	// behaviour is block 19b's subject, and it clears the ledger the same way for the same reason;
-	// clearing here neither tests nor weakens it.
-	mod.resetFlipLedger();
 	await commands.orchestrate.handler("verify", ctx);
+	// The churn guard refuses the boundary's swap outright. `loadLane` answers
+	// `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next` — no swap, no
+	// `setModel`, no thinking level, no briefing — and the four cases below read
+	// `pinsAt.slice(pinsBase) = []`, `[]`, `0 pages`. CI run 45956253588 at 96c117a recorded exactly
+	// that, with the ledger clear already sitting at this block's HEAD, and the repro is the runner's
+	// core count, not a load average: `taskset -c 0,1 npm run -s test:gate` reproduces the four
+	// failures (the runner has 2 cores; this box has 48, where the rig passes).
+	// Why the head clear was not enough, from `src/router.ts`: the ledger is a wall-window list of
+	// swaps THIS process observed on the router's health line, and `resetFlipLedger` clears
+	// `lastSwapSig` with it. A swap still in flight at the moment of the clear is therefore recorded
+	// again as a new flip — clearing mid-swap manufactures the count. So settle the stub's swap line
+	// to quiet first, then clear: the window is empty at the instant the guard is evaluated and
+	// cannot be refilled by an in-flight swap.
+	// Same instrument block 19b uses, for the same reason. The guard's own behaviour — swaps away
+	// from the resident lane counted and named — is block 19's subject and is untouched by this.
+	await settleSwapQuiet();
+	mod.resetFlipLedger();
 	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
 	await new Promise((r) => setTimeout(r, 120)); // the ctl child (spawn + POST) lands before the assertions read the pin
 	// The boundary pays the swap IN ONE ACT: the ctl stub (a child process: spawn + POST) lands and
