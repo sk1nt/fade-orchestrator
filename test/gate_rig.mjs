@@ -292,8 +292,14 @@ process.env.FADE_ORCHESTRATE_KEEPALIVE_MS = "50";
 //    budget. 15 ms is one poll: the load is paid as over-budget, the counters stay honest, and every
 //    swap-count assertion stays about exactly one `POST /v1/load`. From block 12 on `metricsOn` is
 //    false, so the router reads idle and the gate costs nothing.
-//  * the flip window, and the breaker's count at 3: block 19b drives three swaps AWAY from the run's
-//    lane and proves the loop stops paying for them.
+//  * the flip window (60 s) and the churn counts, at their SHIPPED values: the guard at two swaps,
+//    the rig's breaker at 3. Block 19 drives three swaps away from the run's lane and proves the
+//    loop stops paying for them; a higher breaker leaves that block short of the row clause it
+//    asserts (measured at 8 and at 40: no flip clause printed, 10-11 downstream cases failed), and
+//    the row's clause rides the guard's threshold, so the guard cannot move above the breaker
+//    either. The loop's own swaps — a verification boundary pays four — are excluded from the
+//    ledger by `router.ts:markOwnSwap`, which is what keeps block 13's act from refusing itself on
+//    the 2-core CI runner (CI run 45957020140: `no swap issued — FLIP GUARD: 4 swaps in 60s`).
 process.env.FADE_ORCHESTRATE_GATE_POLL_MS = "5";
 process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS = "15";
 process.env.FADE_ORCHESTRATE_FLIP_WINDOW_MS = "60000";
@@ -337,7 +343,7 @@ const pi = {
     // The listing this pin was issued AGAINST. The contract is the pair, not the id: a pin for
     // `hy4-flash` issued while the lane lists `flash-next` is the switch caller doing its act; the
     // completion is what waits (block 13, and `test/lane_switch_404.test.mjs`).
-    pinsAt.push({ id: model?.id, listing: resident });
+    pinsAt.push({ id: model?.id, listing: resident, req: reqLog.length });
     return { switched: true };
   },
   setThinkingLevel: (level) => void thinkingLevels.push(level),
@@ -769,6 +775,22 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 // 13. The verifier sandbox: the thinking lane has no writers, and the guard enforces it.
 {
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
+	// The boundary act needs a LIVE, un-routed run. An earlier block's chain can leave the run paused
+	// (the breaker halts: `run.paused = true`, `src/index.ts:912`) and mark the churn route; measured
+	// at 2 cores the act answered `paused at round 1 — no nudge sent, no lane loaded` — no swap, no
+	// pin, no briefing. And with the churn route live the verification batch is routed OFF the lane, so
+	// the briefing stays at 0 pages even when the pin case passes. Block 19b seeds the same fields for
+	// the same reason; this block inherits the run, so it clears the pause, the stall counters and the
+	// churn marks on the way in.
+	const s13pre = readState();
+	if (s13pre.paused || (s13pre.stall_count ?? 0) > 0 || s13pre.churn === true)
+		writeState({ ...s13pre, paused: false, stall_count: 0, churn: false, churn_utc: null });
+	// The churn ROUTE is the desk's flag, not the run's: `desk.json` carries `churn: true` (block 19b
+	// asserts it), so clearing the run's fields leaves the route live, the verification batch answered
+	// off the lane, and this boundary's briefing at 0 pages while the pin case passes. Drop the desk
+	// file the way 19b does when it wants a clean desk.
+	const desk13 = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
+	if (existsSync(desk13) && JSON.parse(readFileSync(desk13, "utf8")).churn === true) rmSync(desk13, { force: true });
 	await commands.orchestrate.handler("verify", ctx);
 	// The churn guard refuses the boundary's swap outright. `loadLane` answers
 	// `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next` — no swap, no
@@ -787,12 +809,23 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// from the resident lane counted and named — is block 19's subject and is untouched by this.
 	await settleSwapQuiet();
 	mod.resetFlipLedger();
+	// The pin's atomicity is measured by REQUEST ORDER, not by the listing it rode. The contract
+	// (`src/index.ts:1014-1024`) is "the load goes out and `setModel` + `setThinkingLevel` + the tool
+	// policy + the phase briefing follow in the same generation, with NO residency read in front of
+	// them", and `reqLog` records every stub request in order — so the pin's index against the first
+	// `/v1/models` read settles the question with no scheduler in the loop.
+	// The listing proxy that stood here is scheduler-determined: "the pin's instant" is when the rig's
+	// `setModel` handler runs (an RPC handling time), while the stub's flip is a `setTimeout`, so the
+	// ordering belongs to the box. Measured at 2 cores: a 150 ms transit failed deterministically (CI
+	// run 45957020140), 400 ms failed 1 of 4 runs, 600 ms failed 1 of 4 — every time the same
+	// `listing: "hy4-flash"`, the swap landed first. The case below asks what the code answers.
+	const reqBase13 = reqLog.length;
 	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
 	await new Promise((r) => setTimeout(r, 120)); // the ctl child (spawn + POST) lands before the assertions read the pin
 	// The boundary pays the swap IN ONE ACT: the ctl stub (a child process: spawn + POST) lands and
 	// `setModel` + `setThinkingLevel` + `applyToolPolicy` + the briefing follow in the same
-	// generation, with NO residency read in front of them. The rig dials a 150 ms transit so the
-	// window is observable: the pin must land while the stub router STILL lists the code pack.
+	// generation, with NO residency read in front of them — which is what the case below reads the
+	// stub's request order for. The transit dialled below is the window the 404 machinery grades.
 	// Prove-then-pin — the shape this file documented before the fix — is the halt's other half:
 	// it left the pin and the briefing naming the PREVIOUS pack for the whole load, and the next
 	// completion answered `404 The model 'flash-next' does not exist`.
@@ -800,12 +833,19 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	const sentBase = sent.length;
 	const thinkBase = thinkingLevels.length;
 	const pinsBase = pinsAt.length;
-	swapDelayMs = 150;
+	swapDelayMs = 150; // the transit the prove-then-pin / 404 machinery is graded against, as shipped
 	await new Promise((r) => setTimeout(r, 900));
 	swapDelayMs = 0;
 	const pin13 = pinsAt[pinsBase] ?? (await settlePins(pinsBase));
 	ok("the boundary's setModel names the verifier lane", pin13?.id === "hy4-flash", JSON.stringify(pinsAt.slice(pinsBase)));
-	ok("the pin went out WITH the load: the router still listed the code pack when the pin landed", pin13?.listing === "flash-next", JSON.stringify(pin13));
+	// Prove-then-pin has a request-level signature: a residency read BETWEEN the swap POST and the
+	// pin. Reads BEFORE the POST are the plugin's own planning (`switchPlan` asks the router what is
+	// resident) and the contract allows them; a read after it means the switch waited for the pack to
+	// serve before pinning, which is the shape that left the pin and the briefing naming the previous
+	// pack for the whole 13-25 s transit, and the next completion answering 404.
+	const swapIdx13 = reqLog.slice(reqBase13, pin13?.req ?? reqLog.length).lastIndexOf("POST /v1/load");
+	const readsBetween13 = swapIdx13 < 0 ? ["<no swap POST inside the act>"] : reqLog.slice(reqBase13 + swapIdx13 + 1, pin13?.req).filter((r) => r === "GET /v1/models");
+	ok("the pin went out WITH the load: no residency read sat between the swap and the pin", pin13?.id === "hy4-flash" && readsBetween13.length === 0, JSON.stringify({ readsBetween13, pin: pin13 }));
 	ok("the thinking level moved with the pin", thinkingLevels.length > thinkBase && thinkingLevels.at(-1) === "high", JSON.stringify(thinkingLevels.slice(thinkBase)));
 	ok("the briefing moved with the pin, not a turn later", sent.length > sentBase, `${sent.length - sentBase} pages`);
 	ok("the verifier lane's active set carries no writers (delegation stays)", !activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
