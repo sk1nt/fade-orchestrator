@@ -442,13 +442,13 @@ const settleModel = async (from, id, cap = 4000) => {
 	return modelCalls.at(-1);
 };
 /** The pin is what block 13's four cases read, and the failure this file had to explain printed
- *  `pinsAt.slice(pinsBase) = []` for all four of them (fadetheworld CI run 45947253544 at 2c1c2c49,
- *  and both rigs under a local load A/B). The cause is NOT the 900 ms sleep: the boundary's
- *  `loadLane` answered `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next`, so
- *  no `setModel` went out at all — see the clear at the head of block 13. The settle below covers the
- *  remaining class: a pin that lands a little after the fixed sleep closes. The caller invokes it ONLY
- *  when the entry is absent, so an idle box pays nothing, and ALWAYS after the transit dial is reset,
- *  so settling can never hold the swap window open past the moment the fixed sleep closed it. */
+ *  `pinsAt.slice(pinsBase) = []` for all four of them (CI run 45947253544 at 2c1c2c49, and both rigs
+ *  under a local load A/B). The cause is NOT the 900 ms sleep: the boundary's `loadLane` answered
+ *  `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next`, so no `setModel` went
+ *  out at all — see the clear at the head of block 13. The settle below covers the remaining class: a
+ *  pin that lands a little after the fixed sleep closes. The caller invokes it ONLY when the entry is
+ *  absent, so an idle box pays nothing, and ALWAYS after the transit dial is reset, so settling can
+ *  never hold the swap window open past the moment the fixed sleep closed it. */
 const settlePins = async (from, cap = 8000) => {
 	const t0 = Date.now();
 	while (pinsAt.length <= from && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
