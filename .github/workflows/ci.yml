@@ -22,10 +22,13 @@ jobs:
       - name: Provenance sweep
         # No internal ticket ids, dated measurement diaries, `file:line` pointers or private repo
         # paths may ship. Timestamps inside fixtures are DATA; a date written as prose is a hit.
-        # The literals use a character class so this step's own text cannot match the pattern it
-        # enforces.
+        # Each literal puts its character class where the target word has a plain character, so the
+        # step's own text cannot match the pattern it enforces. A class in the wrong position matches
+        # a word that exists nowhere, and the rule passes by being inert — measured: the previous form
+        # of the three name rules scored 0 hits repo-wide, and the two shipped private paths went
+        # uncaught. Keep the class in the bracketed slot when you add a rule.
         run: |
-          ! grep -rnE '\bY[0-9]{1,2}\b|2026-1[01]-|monoli[h]|deploy/o[m]p|fade[o]theworld|fade-f[a]bric|[a-z]+\.ts:? [0-9]{2,4}' src test docs README.md demo .github package.json --exclude-dir=out --exclude-dir=node_modules
+          ! grep -rnE '\bY[0-9]{1,2}\b|2026-1[01]-|monoli[t]h|deploy/[o]mp|fade[t]heworld|fade-f[a]bric|[a-z]+\.ts:? [0-9]{2,4}' src test docs README.md demo .github package.json --exclude-dir=out --exclude-dir=node_modules
       - name: Typecheck
         run: npm run typecheck
       # OMP loads src/*.ts directly, so this is the bundle the publish loop ships: esbuild must emit
