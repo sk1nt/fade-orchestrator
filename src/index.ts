@@ -39,6 +39,15 @@ import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
  *  separate ESM instances, so their `resetFlipLedger()` cannot reach the ledger the live extension
  *  counts in. A rig that needs a clean ledger has to come through here. */
 export { resetFlipLedger };
+/** The generation of the newest switch request, on the module surface for the rigs' instrument.
+ *  `switchGen` is the extension's private chain counter; the gate rig stamps every stub request and
+ *  every pin with this value, so the pin's atomicity is measured against the swap POST of the pin's
+ *  OWN generation. A concurrent generation's residency polls interleave the transit window, and
+ *  request adjacency alone cannot tell them apart — that is what made the adjacency form flake at
+ *  two cores (v14 runs 2c-2/3/4: three `GET /v1/models` from a neighbouring generation read as
+ *  prove-then-pin). Observation only: nothing in production reads it. */
+let latestSwitchGen = 0;
+export const currentSwitchGen = (): number => latestSwitchGen;
 import {
 	DESK_DEADLINE_MS,
 	DESK_SETTLE_MS,
@@ -761,6 +770,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let switchingTo: string | undefined;
 	const requestLane = (lane: string, ctx: ExtensionContext, quiet = false, handBack = false): void => {
 		const gen = ++switchGen;
+		latestSwitchGen = gen; // the observation seam: newest request wins, the chain serialises
 		// A switch that dies must SAY so: this catch used to be `() => undefined`, and a defect in
 		// the tail of `runSwitch` (the briefing, the tool policy) therefore showed up as a lane that
 		// pinned and went silent — no notify, no note, nothing in the record. The chain still

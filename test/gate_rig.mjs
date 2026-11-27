@@ -149,8 +149,16 @@ let swapLine = null;
  *  the old id, the completion answered 404. A rig that flips instantly cannot see the window, so
  *  it cannot grade the fix. */
 let swapDelayMs = 0;
+// The generation in force when each stub request was handled, parallel to `reqLog`: the pin's
+// atomicity is measured against the swap POST of the pin's OWN switch generation, because a
+// concurrent generation's residency polls (the serve-hold at `LANE_POLL_MS`, the flip-watch at
+// `METRICS_INTERVAL_MS`) interleave the ~200 ms transit, and adjacency alone cannot tell them apart.
+// `mod` is the extension module at the same specifier the rig drives (imported below); the handler
+// runs long after that import, so the read is live.
+const reqGen = [];
 const server = http.createServer(async (req, res) => {
   reqLog.push(`${req.method} ${req.url}`);
+  reqGen.push(mod.currentSwitchGen());
   let body = "";
   for await (const c of req) body += c;
   const send = (code, obj) => {
@@ -343,7 +351,7 @@ const pi = {
     // The listing this pin was issued AGAINST. The contract is the pair, not the id: a pin for
     // `hy4-flash` issued while the lane lists `flash-next` is the switch caller doing its act; the
     // completion is what waits (block 13, and `test/lane_switch_404.test.mjs`).
-    pinsAt.push({ id: model?.id, listing: resident, req: reqLog.length });
+    pinsAt.push({ id: model?.id, listing: resident, req: reqLog.length, gen: mod.currentSwitchGen() });
     return { switched: true };
   },
   setThinkingLevel: (level) => void thinkingLevels.push(level),
@@ -807,6 +815,13 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// cannot be refilled by an in-flight swap.
 	// Same instrument block 19b uses, for the same reason. The guard's own behaviour — swaps away
 	// from the resident lane counted and named — is block 19's subject and is untouched by this.
+	// The boundary must PAY the swap: this block asserts the pin rides the load. With the verifier
+	// lane already resident — an earlier act left it, and the rig owns the stub's listing, which its
+	// blocks set by hand before a start — the switch takes the zero-swap route and the pin has no
+	// POST of its generation to ride: v15-2c-1 measured pin `{id: "hy4-flash", req: 136, gen: 7}` with
+	// `<no swap POST by the pin's generation>`, one case in four at 2 cores. Land the run's lane on
+	// the way in, so the act's swap is mandatory, not scheduled.
+	if (resident === process.env.FADE_ORCHESTRATE_VERIFY_LANE) resident = "flash-next";
 	await settleSwapQuiet();
 	mod.resetFlipLedger();
 	// The pin's atomicity is measured by REQUEST ORDER, not by the listing it rode. The contract
@@ -819,33 +834,48 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// ordering belongs to the box. Measured at 2 cores: a 150 ms transit failed deterministically (CI
 	// run 45957020140), 400 ms failed 1 of 4 runs, 600 ms failed 1 of 4 — every time the same
 	// `listing: "hy4-flash"`, the swap landed first. The case below asks what the code answers.
+	// The bases are sampled BEFORE the act, and the transit is dialled before it. The switch is
+	// kicked off by `agent_end` and its ctl child lands in a few hundred ms, so on a fast runner the
+	// pin is already in `pinsAt` when the act returns: sampling after it — the shape that shipped —
+	// leaves the window empty by construction, `settlePins` then waits 8 s for a pin that already
+	// passed, and the four cases below read `[]`. CI runs 45958633125 and 45959423100 are that
+	// signature: a swap POST inside the window, no pin, and the `readsBetween` slice running to the
+	// end of the log. The box passes because its child spawn is slower than the act's return.
 	const reqBase13 = reqLog.length;
-	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
-	await new Promise((r) => setTimeout(r, 120)); // the ctl child (spawn + POST) lands before the assertions read the pin
-	// The boundary pays the swap IN ONE ACT: the ctl stub (a child process: spawn + POST) lands and
-	// `setModel` + `setThinkingLevel` + `applyToolPolicy` + the briefing follow in the same
-	// generation, with NO residency read in front of them — which is what the case below reads the
-	// stub's request order for. The transit dialled below is the window the 404 machinery grades.
-	// Prove-then-pin — the shape this file documented before the fix — is the halt's other half:
-	// it left the pin and the briefing naming the PREVIOUS pack for the whole load, and the next
-	// completion answered `404 The model 'flash-next' does not exist`.
-	const modelBase = modelCalls.length;
 	const sentBase = sent.length;
 	const thinkBase = thinkingLevels.length;
 	const pinsBase = pinsAt.length;
 	swapDelayMs = 150; // the transit the prove-then-pin / 404 machinery is graded against, as shipped
-	await new Promise((r) => setTimeout(r, 900));
+	// ONE load site: the verify verb defers, the boundary pays the swap — and it pays it IN ONE ACT:
+	// the ctl stub (a child process: spawn + POST) lands and `setModel` + `setThinkingLevel` + the
+	// tool policy + the phase briefing follow in the same generation, with NO residency read in front
+	// of them. Prove-then-pin — the shape this file documented before the fix — is the halt's other
+	// half: it left the pin and the briefing naming the PREVIOUS pack for the whole load, and the
+	// next completion answered `404 The model 'flash-next' does not exist`.
+	await hooks.agent_end({}, ctx);
+	await new Promise((r) => setTimeout(r, 900)); // the ctl child (spawn + POST + transit) lands
 	swapDelayMs = 0;
 	const pin13 = pinsAt[pinsBase] ?? (await settlePins(pinsBase));
 	ok("the boundary's setModel names the verifier lane", pin13?.id === "hy4-flash", JSON.stringify(pinsAt.slice(pinsBase)));
-	// Prove-then-pin has a request-level signature: a residency read BETWEEN the swap POST and the
-	// pin. Reads BEFORE the POST are the plugin's own planning (`switchPlan` asks the router what is
-	// resident) and the contract allows them; a read after it means the switch waited for the pack to
-	// serve before pinning, which is the shape that left the pin and the briefing naming the previous
-	// pack for the whole 13-25 s transit, and the next completion answering 404.
-	const swapIdx13 = reqLog.slice(reqBase13, pin13?.req ?? reqLog.length).lastIndexOf("POST /v1/load");
-	const readsBetween13 = swapIdx13 < 0 ? ["<no swap POST inside the act>"] : reqLog.slice(reqBase13 + swapIdx13 + 1, pin13?.req).filter((r) => r === "GET /v1/models");
-	ok("the pin went out WITH the load: no residency read sat between the swap and the pin", pin13?.id === "hy4-flash" && readsBetween13.length === 0, JSON.stringify({ readsBetween13, pin: pin13 }));
+	// What this measures, in one act: the act's generation issued the swap POST, and the pin names
+	// the verifier lane and rode that swap. `reqGen` stamps every stub request with the newest
+	// generation and the pin carries its own, so the zero-swap route cannot pass — v15-2c-1 measured
+	// pin `{id: "hy4-flash", req: 136, gen: 7}` with no POST of generation 7 in the window, because
+	// the verifier lane was already resident at the door (the door above lands the run's lane now).
+	// The clause that stood here — "no `GET /v1/models` between the swap POST and the pin" — is not
+	// measurable by request adjacency, and v15 measured why: the mirror names the NEWEST generation,
+	// so a poll issued by a neighbouring switch and handled while this generation is newest is
+	// stamped with it (v15-2c-2: pin `{id: hy4-flash, req: 147, gen: 7}` with three `GET /v1/models`
+	// stamped 7, all from the run's land path polling at `LANE_POLL_MS = 50`). The plugin's own
+	// POST-to-pin span issues no residency read: `loadLane` returns on the swap's completion and
+	// `runSwitch` pins before `laneServeHold` (`src/index.ts:1014-1050`), so adjacency in that span
+	// grades the scheduler, not the contract. The prove-then-pin SHAPE — the pin landing only after
+	// the lane serves, the next completion answering 404 — is graded against the transit dialled
+	// above by `test/lane_switch_404.test.mjs`; the briefing riding the act is the case below.
+	const win13 = reqLog.slice(reqBase13, pin13?.req ?? reqLog.length);
+	const gwin13 = reqGen.slice(reqBase13, pin13?.req ?? reqLog.length);
+	const swapByGen13 = win13.some((r, i) => r === "POST /v1/load" && gwin13[i] === pin13?.gen);
+	ok("the pin went out WITH the load: the act's generation issued the swap, and the pin names the verifier lane", pin13?.id === "hy4-flash" && swapByGen13, JSON.stringify({ swapByGen13, pin: pin13 }));
 	ok("the thinking level moved with the pin", thinkingLevels.length > thinkBase && thinkingLevels.at(-1) === "high", JSON.stringify(thinkingLevels.slice(thinkBase)));
 	ok("the briefing moved with the pin, not a turn later", sent.length > sentBase, `${sent.length - sentBase} pages`);
 	ok("the verifier lane's active set carries no writers (delegation stays)", !activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));

@@ -3856,6 +3856,8 @@ async function listRuns(dir) {
 }
 
 // src/index.ts
+var latestSwitchGen = 0;
+var currentSwitchGen = () => latestSwitchGen;
 var GATE_POLL_MS = Number(process.env.FADE_ORCHESTRATE_GATE_POLL_MS ?? 3e3);
 var GATE_BUDGET_MS = Number(process.env.FADE_ORCHESTRATE_GATE_BUDGET_MS ?? 6e4);
 var FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+f";
@@ -4227,6 +4229,7 @@ function fadeOrchestrate(pi) {
   let switchingTo;
   const requestLane = (lane, ctx, quiet = false, handBack = false) => {
     const gen = ++switchGen;
+    latestSwitchGen = gen;
     switchChain = switchChain.then(() => gen === switchGen ? runSwitch(lane, ctx, gen, quiet, handBack) : void 0).catch((e) => {
       ctx.ui.notify(`fade_orchestrate: the ${lane} switch failed: ${msg(e)} \u2014 the lane it was owed did NOT land`, "error");
     });
@@ -5603,6 +5606,7 @@ ${SCHEMA_HINT}`);
   });
 }
 export {
+  currentSwitchGen,
   fadeOrchestrate as default,
   resetFlipLedger
 };
