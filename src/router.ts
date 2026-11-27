@@ -487,6 +487,18 @@ export const LANE_LEASE_TTL_SEC = Number(process.env.FADE_ORCHESTRATE_LANE_LEASE
  *  readiness window is far longer, so the proof waits and names the state — it never kills a load. */
 export const START_PROOF_WAIT_MS = Number(process.env.FADE_ORCHESTRATE_START_PROOF_WAIT_MS ?? 240_000);
 
+/** Basalt's keep-alive cadence for a client that waits through a swap
+ *  (`basalt/docs/running.md`, `docs/changelog/0.3.0.md`: "Clients wait through a swap; they do
+ *  not get a 503 for it. A streamed response sends keep-alive comments every 10 s while it
+ *  waits."). The hold below refreshes the working message on this clock, so the operator sees
+ *  the swap moving and the host client never times out. */
+export const LANE_KEEPALIVE_MS = Number(process.env.FADE_ORCHESTRATE_KEEPALIVE_MS ?? 10_000);
+
+/** The wait ceiling is the daemon's own readiness window (900 s), never a client timeout: a pack
+ *  load is tens of seconds and tens of gigabytes, and Basalt's router holds a request for the
+ *  loaded model for that whole window. Rigs override it. */
+export const SERVE_WAIT_MS = Number(process.env.FADE_ORCHESTRATE_SERVE_WAIT_MS ?? 900_000);
+
 export interface LaneProof {
 	ok: boolean;
 	/** The daemon's `lane_state` at the end of the window; `unknown` when it never answered. */
@@ -499,10 +511,12 @@ export interface LaneProof {
 }
 
 /** Admitted is not loaded, and `RESIDENT` proves only that SOME model answered the readiness probe.
- *  The proof is BOTH: the daemon names `target` as the resident pack AND the router serves `target`
- *  as an id. A daemon that never answers, and a router that serves another id, are failures — a
- *  census error is never a skip, because a session pinned to an id the lane does not serve answers
- *  `404 The model '<id>' does not exist`. */
+ *  The proof is BOTH, polled together until they agree: the daemon names `target` as the resident
+ *  pack AND the router serves `target` as an id. Breaking on the daemon half and one-shotting the
+ *  router was the 404: `swap` ADMITTED, supervisor already `RESIDENT pack=flash-next`, `:18014`
+ *  still listing `hy4-flash`, and the next turn named the pack that was not serving —
+ *  `404 The model 'flash-next' does not exist`. A daemon that never answers, and a router that
+ *  still serves another id at the end of the window, are failures that name their class. */
 export async function proveResident(target: string, opts: { sessionId?: string; waitMs?: number; pollMs?: number } = {}): Promise<LaneProof> {
 	const sid = opts.sessionId ?? "fade-orchestrator";
 	const waitMs = opts.waitMs ?? LANE_WAIT_MS;
@@ -510,19 +524,122 @@ export async function proveResident(target: string, opts: { sessionId?: string; 
 	const t0 = Date.now();
 	let state = "unknown";
 	let pack: string | undefined;
+	let idn: { id?: string; n_ctx?: number } | undefined;
 	for (;;) {
 		const now = await supervisorResident(target, sid);
 		state = now?.state ?? state;
 		pack = now?.pack ?? pack;
-		if (now?.resident) break;
+		idn = await servedIdentity();
+		if (now?.resident && idn?.id === target) break;
 		if (Date.now() - t0 >= waitMs) break;
 		const { promise: tick, resolve: tickDone } = Promise.withResolvers<void>();
 		setTimeout(tickDone, pollMs);
 		await tick;
 	}
-	const idn = await servedIdentity();
 	const waited_s = (Date.now() - t0) / 1000;
 	return { ok: state === "RESIDENT" && pack === target && idn?.id === target, state, pack, served_id: idn?.id, n_ctx: idn?.n_ctx, waited_s };
+}
+
+
+export interface ServeHold {
+	ok: boolean;
+	/** The id the router served at the end of the wait; `undefined` when it answers nothing. */
+	served_id?: string;
+	/** `/v1/models` reads taken. A pin that already matches the served id is ONE. */
+	polls: number;
+	/** Working-message refreshes, each on the keep-alive clock. */
+	refreshes: number;
+	waited_s: number;
+	/** A load the router itself declares failed: Basalt's 503 class, not a slow swap. */
+	failed: boolean;
+	reason: string;
+}
+
+/**
+ * Hold the completion the way Basalt's router holds it, for a box whose `:18014` process is
+ * REPLACED by a supervisor swap and therefore serves exactly one id.
+ *
+ * Basalt's contract, copied from `configuration/models.md` and `running.md`: a request for the
+ * loaded model runs at once; a request for a name the server does not carry is a 404; a client
+ * waits through a swap and is never 503'd for it. On this box the swap is a process replacement,
+ * so "the model is not in that server's `models` list" is the 404
+ * `The model 'flash-next' does not exist` the loop died on — the pin named the pack the swap was
+ * bringing in, and the completion posted before it served.
+ *
+ * So this is the wait: one read, and if the served id already is `wanted`, it returns at once
+ * (zero extra polls — the loaded model runs at once). Otherwise it holds, refreshing the working
+ * message on the keep-alive clock with the router's own percent, and returns only when the lane
+ * serves `wanted`, when the router declares the load FAILED (the 503 class), or when the
+ * daemon's readiness window is spent. It never posts, and it never answers for the host.
+ */
+export async function laneServeHold(
+	wanted: string,
+	opts: {
+		waitMs?: number;
+		pollMs?: number;
+		keepAliveMs?: number;
+		served?: () => Promise<{ id?: string; n_ctx?: number } | undefined>;
+		health?: () => Promise<RouterHealth | undefined>;
+		/** The keep-alive page: one line per refresh. `percent` rides so a caller with a painted
+		 *  surface (the status pill, the Alt+F header) can move it with the load; the working
+		 *  message already carries the percent in its own words. */
+		progress?: (message: string, percent?: number) => void;
+	} = {},
+): Promise<ServeHold> {
+	const served = opts.served ?? servedIdentity;
+	const health = opts.health ?? laneHealth;
+	const pollMs = opts.pollMs ?? LANE_POLL_MS;
+	const waitMs = opts.waitMs ?? SERVE_WAIT_MS;
+	const keepAliveMs = opts.keepAliveMs ?? LANE_KEEPALIVE_MS;
+	const t0 = Date.now();
+	let polls = 0;
+	let refreshes = 0;
+	let nextRefreshAt = t0;
+	for (;;) {
+		const idn = await served();
+		polls += 1;
+		if (idn?.id === wanted) {
+			return { ok: true, served_id: idn.id, polls, refreshes, failed: false, waited_s: (Date.now() - t0) / 1000, reason: `${wanted} is the id the lane serves` };
+		}
+		if (Date.now() - t0 >= waitMs) {
+			return {
+				ok: false,
+				...(idn?.id !== undefined ? { served_id: idn.id } : {}),
+				polls,
+				refreshes,
+				failed: false,
+				waited_s: (Date.now() - t0) / 1000,
+				reason: `the lane serves ${idn?.id ?? "nothing"}, not ${wanted}, after ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+			};
+		}
+		if (Date.now() >= nextRefreshAt) {
+			const h = await health();
+			refreshes += 1;
+			nextRefreshAt = Date.now() + keepAliveMs;
+			// Basalt's failed load "answers its batch with a 503 naming the model". The router's own
+			// pre-unload verdict names the same class: an error state, a dead zero-VRAM context, a
+			// loaded context that names no model. A swap still in flight — `loading: true`, or
+			// `/health` refusing while the process is being replaced — is NOT a failure: that is
+			// precisely the wait Basalt holds a client through, so it keeps waiting.
+			const verdict = serveVerdict(h);
+			if (!verdict.serve && h !== undefined && h.loading !== true) {
+				return {
+					ok: false,
+					...(idn?.id !== undefined ? { served_id: idn.id } : {}),
+					polls,
+					refreshes,
+					failed: true,
+					waited_s: (Date.now() - t0) / 1000,
+					reason: `${wanted} did not come up: ${verdict.reason} — the 503 class, not a slow swap`,
+				};
+			}
+			const pct = typeof h?.percent === "number" ? Math.round(h.percent) : undefined;
+			opts.progress?.(`fade_orchestrate: ${wanted} is not serving yet (the lane answers ${idn?.id ?? "nothing"})${pct !== undefined ? ` ${pct}%` : ""} — this request waits, it does not time out`, pct);
+		}
+		const { promise: tick, resolve: tickDone } = Promise.withResolvers<void>();
+		setTimeout(tickDone, pollMs);
+		await tick;
+	}
 }
 
 /** The screen's model pin, or `undefined` = leave the screen alone. `residentPack` is the daemon's
@@ -535,6 +652,13 @@ export function laneSyncTarget(residentPack: string | undefined, owed: string | 
 	const target = packToModelId(residentPack);
 	if (owed !== undefined && packToModelId(owed) !== target) return undefined;
 	return target;
+}
+
+/** The names this box's router is meant to serve: the three lanes. Basalt's rule is that a
+ *  request for a name the server does not carry is a 404 — "any other name" — so a pin outside
+ *  this set is the HOST's 404 to answer, and the hold stays out of it. */
+export function isServedLane(id: string): boolean {
+	return id === CODE_LANE || id === THINK_LANE || id === VERIFY_LANE;
 }
 
 const statusOf = (m: Record<string, unknown>): string => {

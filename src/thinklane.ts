@@ -86,8 +86,20 @@ export interface AskOpts {
 	 *  endpoint. Absent means the server's own default — never a silent `low`. */
 	thinking?: "high" | "low";
 	timeoutMs?: number;
-	/** A system line, sent when the API carries one. */
+	/** A system line, sent when the API carries one. THE ROLE'S STATIC PREFIX: the KV prefix cache
+	 *  is keyed on the bytes ahead of the newest user message, so a system line that changes per
+	 *  turn re-prefills the whole prompt. Round numbers, cycle counters, lane status and any other
+	 *  telemetry belong in the `prompt` (the latest user leg), never here. */
 	system?: string;
+	/** The role-scoped conversation key (`role:planner`, `role:coder`, `role:verifier`). Basalt's
+	 *  session identity is the body's `session_id` or the `x-session-id` header
+	 *  (`serve/handler.py:SESSION_HEADERS`, `_session_id`), and the engine's conversation slot —
+	 *  the KV prefix cache in RAM and on disk — follows it. Every turn of ONE role sends the ONE
+	 *  key, so each role keeps its own warm prefix and none evicts another's. Deterministic by
+	 *  rule: no timestamp, no round, no cycle counter — a key that moves per turn is a key that
+	 *  re-prefills per turn. Absent, the key is the lane's own model id, which is stable per role
+	 *  for as long as the role is routed to that lane. */
+	role?: string;
 }
 
 export interface AskDeps extends ProbeDeps {
@@ -220,6 +232,12 @@ export async function askLane(model: string, prompt: string, opts: AskOpts = {},
 		return finish({ ok: false, text: "", cls: "endpoint_unreachable", endpoint, model: spec.model, detail: `${note.replace(/^; /, "")} — no request sent to ${endpoint}` });
 	}
 
+	// ROLE-SCOPED SESSION AFFINITY: one deterministic key per role, on both surfaces basalt reads
+	// (the body's `session_id`, the `x-session-id` header). The probes in lane.ts stay UNKEYED: a
+	// probe is one request, and a key per probe would open a cache slot per probe.
+	const session = opts.role && opts.role !== "" ? opts.role : `role:${spec.model}`;
+	headers["x-session-id"] = session;
+
 	const base = completionRequest(spec.api, spec.model).body as Record<string, unknown>;
 	const messages: { role: string; content: string }[] = [];
 	if (opts.system) messages.push({ role: "system", content: opts.system });
@@ -227,6 +245,7 @@ export async function askLane(model: string, prompt: string, opts: AskOpts = {},
 	const body: Record<string, unknown> = {
 		...base,
 		model: spec.model,
+		session_id: session,
 		max_tokens: opts.maxTokens ?? ASK_MAX_TOKENS,
 		messages,
 	};

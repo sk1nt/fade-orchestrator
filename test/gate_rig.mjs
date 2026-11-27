@@ -142,6 +142,13 @@ let metricsOn = true;
 /** The swap the router is mid-way through, as its own `/health` line reports it. `null`
  *  between swaps, exactly as the real router clears `swap` when a swap lands. */
 let swapLine = null;
+/** The swap's transit, in rig milliseconds. `0` (the default, every block but the verification
+ *  boundary) flips the resident pack the instant the POST lands, which is what every settle reads.
+ *  The verification boundary dials it: the real box replaces the `:18014` process over 13-25 s, and
+ *  the halt of 2026-11-26 lives INSIDE that window — the pack was swapped, the session pin named
+ *  the old id, the completion answered 404. A rig that flips instantly cannot see the window, so
+ *  it cannot grade the fix. */
+let swapDelayMs = 0;
 const server = http.createServer(async (req, res) => {
   reqLog.push(`${req.method} ${req.url}`);
   let body = "";
@@ -173,11 +180,21 @@ const server = http.createServer(async (req, res) => {
       data: [
         { id: "flash-next", status: { value: resident === "flash-next" ? "loaded" : "unloaded" } },
         { id: "deepseek", status: { value: resident === "deepseek" ? "loaded" : "unloaded" } },
+        { id: "hy4-flash", status: { value: resident === "hy4-flash" ? "loaded" : "unloaded" } },
       ],
     });
   if (req.url === "/v1/load" && req.method === "POST") {
     const { model } = JSON.parse(body || "{}");
-    resident = model;
+    if (swapDelayMs > 0) {
+      // Accepted, and NOT yet serving: the listing keeps the old id and `/health` says loading,
+      // the way the swapped process does mid-transit. The real box takes 13-25 s for this window;
+      // a block that must see it dials `swapDelayMs`, and 0 (every other block) flips at once.
+      swapLine = { from: resident, to: model };
+      setTimeout(() => {
+        resident = model;
+        swapLine = null;
+      }, swapDelayMs);
+    } else resident = model;
     return send(200, { ok: true, model });
   }
   if (req.url === "/metrics")
@@ -257,6 +274,7 @@ process.env.FADE_ORCHESTRATE_VERIFY_LANE = "hy4-flash";
 // rig's blocks set `resident` by hand before a start, so the proof lands on its first poll; the
 // short ceiling is a fuse, never a lever: a proof that misses is a rig bug, named by detail.
 process.env.FADE_ORCHESTRATE_START_PROOF_WAIT_MS = "800";
+process.env.FADE_ORCHESTRATE_LANE_POLL_MS = "50";
 // The serve-hold the SWITCH runs (the boundary's holding page, the same wrapper
 // `before_agent_start` uses for the completion). Its ceiling in production is the daemon's
 // readiness window, so the rig pins it in milliseconds: a hold that never ends is a rig defect
@@ -316,9 +334,13 @@ const pi = {
   },
   setModel: async (model) => {
     modelCalls.push(model);
+    // The listing this pin was issued AGAINST. The contract is the pair, not the id: a pin for
+    // `hy4-flash` issued while the lane lists `flash-next` is the switch caller doing its act; the
+    // completion is what waits (block 13, and `test/lane_switch_404.test.mjs`).
+    pinsAt.push({ id: model?.id, listing: resident });
     return { switched: true };
   },
-  setThinkingLevel: () => {},
+  setThinkingLevel: (level) => void thinkingLevels.push(level),
   getActiveTools: () => activeTools,
   setActiveTools: (t) => void (activeTools = t),
   sendUserMessage: (t) => void sent.push(t),
@@ -326,6 +348,10 @@ const pi = {
 const notes = [];
 /** Every `pi.setModel` call, in order: the hand-back cases name the model the plugin chose. */
 const modelCalls = [];
+/** The router listing each `pi.setModel` rode, in order: see `setModel` above. */
+const pinsAt = [];
+/** Every `pi.setThinkingLevel` argument, in order. */
+const thinkingLevels = [];
 /** Every `setWorkingMessage` call, in order: the gate names the row it is RUNNING, so the rig can
  *  prove the operator watches progress instead of a frozen terminal. `null` is the clear. */
 const working = [];
@@ -402,6 +428,18 @@ const settleLoads = async (from, want = 1, cap = 4000) => {
 	const t0 = Date.now();
 	while (loads() - from < want && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
 	return loads() - from;
+};
+/** The pin follows the served-id proof, which is AFTER the load. Settling on POST /v1/load
+ *  and then reading `modelCalls` is the old setModel-first race: the stub has loaded, the
+ *  proof is in flight, and the assertion names the previous pack. Wait for the id. */
+const settleModel = async (from, id, cap = 4000) => {
+	const t0 = Date.now();
+	while (Date.now() - t0 < cap) {
+		const hit = modelCalls.slice(from).find((m) => m?.id === id);
+		if (hit) return hit;
+		await new Promise((r) => setTimeout(r, 10));
+	}
+	return modelCalls.at(-1);
 };
 const exec = (phase, payload) => tools.fade_phase.execute("id", { phase, payload: JSON.stringify(payload) }, null, null, ctx);
 
@@ -711,9 +749,6 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	await commands.orchestrate.handler("verify", ctx);
 	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
 	await new Promise((r) => setTimeout(r, 120)); // the ctl child (spawn + POST) lands before the assertions read the pin
-	// The boundary pays the swap: `setModel` lands first, then the ctl stub (a child process:
-	// spawn + POST) completes and `applyToolPolicy` strips the writers. 150 ms lost that race.
-	await new Promise((r) => setTimeout(r, 600));
 	// The boundary pays the swap IN ONE ACT: the ctl stub (a child process: spawn + POST) lands and
 	// `setModel` + `setThinkingLevel` + `applyToolPolicy` + the briefing follow in the same
 	// generation, with NO residency read in front of them. The rig dials a 150 ms transit so the
@@ -727,7 +762,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	const pinsBase = pinsAt.length;
 	swapDelayMs = 150;
 	await new Promise((r) => setTimeout(r, 900));
+	swapDelayMs = 0;
+	const pin13 = pinsAt[pinsBase];
 	ok("the boundary's setModel names the verifier lane", pin13?.id === "hy4-flash", JSON.stringify(pinsAt.slice(pinsBase)));
+	ok("the pin went out WITH the load: the router still listed the code pack when the pin landed", pin13?.listing === "flash-next", JSON.stringify(pin13));
+	ok("the thinking level moved with the pin", thinkingLevels.length > thinkBase && thinkingLevels.at(-1) === "high", JSON.stringify(thinkingLevels.slice(thinkBase)));
+	ok("the briefing moved with the pin, not a turn later", sent.length > sentBase, `${sent.length - sentBase} pages`);
 	ok("the verifier lane's active set carries no writers (delegation stays)", !activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("task") && activeTools.includes("fade_phase"), JSON.stringify(activeTools));
 	const blocked = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "x", input: {} }, ctx);
 	ok("a verifier edit is BLOCKED with the rule named", blocked?.block === true && /read-only/.test(blocked.reason ?? ""), JSON.stringify(blocked));
@@ -757,10 +797,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// one setModel + one quiet load, no briefing sent for a lane nobody asked about.
 	const loadBase = loads();
 	const sentBase = sent.length;
+	const modelBase = modelCalls.length;
 	await hooks.agent_end({}, ctx);
 	const landed = await settleLoads(loadBase, 1);
 	ok("a completed run hands the lane back to the code lane", landed >= 1 && loads() - loadBase === 1, `${loads() - loadBase}`);
-	ok("the completed run's hand-back is a setModel naming flash-next", modelCalls.at(-1)?.id === "flash-next", JSON.stringify(modelCalls.at(-1)));
+	const pinned = await settleModel(modelBase, "flash-next");
+	ok("the completed run's hand-back is a setModel naming flash-next", pinned?.id === "flash-next", JSON.stringify(pinned));
 	ok("the completed run's hand-back carries no briefing", sent.length === sentBase, `${sent.length - sentBase}`);
 }
 
@@ -1676,7 +1718,8 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await hooks.agent_end({}, ctx);
   const got1 = await settleLoads(b1, 1);
   ok("a non-run session on the thinking lane hands back with one load", got1 >= 1 && loads() - b1 === 1, `${loads() - b1}`);
-  ok("the non-run hand-back is a setModel naming flash-next", modelCalls.length === m1 + 1 && modelCalls.at(-1)?.id === "flash-next", JSON.stringify(modelCalls.slice(m1)));
+  const pinned1 = await settleModel(m1, "flash-next");
+  ok("the non-run hand-back is a setModel naming flash-next", pinned1?.id === "flash-next" && modelCalls.length === m1 + 1, JSON.stringify(modelCalls.slice(m1)));
   ok("the non-run hand-back sends no briefing", sent.length === s1, `${sent.length - s1}`);
 
   // (b) the code lane is already the session's model: nothing is sent

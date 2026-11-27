@@ -15,6 +15,17 @@
  * A daemon that never answers, a router that answers 404, and a resident pack that is not the
  * served id are each failures that NAME their class. The proof reads: it takes no lease, issues
  * no swap, and never kills a load in flight — the window is a fuse, not a lever.
+ *
+ * WHAT THIS PROOF IS NOT, since the same day: the SWITCH path. The halt that ended the day was
+ * the opposite shape — a review round announced `hy4-flash` while the session's completion still
+ * named `flash-next`, and the host answered `404 The model 'flash-next' does not exist`. A
+ * residency proof placed IN FRONT of the pin is what produced it: the proof spends the whole
+ * 13-25 s load, so the pin and the briefing sat on the PREVIOUS pack the entire time. The switch
+ * now issues load + `setModel` + thinking + tool policy + briefing in ONE generation and lets
+ * `before_agent_start` hold the COMPLETION until the lane serves the pin — the contract is
+ * `test/lane_switch_404.test.mjs`, and block 13 of `test/gate_rig.mjs` grades the boundary.
+ * `proveResident` stays exactly where it belongs: the start preflight, and the operator's `/lane`
+ * verb, which reads state and swaps nothing.
  */
 import "./env.mjs?suite=preflight_proof";
 import { test } from "node:test";
@@ -105,12 +116,29 @@ test("the proof is BOTH: daemon RESIDENT for the target AND the router serving i
 test("the start defect, reproduced: RESIDENT for the target while the router serves another id is NOT a proof", async () => {
 	// The 404 class: the daemon's readiness probe was answered by SOME model, the lane serves
 	// `flash-next`, and a session pinned to `deepseek` sends a request the router refuses.
+	// The wait is the whole window: breaking on the daemon half and one-shotting the router
+	// was the measured 404 (hy4-flash still listed, session already named flash-next).
 	rt.state.loaded = "flash-next";
+	const t0 = Date.now();
 	const p = await prove("deepseek");
+	const spent = Date.now() - t0;
 	assert.equal(p.ok, false, JSON.stringify(p));
 	assert.equal(p.state, "RESIDENT", "the daemon's half is named, because it passed");
 	assert.equal(p.served_id, "flash-next", "the router's half is the failure, and it is the named one");
+	assert.ok(spent >= 250, `the proof WAITS the window for the router id, it does not one-shot: ${spent}ms`);
 	rt.state.loaded = "deepseek";
+});
+
+test("the router catching up mid-window is a proof: the wait is for BOTH halves, not the daemon alone", async () => {
+	rt.state.loaded = "flash-next";
+	setTimeout(() => { rt.state.loaded = "deepseek"; }, 80);
+	const t0 = Date.now();
+	const p = await prove("deepseek");
+	const spent = Date.now() - t0;
+	assert.equal(p.ok, true, JSON.stringify(p));
+	assert.equal(p.served_id, "deepseek");
+	assert.ok(spent >= 80, `the proof waited for the served id, it did not accept the daemon half alone: ${spent}ms`);
+	assert.ok(spent < 300, `a catch-up inside the window does not spend the fuse: ${spent}ms`);
 });
 
 test("an IDLE lane is a failure that names the state, and the window is spent, never skipped", async () => {

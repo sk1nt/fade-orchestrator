@@ -41,7 +41,7 @@ const VERIFY = "hy4-flash";
 const CODE = "flash-next";
 const THINK = "deepseek";
 const TOKEN = "T-VERIFY";
-const IDLE = { lane_state: "IDLE", active_pack: CODE, pid: 4242, active_requests: 0, telemetry: { source: "nvml" }, supervisor: { version: "0.2.0" } };
+const IDLE = { lane_state: "RESIDENT", active_pack: CODE, pid: 4242, active_requests: 0, telemetry: { source: "nvml" }, supervisor: { version: "0.2.0" } };
 const HEALTH = { status: "ok", model: CODE, loaded: true, loading: false, service: "basalt", percent: null, swap: null };
 
 /** The stub supervisor on a Unix socket: one line per byte, so the assertions are the wire. */
@@ -158,6 +158,10 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		// harness window can never be mistaken for the plugin's 13-25 s pack load.
 		FADE_ORCHESTRATE_SETTLE_MAX_MS: "2000",
 		FADE_ORCHESTRATE_SETTLE_POLL_MS: "200",
+		// The phase-boundary switch now PROVES the served id before setModel. The stub lands on
+		// the first poll; a miss must fail in milliseconds, never the box's 240 s window.
+		FADE_ORCHESTRATE_START_PROOF_WAIT_MS: "800",
+		FADE_ORCHESTRATE_LANE_POLL_MS: "50",
 		FADE_ORCHESTRATE_KEY: "ctrl+shift+f13",
 		FADE_ORCHESTRATE_FALLBACK_KEY: "ctrl+shift+f14",
 	});

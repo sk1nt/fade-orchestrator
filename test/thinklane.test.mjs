@@ -257,3 +257,48 @@ test("resolution reports the provider plane in words an operator can act on", ()
 	assert.equal(resolveAskSpec("basalt-deepseek/deepseek", { yml: YML }).spec.baseUrl, "http://127.0.0.1:18016/v1");
 	assert.match(resolveAskSpec("strata-flash/nope", { yml: YML }).error, /advertises flash-next, deepseek, not nope/);
 });
+
+// The KV-cache contract (the second half of why this path exists): basalt keys a conversation's
+// engine slot on the body's `session_id` or the `x-session-id` header
+// (`serve/handler.py:SESSION_HEADERS`, `_session_id`). One deterministic key per ROLE, on both
+// surfaces, so the planner's warm prefix survives the coder's turn; and the prefix bytes ahead of
+// the newest user message stay byte-identical, because a system line that moves re-prefills the
+// whole prompt. The dynamic text rides ONLY in the user leg.
+
+const bodiesOf = (calls) => calls.map((c) => JSON.parse(c.init.body));
+
+test("every turn of one role sends the ONE key basalt keys its KV slot on, on body and header", async () => {
+	const { calls, fetchImpl } = stub();
+	const deps = { yml: YML, resident: "flash-next", fetchImpl };
+	const system = "You are the planner of this loop. Static text, no counters.";
+	const a = await askLane("strata-flash/flash-next", "round 1: plan the change", { role: "role:planner", system }, deps);
+	const b = await askLane("strata-flash/flash-next", "round 2: plan the change", { role: "role:planner", system }, deps);
+	assert.ok(a.ok && b.ok);
+	assert.deepEqual(bodiesOf(calls).map((b) => b.session_id), ["role:planner", "role:planner"]);
+	assert.deepEqual(calls.map((c) => c.init.headers["x-session-id"]), ["role:planner", "role:planner"]);
+	// The prefix leg is byte-identical; only the newest user message moves.
+	assert.deepEqual(bodiesOf(calls).map((b) => b.messages.filter((m) => m.role === "system")), [
+		[{ role: "system", content: system }],
+		[{ role: "system", content: system }],
+	]);
+	assert.deepEqual(bodiesOf(calls).map((b) => b.messages.at(-1).content), ["round 1: plan the change", "round 2: plan the change"]);
+	noLoadByte(calls);
+});
+
+test("roles that differ get different slots, so a coder turn cannot evict the planner's prefix", async () => {
+	const { calls, fetchImpl } = stub();
+	const deps = { yml: YML, resident: "flash-next", fetchImpl };
+	await askLane("strata-flash/flash-next", "plan", { role: "role:planner" }, deps);
+	await askLane("strata-flash/flash-next", "code", { role: "role:coder" }, deps);
+	await askLane("strata-flash/flash-next", "verify", { role: "role:verifier" }, deps);
+	assert.deepEqual(bodiesOf(calls).map((b) => b.session_id), ["role:planner", "role:coder", "role:verifier"]);
+	assert.deepEqual(calls.map((c) => c.init.headers["x-session-id"]), ["role:planner", "role:coder", "role:verifier"]);
+});
+
+test("with no role named the key is the lane's own id, and it does not move between turns", async () => {
+	const { calls, fetchImpl } = stub();
+	const deps = { yml: YML, resident: "flash-next", fetchImpl };
+	await askLane("strata-flash/flash-next", "one", {}, deps);
+	await askLane("strata-flash/flash-next", "two", {}, deps);
+	assert.deepEqual(bodiesOf(calls).map((b) => b.session_id), ["role:flash-next", "role:flash-next"]);
+});
