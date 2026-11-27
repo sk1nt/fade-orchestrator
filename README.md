@@ -36,7 +36,7 @@ named at login** — the documented lane wins and the refusal rides the status l
   PROVEN: the supervisor daemon's `lane_state` says `RESIDENT` with `active_pack` = the planning
   pack AND the router serves that id on `/v1/models`. The old one-shot census SKIPPED on a census
   error, the session pinned an id the lane did not serve, and the planning briefing answered
-  `404 The model 'basalt/deepseek' does not exist` — measured 2026-11-26. A cold load is not refused:
+  `404 The model 'basalt/deepseek' does not exist` — measured. A cold load is not refused:
   the proof polls the daemon's readiness window (`FADE_ORCHESTRATE_START_PROOF_WAIT_MS`, default 240 s,
   13–25 s is the measured load) and never kills a swap in flight. The refusal is a line naming the
   daemon state, the pack, the served id and the wait, and it pays no briefing and writes no state
@@ -229,8 +229,8 @@ OMP loads the TypeScript source directly; `dist/index.js` is the bundled single-
 |---|---|---|
 | `FADE_ORCHESTRATE_ROUTER` | `http://127.0.0.1:18014` | basalt router base URL |
 | `FADE_ORCHESTRATE_LOCK_DIR` | `~/.local/state/fade-orchestrator` | the base of the **router claim**: one file per router (`<router-slug>/orchestrator.lock`), holding the owning pid, run id, repo, host and start time. A run claims its router at the keystroke and releases it at `halt`/`stop`/completion/preflight failure; a second session on the same router is refused before any lane load or state write, and the refusal, `/orchestrate status` and the screen all name the holder **with the age of the claim** (`· held 12h00m`), which is the "is this a session that never ended?" reading. Set it to move the whole plane (rigs, containers, a read-only home) |
-| `FADE_ORCHESTRATE_PROVIDER` | `basalt` | OMP provider id the lanes live under. `basalt` is the provider that declares every alias of the single `:18014` lane; the live `modelRoles` are all `basalt/*`. `strata-flash` names only `flash-next`, so a thinking-lane `setModel` there cannot resolve and every lane move dies at the registry lookup (measured 2026-11-25) |
-| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | the **planning** lane. **Read from `process.env` at import** (`src/router.ts`), so `.bashrc` setting it means nothing: a live session cannot be repointed — relaunch with the lane on the launch line. A value equal to the code lane is **refused and named** (the box's `inference-keys.env` exports `flash-next`; honored, that made planning and coding run on the coder's pack with zero swaps, measured 2026-11-26) and the documented lane wins |
+| `FADE_ORCHESTRATE_PROVIDER` | `basalt` | OMP provider id the lanes live under. `basalt` is the provider that declares every alias of the single `:18014` lane; the live `modelRoles` are all `basalt/*`. `strata-flash` names only `flash-next`, so a thinking-lane `setModel` there cannot resolve and every lane move dies at the registry lookup (measured) |
+| `FADE_ORCHESTRATE_THINK_LANE` | `deepseek` | the **planning** lane. **Read from `process.env` at import** (`src/router.ts`), so `.bashrc` setting it means nothing: a live session cannot be repointed — relaunch with the lane on the launch line. A value equal to the code lane is **refused and named** (the box's `inference-keys.env` exports `flash-next`; honored, that made planning and coding run on the coder's pack with zero swaps, measured) and the documented lane wins |
 | `FADE_ORCHESTRATE_CODE_LANE` | `flash-next` | the coder's pack; the same import-time read, so the boundary hands back to whatever this names. Naming a documented thinking pack here (`deepseek`, `hy4-flash`) is refused the same way: it collapses every lane onto one swap-free coder |
 | `FADE_ORCHESTRATE_VERIFY_LANE` | `hy4-flash` | the **advisor** lane: every verdict act (`frontier report`/`review`, a `task` carrying a verification agent, `/orchestrate verify`, `coding_done`'s verification leg) lands here, never on the coder. Equal to the coder is refused (named); equal to the planning lane is honored (one thinking pack for both acts is a lane-economy choice, not a collapse) |
 | `FADE_ORCHESTRATE_KEY` | `alt+f` | the screen's key. The host binds `alt+f` to `tui.editor.cursorWordRight`, so `registerShortcut` is **refused** for it and the extension takes the raw byte: `onTerminalInput` consumes `ESC f` (`1b 66`). No host binding is moved; [`docs/OVERLAY.md`](docs/OVERLAY.md) carries the chord history and the list of free single-alt chords |
@@ -491,7 +491,7 @@ docs/OVERLAY.md   the surface: layout, metrics, keys, redaction, proof inventory
 docs/quant-choice.md the IQ1_M pin: the measurement, the method, the reproduce commands
 docs/FEATURES.md  the feature sweep: each proposal, the code that shows the gap, its cost, the command that accepts it
 docs/DELEGATION.md the verification desk: schema, closure rules, the churn route, the invariants
-docs/overlay-holding-page-2026-11-26.md the loading-phase proxy TUI, the `terminalSize` wrapper, and the switch's holding page
+docs/overlay-holding-page.md the loading-phase proxy TUI, the `terminalSize` wrapper, and the switch's holding page
 ```
 
 ## License
