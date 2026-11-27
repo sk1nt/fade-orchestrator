@@ -219,15 +219,15 @@ test("a minted lease is released when the swap is refused: the finally is the gu
 	const ctl = ctlStub(sup.dir);
 	try {
 		const router = await fresh("load-refused", { FADE_SUPERVISOR_SOCK: sup.sock, FADE_ORCHESTRATE_ROUTER: rt.url, FADE_ORCHESTRATE_SWAP_CMD: ctl.script });
-		const r = await router.loadLane(TARGET, { sessionId: "sess-turn", mintLease: { ttlSec: 300 } });
+		const r = await router.loadLane(TARGET, { sessionId: "sess-refused", mintLease: { ttlSec: 300 } });
 		assert.equal(r.ok, false, "a refused swap is a refused load, never a silent success");
 		assert.match(r.detail, /swap supervisor refused http 503 rule vram_floor/, r.detail);
 		assert.match(r.detail, /gpu0 701 MiB/, "the daemon's reason reaches the operator");
 		assert.deepEqual(sup.hits, [
-			`GET ${R_RESIDENCY} build=prod sid=sess-turn action=- token=- pack=-`,
-			`POST ${R_LEASE} build=prod sid=sess-turn action=acquire token=- pack=${TARGET}`,
-			`POST ${R_SWAP} build=prod sid=sess-turn action=- token=T-MINT pack=${TARGET}`,
-			`POST ${R_LEASE} build=prod sid=sess-turn action=release token=T-MINT pack=-`,
+			`GET ${R_RESIDENCY} build=prod sid=sess-refused action=- token=- pack=-`,
+			`POST ${R_LEASE} build=prod sid=sess-refused action=acquire token=- pack=${TARGET}`,
+			`POST ${R_SWAP} build=prod sid=sess-refused action=- token=T-MINT pack=${TARGET}`,
+			`POST ${R_LEASE} build=prod sid=sess-refused action=release token=T-MINT pack=-`,
 		], "acquire under prod, swap under the minted token, release even on the refusal");
 		assert.ok(!existsSync(ctl.log), "a supervisor-path swap never falls to the ctl fleet gate");
 	} finally {
@@ -247,12 +247,12 @@ test("a minted lease is KEPT when the swap lands, and the swap byte rides the to
 	const ctl = ctlStub(sup.dir);
 	try {
 		const router = await fresh("load-landed", { FADE_SUPERVISOR_SOCK: sup.sock, FADE_ORCHESTRATE_ROUTER: rt.url, FADE_ORCHESTRATE_SWAP_CMD: ctl.script });
-		const r = await router.loadLane(TARGET, { sessionId: "sess-turn", mintLease: { ttlSec: 300 } });
+		const r = await router.loadLane(TARGET, { sessionId: "sess-kept", mintLease: { ttlSec: 300 } });
 		assert.equal(r.ok, true, r.detail);
 		assert.match(r.detail, /swap via supervisor: flash-next/, r.detail);
 		assert.equal(r.minted, true, "the load says this token is the CALLER'S to keep");
 		assert.equal(r.leaseToken, "T-OK", "the minted capability is returned, not consumed");
-		assert.equal(r.leaseSession, "sess-turn", "the minting identity rides back for the release");
+		assert.equal(r.leaseSession, "sess-kept", "the minting identity rides back for the release");
 		assert.equal(sup.hits.filter((h) => h.includes("release")).length, 0,
 			"the success path releases NOTHING: releasing here freed the lane before the turn the load protects ran (measured)");
 		assert.equal(sup.hits.filter((h) => h.includes("acquire")).length, 1, "one acquire, no retry storm");
@@ -299,7 +299,7 @@ test("a refused mint names the rule and issues no swap byte", async () => {
 	const ctl = ctlStub(sup.dir);
 	try {
 		const router = await fresh("load-mintrefused", { FADE_SUPERVISOR_SOCK: sup.sock, FADE_ORCHESTRATE_ROUTER: rt.url, FADE_ORCHESTRATE_SWAP_CMD: ctl.script });
-		const r = await router.loadLane(TARGET, { sessionId: "sess-turn", mintLease: { ttlSec: 300 } });
+		const r = await router.loadLane(TARGET, { sessionId: "sess-mintrefused", mintLease: { ttlSec: 300 } });
 		assert.equal(r.ok, false);
 		assert.match(r.detail, /lease mint refused http 409 rule lease_not_holder/, r.detail);
 		assert.equal(sup.hits.filter((h) => h.includes(R_SWAP)).length, 0, "a caller that does not hold the lane never moves it");

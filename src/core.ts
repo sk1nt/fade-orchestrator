@@ -670,6 +670,97 @@ export interface RunState {
 	lease_holder?: string;
 	lease_granted_ttl_s?: number;
 	lease_hint?: string;
+	/** The lane move a refused lease mint DEFERRED. A 409 naming a holder is not a run
+	 *  failure: the pin stays on the pack the lane SERVES (so the next completion is held
+	 *  by `laneServeHold`, never 404'd), the page the switch owed is QUEUED in
+	 *  `deferred_briefing`, and the retry rides the holder's own `remaining_s`. The next
+	 *  successful switch to `deferred_lane` sends the queued page and clears the pair.
+	 *  Design and the measured refusal: docs/lease-lifecycle-409-20261127.md. */
+	deferred_lane?: string;
+	deferred_briefing?: "verify" | "verifyBatch" | "code" | "repair" | "gate" | "plan";
+	deferred_since_utc?: string;
+	/** When the deferral re-asks, as the client decided it from the daemon's countdown.
+	 *  Rendered; the countdown is the daemon's, this is the appointment. */
+	lease_retry_at_utc?: string;
+	/** How the current briefing stands, in the operator's words: `sent` (a page went
+	 *  out), `queued` (owed by a deferred lane move), `quiet` (a hand-back that ships no
+	 *  page by design), `not-sent` (the switch failed outright, no queue). A hand-back
+	 *  that ships no page never prints "briefing not sent" without naming the review
+	 *  state and the queue beside it — the message that read as a failure was the
+	 *  operator's only signal, and it named neither. */
+	briefing_delivery?: "sent" | "queued" | "quiet" | "not-sent";
+	briefing_sent_at_utc?: string;
+	/** The review state as the last lane act read it (round, phase, desk verdicts).
+	 *  Rendered beside the briefing state; absent prints as `unknown`, never a guess. */
+	review_state?: string;
+}
+
+/** A lane move the daemon refused because the lane is CLAIMED, as the client recorded it. */
+export interface LaneDeferral {
+	lane: string;
+	/** The page the landing owes, in the plugin's words. Stored as a KIND, never as text: the
+	 *  page is built from the run state when the lane frees, and a page built at the refusal is
+	 *  a snapshot of a round that moved on while the lane was busy. */
+	kind: "verify" | "verifyBatch" | "code" | "repair" | "gate" | "plan";
+	rule?: string;
+	holder?: string;
+	remaining_s?: number;
+	token_hint?: string;
+	/** The appointment, in ms from `at`, decided from the daemon's own countdown. */
+	retry_delay_ms: number;
+	/** A quiet landing (a hand-back) owes no page, so the queue records `quiet`, never `queued`. */
+	quiet?: boolean;
+}
+
+/**
+ * Record that a lane move is DEFERRED, in the state the row, the panel and the next session read.
+ *
+ * A 409 over a HELD lane is not a run failure, and this function is where that is enforced:
+ * `state`, `round`, `stall_count` and the protocol counters are untouched — the run's plan
+ * survives a pack that has not arrived. What lands is the owed lane, the page it owes, the holder
+ * named by the daemon, and the appointment to re-ask. The record is durable on purpose: a session
+ * that closes with the queue open re-asks at the next boundary, and the completion of the pack
+ * that SERVES is held by `laneServeHold`, so an unanswered queue never becomes a 404.
+ */
+export function applyLaneDeferral(st: RunState, d: LaneDeferral, at: string = new Date().toISOString()): void {
+	st.deferred_lane = d.lane;
+	st.deferred_briefing = d.kind;
+	st.deferred_since_utc = at;
+	st.briefing_delivery = d.quiet ? "quiet" : "queued";
+	st.lease_state = "deferred";
+	st.lease_holder = d.holder;
+	if (d.token_hint) st.lease_hint = d.token_hint;
+	st.lease_retry_at_utc = new Date(Date.parse(at) + d.retry_delay_ms).toISOString();
+	st.review_state = reviewStateLabel(st);
+}
+
+/** The lane move landed: record what the briefing did and clear the deferral it answers. A quiet
+ *  landing answers the queue too — a lane that landed quietly is not owed, and a row that names it
+ *  as owed is a lie about the plane. */
+export function clearLaneDeferral(st: RunState, lane: string, delivery: "sent" | "quiet", at: string = new Date().toISOString()): void {
+	st.briefing_delivery = delivery;
+	if (delivery === "sent") st.briefing_sent_at_utc = at;
+	if (st.deferred_lane === lane) {
+		st.deferred_lane = undefined;
+		st.deferred_briefing = undefined;
+		st.deferred_since_utc = undefined;
+		st.lease_retry_at_utc = undefined;
+	}
+}
+
+/**
+ * The run's review state in the operator's words — the single rule the row, the deferral line and
+ * the suite read. Frontier prints its own `settled unreviewed` warning on the frontier surface;
+ * this is the orchestrate side of the same fact, printed beside the briefing state so a hand-back
+ * that ships no page is never mistaken for a lost round. Never a guess: an unmapped state prints
+ * as what it is, with its round.
+ */
+export function reviewStateLabel(st: RunState): string {
+	if (st.state === "complete") return `accepted (round ${st.round})`;
+	if (st.state === "verifying") return `verdicts open (round ${st.round}${st.verify_batch ? `, batch ${st.verify_batch.batch + 1}` : ""})`;
+	if (st.state === "repair") return `repair owed (round ${st.round})`;
+	if (st.state === "failed") return `FAILED: ${st.reason ?? "no reason recorded"}`;
+	return `${st.state} (round ${st.round})`;
 }
 
 /**

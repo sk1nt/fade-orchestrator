@@ -15,7 +15,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { acquireLease, getResidency, packToModelId, releaseLease as releaseSupervisorLease, swapLeased } from "./supervisor.ts";
+import { acquireLease, clearStoredLease, getResidency, packToModelId, readStoredLease, renewLease, releaseLease as releaseSupervisorLease, RULE_LEASE_HELD, RULE_LEASE_NOT_HOLDER, RULE_LEASE_STALE_TOKEN, swapLeased, writeStoredLease } from "./supervisor.ts";
 
 const execC = promisify(exec);
 
@@ -349,8 +349,29 @@ async function gateBusyLoop(lane: string, opts: GateOpts, budgetMs: number, poll
  *  caller returns it at the hand-back. Releasing inside the load (the old
  *  `finally`) dropped the guard before the review turn had run a byte, and the
  *  very next peer session minted its own lease and swapped the lane back
- *  (measured). */
-export type LaneLoad = { ok: boolean; detail: string; elapsed_s: number; guarded: boolean; flip: FlipState; leaseToken?: string; leaseSession?: string; minted?: boolean };
+ *  (measured).
+ *
+ *  `deferred` is the third answer, and it is not a failure. A mint refused over a
+ *  lane somebody HOLDS (`lease_held`, `lease_not_holder`, `lease_stale_token`) says
+ *  the lane is claimed and attaches the holder's countdown; the caller's contract is
+ *  to leave the pin on the pack that SERVES, queue what the switch owed, and come
+ *  back on that clock. The floors with no countdown (`dev_build_no_evict`,
+ *  `lease_required`, VRAM and residency gates) stay `ok: false` with no `deferred`. */
+export type LaneLoad = {
+	ok: boolean;
+	detail: string;
+	elapsed_s: number;
+	guarded: boolean;
+	flip: FlipState;
+	leaseToken?: string;
+	leaseSession?: string;
+	minted?: boolean;
+	deferred?: boolean;
+	leaseRule?: string;
+	leaseHolder?: string;
+	leaseRemainingS?: number;
+	leaseTokenHint?: string;
+};
 
 // `lease: true` asks the router for the DURABLE load: the lane stays resident until
 // `releaseLease`, and a request naming any other model is refused (409) instead of swapping
@@ -398,6 +419,23 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 		let token = opts.leaseToken;
 		let minted = false;
 		if (!token) {
+			// Prove the lease this pair ALREADY owns before asking for a second one. The
+			// daemon keys a lease by `(caller, session)`; the store below is keyed the same
+			// way, so an act that carries no in-memory token RENEWS the grant its own
+			// earlier act minted. Minting where a renewal belongs is the refusal measured on
+			// the box — a caller colliding with its own held lease:
+			// `http 409 rule lease_held: lease held by fade-orchestrator (session
+			// 01a21a8e-…, 1137 s left)`.
+			const stored = readStoredLease(sid);
+			if (stored) {
+				const rv = await renewLease(stored.token, opts.mintLease?.ttlSec ?? LANE_LEASE_TTL_SEC, sid);
+				if (rv.ok) token = stored.token;
+				// The daemon proved this token is not this pair's (released, expired, a
+				// foreign pair owns the lane): the store goes and the mint below starts fresh.
+				else if (rv.rule === RULE_LEASE_NOT_HOLDER || rv.rule === RULE_LEASE_STALE_TOKEN) clearStoredLease(sid);
+			}
+		}
+		if (!token) {
 			if (!opts.mintLease) {
 				return {
 					ok: false,
@@ -417,9 +455,29 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 			clearOwnSwap(lane); // the mint blocks through the swap; whatever the polls saw is already booked
 			token = lease.ok ? lease.token : undefined;
 			minted = !!token;
+			// The capability is persisted the moment it exists: the token that outlives this
+			// load is the token the NEXT act must renew with, and a process closure is not a
+			// place a lease can survive in.
+			if (token) writeStoredLease({ token, pack: lane, session: sid, granted_utc: new Date().toISOString() });
 			if (!token) {
+				// A refusal naming a holder and a countdown is a DEFERRAL: the lane is claimed,
+				// not broken. `ok: false` alone used to take the run to `failed` and print
+				// "briefing not sent" with nothing queued and no retry — the loop's hand-back
+				// died at the mint. The caller that sees `deferred` keeps the pin on the served
+				// pack (the completion is then HELD by `laneServeHold`, never 404'd), queues the
+				// briefing, and re-asks on `leaseRemainingS`.
+				// The classification is the ONE bit the caller branches on; the rule, the holder,
+				// the countdown and the masked hint are published for every mint refusal, hard
+				// failures included — a `dev_build_no_evict` line the operator reads is exactly as
+				// diagnosable as a claim, and a caller must be able to tell which class it has.
+				const deferrable = lease.rule === RULE_LEASE_HELD || lease.rule === RULE_LEASE_NOT_HOLDER || lease.rule === RULE_LEASE_STALE_TOKEN;
 				return {
 					ok: false,
+					...(deferrable ? { deferred: true } : {}),
+					leaseRule: lease.rule,
+					leaseHolder: lease.holder,
+					leaseRemainingS: lease.remaining_s,
+					leaseTokenHint: lease.token_hint,
 					detail: `lease mint refused http ${lease.status} rule ${lease.rule || "?"}: ${lease.reason || "no reason"}${flipNote(flip)}`,
 					elapsed_s: (Date.now() - t0) / 1000,
 					guarded,
@@ -434,7 +492,9 @@ export async function loadLane(lane: string, opts: { lease?: boolean; leaseToken
 		if (!v.ok && minted) {
 			// Nothing will run under a lease whose swap was refused: return it, or the
 			// capability strands the lane for the whole TTL with no holder to release it.
+			// The stored token goes with it — the pair no longer owns the lane.
 			await releaseSupervisorLease(token, sid).catch(() => undefined);
+			clearStoredLease(sid);
 			return { ok: false, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1000, guarded, flip };
 		}
 		return {

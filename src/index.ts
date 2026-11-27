@@ -29,8 +29,8 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, ENV_NOTICES, FLIP_WINDOW_MS, LANE_POLL_MS, PROVIDER, ROUTER, START_PROOF_WAIT_MS, THINK_LANE, THINKING, VERIFY_LANE, flipBreaker, flipGuarded, flipState, isServedLane, isThinkingLane, laneServeHold, laneSyncTarget, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
-import { acquireLease, releaseLease, renewLease, leaseLine, getResidency, shouldRenew, packToModelId, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
+import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, ENV_NOTICES, FLIP_WINDOW_MS, LANE_POLL_MS, PROVIDER, ROUTER, START_PROOF_WAIT_MS, THINK_LANE, THINKING, VERIFY_LANE, flipBreaker, flipGuarded, flipState, isServedLane, isThinkingLane, laneServeHold, laneSyncTarget, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type LaneLoad, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
+import { acquireLease, leaseLine, getResidency, packToModelId, releaseLease, releaseOwnedLease, renewLease, RULE_LEASE_NOT_HOLDER, RULE_LEASE_STALE_TOKEN, shouldRenew, writeStoredLease } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
 /** The churn ledger's clear, on the extension's own module surface. Production reaches it through the
  *  `/orchestrate lanes reset` verb, which also HALTS the loop and lands the owed lane — the right act
@@ -82,7 +82,7 @@ import {
 	PHASE_FOR_STATE,
 	STATE_FILENAME,
 	STATE_KEY,
-	SCHEMA_HINT, STALL_SYNTHESIZE_AT, acquireInstanceLock, adaptiveRounds, classifyTurnEnd, coalesceWrite, execGitAsync, instanceLockDir, normalizeRun, parseJson, pushRejection, readInstanceLock, readJsonAsync, refreshChecks, refreshRoot, releaseInstanceLock, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
+	SCHEMA_HINT, STALL_SYNTHESIZE_AT, acquireInstanceLock, adaptiveRounds, applyLaneDeferral, classifyTurnEnd, clearLaneDeferral, coalesceWrite, execGitAsync, instanceLockDir, normalizeRun, parseJson, pushRejection, readInstanceLock, readJsonAsync, refreshChecks, refreshRoot, releaseInstanceLock, reviewStateLabel, roundsForTasks, runGate, sameTaskPlan, synthesizeCodingDone, tagCheckpoint,
 	TERMINAL,
 	briefings,
 	validateChecks,
@@ -314,6 +314,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// The ramp reads cold (a fresh pack decodes well under its steady rate), a loaded lane reads
 	// hot; idle reads as nothing.
 	const pillSuffix = (): string | undefined => {
+		// The deferral outranks the rate chip. An owed lane with a named holder and an
+		// appointment is the fact the row exists to carry; a decode rate says nothing about
+		// a pack that has not arrived, and the row's job is to name what the loop waits on.
+		// `deferred_lane` is cleared by the landing that answers it.
+		if (run?.deferred_lane) {
+			const held = run.lease_holder ?? "held";
+			const retry = run.lease_retry_at_utc ? ` · retry ${run.lease_retry_at_utc.slice(11, 16)}Z` : "";
+			return `owed ${run.deferred_lane} · lease ${held}${retry} · briefing ${run.briefing_delivery ?? "queued"} · review ${run.review_state ?? "unknown"}`;
+		}
 		if (!metrics) return undefined;
 		const ch = coldHot(metrics.tok_s, laneBest);
 		if (ch.label === "idle" || ch.rate === undefined) return undefined;
@@ -477,9 +486,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// The mint started the tick (see `requestLane`); the capability is gone, so the clock goes
 		// with it -- a plain session that handed the lane back must not keep polling the router.
 		if (!run && !leaseToken) stopMetricsTimer();
+		// `releaseOwnedLease` retires the pair's STORED token with the release, and it can only
+		// ever touch the file of the session it presents: a release the daemon refuses for a
+		// token it does not recognize never deletes the real holder's capability. A caller that
+		// wants the lane back goes through the holder, never through this function.
 		try {
-			const v = await releaseLease(tok, sid);
-			if (!v.ok) process.stderr.write(`orchestrate: verify lease release refused (${v.rule || v.status}); it expires on its TTL
+			const v = await releaseOwnedLease(tok, sid);
+			if (!v.ok) process.stderr.write(`orchestrate: verify lease release refused (${v.rule || v.status}); it expires on its TTL — a release is admitted for the (caller, session) pair that holds the lease
 `);
 		} catch (e) {
 			process.stderr.write(`orchestrate: verify lease release failed: ${msg(e)}; it expires on its TTL
@@ -499,9 +512,13 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		leaseSession = "";
 		if (run) run.lease_state = "released";
 		if (!tok) return;
-		void releaseLease(tok, sid)
+		// The stored capability goes with an accepted release, and a refused one is NAMED: an
+		// unreleased lease pins the lane to its TTL, and the pin is the next session's 409.
+		void releaseOwnedLease(tok, sid)
 			.then((v) => {
 				if (run) run.lease_hint = v.token_hint ?? run.lease_hint;
+				if (!v.ok) process.stderr.write(`orchestrate: lane lease release refused (${v.rule || v.status}); the lane stays claimed to its TTL — a release is admitted for the (caller, session) pair that holds it
+`);
 			})
 			.catch(() => undefined);
 	};
@@ -511,10 +528,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  and is refused at the start, so a second orchestration serializes behind the
 	 *  holder. The token is the write capability: it lives in the closure and the
 	 *  run state, never in any rendered line. */
-	const acquireLaneLease = async (lane: string, runId: string, ctx: ExtensionContext): Promise<{ ok: boolean; line: string }> => {
-		leaseSession = runId;
+	const acquireLaneLease = async (lane: string, sessionId: string, ctx: ExtensionContext): Promise<{ ok: boolean; line: string }> => {
+		leaseSession = sessionId;
 		try {
-			const v = await acquireLease(lane, LEASE_TTL_S, runId);
+			const v = await acquireLease(lane, LEASE_TTL_S, sessionId);
 			if (run) {
 				run.lease_holder = v.holder;
 				run.lease_hint = v.token_hint;
@@ -522,6 +539,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			if (v.ok && v.token) {
 				leaseToken = v.token;
 				leaseRemainingS = v.remaining_s ?? v.granted_ttl_s ?? LEASE_TTL_S;
+				// Persist the capability WITH the grant, not at the first swap: the token is the
+				// lease's only proof, and a closure is not a place a lease can survive in. A
+				// re-entry that presents it RENEWS; one that mints again is refused by itself.
+				writeStoredLease({ token: v.token, pack: lane, session: sessionId, granted_utc: new Date().toISOString() });
 				if (run) {
 					run.lease_state = "held";
 					run.lease_token = v.token;
@@ -764,6 +785,127 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 */
 	let switchGen = 0;
 	let switchChain: Promise<void> = Promise.resolve();
+	/** The deferral's clock and its ceiling.
+	 *
+	 *  The floor keeps a 1137 s claim from being polled every second. The cap bounds the wait for
+	 *  a lease that never frees. The TRIES ceiling is the load-bearing one: a deferral re-arms
+	 *  from its own retry, so an unbounded chain is a client that hammers the daemon and repaints
+	 *  the row forever — and in a rig it is a timer that never lets the suite's process exit
+	 *  (measured: a full-suite run that never finished, one 3 s retry loop). At the ceiling the
+	 *  client STOPS re-asking, says so, and leaves the queue: the row keeps naming the owed lane,
+	 *  and the operator's keys re-ask by hand. A landing on the owed lane resets the count. */
+	const LEASE_RETRY_MIN_MS = Number(process.env.FADE_ORCHESTRATE_LEASE_RETRY_MIN_MS ?? 15_000);
+	const LEASE_RETRY_MAX_MS = Number(process.env.FADE_ORCHESTRATE_LEASE_RETRY_MAX_MS ?? 600_000);
+	const LEASE_RETRY_MAX_TRIES = Number(process.env.FADE_ORCHESTRATE_LEASE_RETRY_MAX_TRIES ?? 3);
+	const leaseRetryDelayMs = (remainingS: number | undefined): number => {
+		const held = (typeof remainingS === "number" && Number.isFinite(remainingS) && remainingS > 0 ? remainingS : 30) * 1000 + 3_000;
+		return Math.min(Math.max(held, LEASE_RETRY_MIN_MS), LEASE_RETRY_MAX_MS);
+	};
+	let leaseRetryTimer: NodeJS.Timeout | undefined;
+	let leaseRetryTries = 0;
+	/** Which lane's queue the count belongs to. A plain session has no run state to key on, so
+	 *  the count needs its own key: without it, "is this a new queue?" answers yes every time and
+	 *  the ceiling never applies — the perpetual retry loop the ceiling exists to stop. */
+	let leaseRetryLane = "";
+	/** True once `session_shutdown` has run: the deferral's timer is armed on the daemon's
+	 *  countdown, which outlives the hook chain that armed it, and a lane request fired into
+	 *  a closed host is a notify nobody reads and a mint nobody owns. */
+	let closed = false;
+	/** The review state in the operator's words, from what this plugin can actually see: the
+	 *  run's protocol state, its round, and the desk's open batch. Frontier's `settled
+	 *  unreviewed` line is the frontier surface's own; this is the orchestrate side of the same
+	 *  fact, printed beside the briefing state so a hand-back that ships no page is never
+	 *  mistaken for a lost round. Never a guess: a session with no run says `no run`. */
+	const reviewLabel = (): string => (run ? reviewStateLabel(run) : "no run");
+	/** Which page a landing on `lane` owes, in the same order the briefing timer picks it. The
+	 *  deferral stores the KIND, never the text: the page is built from the run state at the
+	 *  landing, and a page built at the refusal is a snapshot of a round that moved on while
+	 *  the lane was busy. */
+	const briefKindFor = (lane: string, st: RunState): "verify" | "verifyBatch" | "code" | "repair" | "gate" =>
+		st.verify_batch && isThinkingLane(lane)
+			? "verifyBatch"
+			: st.state === "repair"
+				? "repair"
+				: lane === CODE_LANE && st.gate_last && st.gate_last.passed === false
+					? "gate"
+					: lane === CODE_LANE
+						? "code"
+						: "verify";
+	/** Record what the briefing did, and clear the deferral the landing answers. The delivery
+	 *  state is what the row and the deferral line print, so it is written AT the send and
+	 *  never inferred afterwards. */
+	const markBriefing = (delivery: "sent" | "quiet", lane: string): void => {
+		// A lane that landed is not owed: the queue, the appointment and the retry count all go.
+		leaseRetryTries = 0;
+		leaseRetryLane = "";
+		if (!run) return;
+		clearLaneDeferral(run, lane, delivery);
+		void persist().catch(() => undefined);
+	};
+	/**
+	 * The lane lease is HELD by a pair this process cannot displace, so the lane move is
+	 * DEFERRED: the pack stays where it is, the session's pin stays on the pack the lane
+	 * SERVES, and the page this switch owed is queued in the run state with the retry armed on
+	 * the holder's own countdown.
+	 *
+	 * The non-404 is the point, and it is the SAME WRAPPER the completion uses. Because the pin
+	 * never moves to a pack the lane does not serve, `before_agent_start`'s hold path
+	 * (`laneServeHold`) holds the next turn the way Basalt holds a client through a swap: one
+	 * `/v1/models` read when the pin already matches, a keep-alive page every 10 s when it
+	 * does not, and never `404 The model '…' does not exist`. When the retry lands, the load
+	 * and the pin move in ONE act in one generation, and the identical wrapper holds that
+	 * completion too.
+	 *
+	 * The refusal this replaces, measured on the box at a Frontier hand-back:
+	 *   Error: fade_orchestrate: loading lane hy4-flash failed (lease mint refused http 409
+	 *   rule lease_held: lease held by fade-orchestrator (session
+	 *   01a21a8e-da8a-748c-bdf2-db2bd2d1f470, 1137 s left): acquire is refused until it is
+	 *   released or expires); briefing not sent
+	 * That path set `state = "failed"`, released the run's lock and lease, and dropped the
+	 * briefing on the floor with the run — over a lane that was merely BUSY for 1137 s. A
+	 * claimed lane is a queue, not a verdict: nothing in the run's plan is invalidated by a
+	 * pack that has not arrived.
+	 */
+	const deferLaneMove = (lane: string, loaded: LaneLoad, ctx: ExtensionContext, quiet: boolean, handBack: boolean): void => {
+		clearTimeout(leaseRetryTimer);
+		leaseRetryTimer = undefined;
+		// A deferral on a NEW lane is a new queue: its count starts at zero. A deferral on the
+		// lane already owed is the same queue aging, and its count carries — in a session with no
+		// run too, where `leaseRetryLane` is the only queue key there is.
+		if (leaseRetryLane !== lane) {
+			leaseRetryLane = lane;
+			leaseRetryTries = 0;
+		}
+		const heldS = loaded.leaseRemainingS;
+		const holder = loaded.leaseHolder ?? "a peer pair";
+		const delayMs = leaseRetryDelayMs(heldS);
+		const exhausted = leaseRetryTries >= LEASE_RETRY_MAX_TRIES;
+		if (run) {
+			applyLaneDeferral(run, { lane, kind: briefKindFor(lane, run), rule: loaded.leaseRule, holder: loaded.leaseHolder, remaining_s: loaded.leaseRemainingS, token_hint: loaded.leaseTokenHint, retry_delay_ms: exhausted ? 0 : delayMs, quiet }, new Date().toISOString());
+			// At the ceiling there is no appointment to publish: the row names the owed lane and
+			// no retry time, which is the honest state of a client that has stopped asking.
+			if (exhausted) run.lease_retry_at_utc = undefined;
+		}
+		void persist().catch(warnWrite(ctx, "defer"));
+		paint(ctx);
+		if (exhausted) {
+			ctx.ui.notify(
+				`fade_orchestrate: ${lane} is STILL owed after ${leaseRetryTries} tries — the lease is held by ${holder}${heldS !== undefined ? ` (${heldS}s left)` : ""} and the client stops re-asking. The queue stays: briefing ${run?.briefing_delivery ?? "queued"}, review ${reviewLabel()}, pin ${ctx.model?.id ?? "the served pack"} (held, never 404'd). End the holding run, or re-ask with the panel's v/c keys. (${loaded.detail})`,
+				"warning",
+			);
+			return;
+		}
+		leaseRetryTries += 1;
+		leaseRetryTimer = setTimeout(() => {
+			leaseRetryTimer = undefined;
+			if (closed) return;
+			void requestLane(lane, ctx, quiet, handBack);
+		}, delayMs);
+		ctx.ui.notify(
+			`fade_orchestrate: ${lane} DEFERRED — lease ${loaded.leaseRule ?? "held"}, held by ${holder}${heldS !== undefined ? `, ${heldS}s left` : ""}. The pin stays on ${ctx.model?.id ?? "the served pack"}: the completion is HELD through the swap, not 404'd. Briefing: ${quiet ? "quiet hand-back, no page owed" : "QUEUED — sent the moment the lane lands"}. Review: ${reviewLabel()}. Retry ${leaseRetryTries}/${LEASE_RETRY_MAX_TRIES} in ${Math.round(delayMs / 1000)}s. (${loaded.detail})`,
+			"warning",
+		);
+	};
 	/** The lane an in-flight `runSwitch` is landing. Auto-sync reads this so a drain does not pin
 	 *  the pack that is still resident while the owed pack is coming in. Cleared when that
 	 *  generation finishes; a superseded switch leaves it for the generation that replaced it. */
@@ -1018,7 +1160,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			watch?.cancel();
 			ctx.ui.setWorkingMessage();
 			swapPill = undefined;
-			fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
+			// A lease that names a holder is a CLAIMED lane, not a broken one: defer, queue,
+			// retry. Nothing here moves the pin, so the completion the wrapper holds is a
+			// completion of the pack that SERVES — never a 404.
+			if (loaded.deferred) {
+				deferLaneMove(lane, loaded, ctx, quiet, handBack);
+				return;
+			}
+			// A refusal with no holder to wait on (a VRAM floor, a dev-build claim, a router
+			// that is not there) IS a failure — and the line now says what the operator has and
+			// has not got. The bare "briefing not sent" named neither the review state nor the
+			// pin, which is why it read as a lost round instead of an unavailable lane.
+			fail(ctx, `loading lane ${lane} failed (${loaded.detail}) · review: ${reviewLabel()} · briefing: not sent · the pin stays on ${ctx.model?.id ?? "the served pack"}`);
 			return;
 		}
 		// ADMITTED IS THE MOMENT TO PIN. The pack switch and the session prompt are ONE act: the
@@ -1102,7 +1255,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			if (gen !== switchGen) return; // the briefing is for the lane that LANDED, never one a newer switch replaced
 			// A QUIET switch carries no briefing: the hand-back lands a lane the operator did not ask
 			// about, and a page sent for it would be a queued request naming the lane just left.
-			if (quiet) return;
+			// It still ANSWERS a deferral, so the queue clears and the row stops naming an owed
+			// lane — a lane that landed quietly is not owed, and a row that says it is lies.
+			if (quiet) {
+				markBriefing("quiet", lane);
+				return;
+			}
 			// A PLAIN session (no run) has no round, no desk, no protocol debt: the lane move IS
 			// the deliverable. The briefing below reads `run!` — measured, a verdict act
 			// in a session with no run reached this timer with `run === undefined` and threw inside
@@ -1140,6 +1298,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 							requests: d.requests.filter((r) => ids.includes(r.id)).map((r) => ({ id: r.id, agent: r.agent, ...(r.task_id ? { task_id: r.task_id } : {}), objective: r.objective, ...(r.acceptance ? { acceptance: r.acceptance } : {}), checks: r.checks })),
 						}),
 					);
+					markBriefing("sent", lane);
 					return;
 				}
 			}
@@ -1153,6 +1312,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 							: briefings.verify(run!)
 			);
 			pi.sendUserMessage(text);
+			markBriefing("sent", lane);
 		}, 0);
 	};
 
@@ -2287,22 +2447,28 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			if (!(await isGitRepo(repo))) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
 			ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router…`);
 			// A lane load starts here: drop the cached `/proc` placement proof (moe.ts) so nothing
-			// The :18014 lane is a single-authority lease. Acquire it as the prod
-			// authority BEFORE the first pack load: a peer orchestration that holds
-			// it (409 lease_not_holder) is refused here, so two sessions serialize on
-			// the lane instead of one swapping out the other's planning pack.
-			// One process can hold at most ONE lease on the lane: the verify capability (a review
-			// turn's) is a DIFFERENT (caller, session) pair, and `AdmitLease` refuses a cross-pair
-			// claim as `lease_held` — against this very session. Return it, then claim as the run.
+			// The :18014 lane is a single-authority lease. Acquire it as the prod authority
+			// BEFORE the first pack load: a PEER process is a different pair, so its held lease
+			// (`lease_not_holder` / `lease_held`) is refused here and the two sessions serialize
+			// on the lane instead of one swapping out the other's planning pack.
+			// ONE lease identity per process. The daemon keys a lease by `(caller, session)`, and
+			// this process used to present THREE: the run id at this claim, `omp-pid-<pid>` at a
+			// review-turn mint, and the run id again at the preflight load. A client that holds a
+			// lease under one pair and asks under another is `lease_held` naming ITSELF as the
+			// holder — measured as the 409 that killed the hand-back (`lease held by
+			// fade-orchestrator (session 01a21a8e-…, 1137 s left)`). The run, the review turn and
+			// the load all present `SELF_SESSION`: one process, one lease, one token to renew, and
+			// the cross-pair refusal has nothing left to refuse inside a process. The verify
+			// capability is returned first so the claim starts from a clean lane and a clean store.
 			await returnVerifyLease();
-			const lease = await acquireLaneLease(THINK_LANE, runId, ctx);
+			const lease = await acquireLaneLease(THINK_LANE, SELF_SESSION, ctx);
 			if (!lease.ok) {
 				releaseLock();
 				ctx.ui.notify(`orchestrate: the :18014 lane lease is held — ${lease.line}. End the holding run there, then start here. Nothing was written.`, "error");
 				return;
 			}
 			// in this run reads a pre-load engine state.
-			const loaded = await loadLane(THINK_LANE, { leaseToken, sessionId: runId });
+			const loaded = await loadLane(THINK_LANE, { leaseToken, sessionId: SELF_SESSION });
 			if (!loaded.ok) {
 				// A start that never began releases its claim: a preflight failure must not strand
 				// the router behind a run that does not exist.
@@ -2780,6 +2946,17 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		closed = true;
+		// The deferral's timer is armed on the daemon's countdown, which outlives this hook. A
+		// lane request fired into a closed host is a notify nobody reads and a mint nobody
+		// owns. The queued page stays durable in `state.json`: `deferred_lane` is read by the
+		// row, and the next session's boundary re-asks for the lane — where the completion of
+		// the pack that SERVES is held by `laneServeHold`, so a resumed session cannot 404 on
+		// an unanswered queue either.
+		if (leaseRetryTimer) {
+			clearTimeout(leaseRetryTimer);
+			leaseRetryTimer = undefined;
+		}
 		clearSurface(ctx);
 		stopMetricsTimer();
 		await returnVerifyLease();

@@ -1,3 +1,19 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/**
+ * The lease store is a REAL file tree: `supervisor.ts` resolves `STATE_DIR` at module import and
+ * writes one file per minted `(caller, session)`, so a renew-before-mint can pay a lease the
+ * caller already owns. A rig that merely DELETES `FADE_ORCHESTRATE_STATE_DIR` therefore mints into
+ * the operator's own state directory, and a file left there makes a LATER suite renew a lease it
+ * never asked for — measured: `resident_gate` gained a `renew token=T-OK` wire line from a
+ * neighbour's mint. Every suite gets a scratch store of its own instead: one directory per process,
+ * made here, removed at exit. A rig that names its own store (the lease-lifecycle suite) overrides
+ * this by assigning the key after importing.
+ */
+const SUITE_STATE_DIR = mkdtempSync(join(tmpdir(), "fade-orchestrator-leases-"));
+process.on("exit", () => rmSync(SUITE_STATE_DIR, { recursive: true, force: true }));
 /**
  * The suites that assert lane IDENTITY must not inherit the operator's live lane config.
  *
@@ -81,8 +97,18 @@ function runDeletes() {
 		"FADE_ORCHESTRATE_METRICS_INTERVAL_MS",
 		"FADE_ORCHESTRATE_FLIP_WINDOW_MS",
 		"FADE_ORCHESTRATE_HEADLESS",
+		// The lease-lifecycle rig keys. `STATE_DIR` resolves at module import in supervisor.ts,
+		// so a rig's temp store frozen into the singleton is a suite minting into a deleted
+		// directory and a renew reading nothing; the retry floors are rig clocks, and a leaked
+		// 60 s cap is a deferral that stops re-asking.
+		"FADE_ORCHESTRATE_STATE_DIR",
+		"FADE_ORCHESTRATE_LEASE_RETRY_MIN_MS",
+		"FADE_ORCHESTRATE_LEASE_RETRY_MAX_MS",
+		"FADE_ORCHESTRATE_LEASE_RETRY_MAX_TRIES",
 	]) {
 		delete process.env[k];
 	}
+	// Never the documented default: the default is the operator's real store.
+	process.env.FADE_ORCHESTRATE_STATE_DIR = SUITE_STATE_DIR;
 }
 runDeletes();

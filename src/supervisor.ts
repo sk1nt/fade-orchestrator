@@ -31,7 +31,10 @@
  * release bodies, token threading, and the 409 handling — against a stub
  * daemon on a real socket path, with no live hardware.
  */
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 /** The caller identity this client always presents. */
 export const CALLER = "fade-orchestrator";
@@ -42,6 +45,87 @@ export const BUILD_PROD = "prod";
  *  tmp path; the root daemon owns the /run path. FADE_SUPERVISOR_SOCK wins. */
 export const ROOT_SOCK = "/run/fade/supervisor.sock";
 export const USER_SOCK = "/tmp/fade-supervisor.sock";
+/**
+ * The lease-token store: the minted capability, on disk, keyed by the pair that minted it.
+ *
+ * The daemon keys a lease by `(caller, session)` and admits a renew/release from THAT pair
+ * alone. The token lived in a process closure, so "the lease this client owns" was a
+ * per-closure fact: a lane act whose closure carried no token MINTED, and a mint under a
+ * second identity over a lane the client's FIRST identity holds is the daemon's
+ * `lease_held`. Measured on the box, one caller colliding with its own held lease:
+ *
+ *   lease mint refused http 409 rule lease_held: lease held by fade-orchestrator
+ *   (session 01a21a8e-da8a-748c-bdf2-db2bd2d1f470, 1137 s left)
+ *
+ * The token now lands beside the run state, keyed the way the daemon keys, so a re-entry
+ * RENEWS the grant it already owns instead of minting a second one and being refused by
+ * itself.
+ *
+ * 0600 in a 0700 directory, one file per pair: a token is a write capability over the
+ * trading box's GPU lane, so it follows the rule `run.lease_token` already follows —
+ * never rendered, never logged, never in a status line.
+ */
+export const STATE_DIR = process.env.FADE_ORCHESTRATE_STATE_DIR ?? join(homedir(), ".local", "state", "fade-orchestrator");
+
+export interface StoredLease {
+	token: string;
+	pack: string;
+	session: string;
+	granted_utc: string;
+}
+
+/** One file per lease pair. The session id is a filename, not a string: `..`, a slash and a
+ *  colon are folded to `_` so a caller that names its session with a path cannot write outside
+ *  the `leases/` directory, and an empty identity lands in `anon` — traceable on the daemon side
+ *  as an empty `X-Fade-Session-Id`, never a file a peer can collide with. */
+export const leaseTokenFile = (session: string, dir = STATE_DIR): string => join(dir, "leases", `${CALLER}-${(session || "anon").replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+
+/** The pair's stored token. `undefined` for absent or unparsable: no store is the normal
+ *  case (a first mint), never an error, and a corrupt file costs a mint, not a lane. */
+export function readStoredLease(session: string, dir = STATE_DIR): StoredLease | undefined {
+	try {
+		const rec = JSON.parse(readFileSync(leaseTokenFile(session, dir), "utf8")) as Partial<StoredLease>;
+		return typeof rec?.token === "string" && rec.token.length > 0 && typeof rec.session === "string" ? (rec as StoredLease) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Persist a minted token: temp + rename. A write failure is SILENT by design — a state
+ *  dir the operator wiped (the gate rigs `rm -rf` theirs) must never take a granted
+ *  lease down; the caller keeps the token in memory and the lane act proceeds. */
+export function writeStoredLease(rec: StoredLease, dir = STATE_DIR): void {
+	try {
+		const path = leaseTokenFile(rec.session, dir);
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		const tmp = `${path}.${process.pid}.tmp`;
+		writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
+		renameSync(tmp, path);
+	} catch {
+		/* best-effort, by the paragraph above */
+	}
+}
+
+/** Drop the pair's stored token: a release, or a token the daemon proved dead. */
+export function clearStoredLease(session: string, dir = STATE_DIR): void {
+	try {
+		rmSync(leaseTokenFile(session, dir), { force: true });
+	} catch {
+		/* nothing stored is the resting state */
+	}
+}
+
+/** Release a lease the presenting pair owns, and retire its stored token with it. The
+ *  daemon is the arbiter of ownership (`lease_not_holder` for any other pair); the
+ *  client's contribution is that a release can never delete a capability it does not
+ *  own — the store is keyed by the presenting session, so a refused release of a
+ *  foreign token leaves the real holder's file exactly where it was. A caller that
+ *  wants the lane back goes through the holder, never through this function. */
+export async function releaseOwnedLease(token: string, sessionId: string, sock?: string): Promise<LeaseVerdict> {
+	const v = await releaseLease(token, sessionId, sock);
+	if (v.ok || v.rule === RULE_LEASE_STALE_TOKEN) clearStoredLease(sessionId);
+	return v;
+}
 
 /** The lease floors the daemon returns, as stable wire strings. */
 export const RULE_LEASE_NOT_HOLDER = "lease_not_holder";
