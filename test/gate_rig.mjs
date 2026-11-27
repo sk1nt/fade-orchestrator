@@ -441,6 +441,17 @@ const settleModel = async (from, id, cap = 4000) => {
 	}
 	return modelCalls.at(-1);
 };
+/** The pin is what block 13's four cases read, and on a contended runner the swap is queued behind
+ *  the gate's polls, the stub's HTTP and the gate's check children: run 45947253544 at 2c1c2c49
+ *  printed `pinsAt.slice(pinsBase) = []` for all four of them, i.e. nothing had landed when the
+ *  assertions read. The caller calls this ONLY when the entry is absent (so an idle box pays nothing)
+ *  and ALWAYS after the transit dial is reset, so settling cannot hold the window open past the moment
+ *  the fixed sleep closed it. */
+const settlePins = async (from, cap = 8000) => {
+	const t0 = Date.now();
+	while (pinsAt.length <= from && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
+	return pinsAt[from];
+};
 const exec = (phase, payload) => tools.fade_phase.execute("id", { phase, payload: JSON.stringify(payload) }, null, null, ctx);
 
 const mod = await import("../.test-build/index.mjs");
@@ -763,7 +774,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	swapDelayMs = 150;
 	await new Promise((r) => setTimeout(r, 900));
 	swapDelayMs = 0;
-	const pin13 = pinsAt[pinsBase];
+	const pin13 = pinsAt[pinsBase] ?? (await settlePins(pinsBase));
 	ok("the boundary's setModel names the verifier lane", pin13?.id === "hy4-flash", JSON.stringify(pinsAt.slice(pinsBase)));
 	ok("the pin went out WITH the load: the router still listed the code pack when the pin landed", pin13?.listing === "flash-next", JSON.stringify(pin13));
 	ok("the thinking level moved with the pin", thinkingLevels.length > thinkBase && thinkingLevels.at(-1) === "high", JSON.stringify(thinkingLevels.slice(thinkBase)));
@@ -778,7 +789,12 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// The self-lockout to guard: a session that adopted the thinking lane at start must not keep
 	// refusing the operator's editor once the run is no longer the verifier's turn. The guard reads
 	// the ON-DISK state for exactly this reason.
-	const s13 = readState();
+	// The pair is read from two async planes: the state publish is coalesced (the rule at :407-411) and
+	// the stub's `resident` is set at the END of the transit. Settle on the pair the swap OWNS, bounded,
+	// then judge the VALUE — a stale record that contradicts the expectation still fails. This is the
+	// rig's own idiom for the class; the mid-transit read shows as `verifying/hy4-flash vs resident
+	// flash-next`.
+	const s13 = await readStateWhen((s) => s.state === "verifying" && s.lane === resident);
 	ok("the enforced state is the verifier's turn on the thinking lane", s13.state === "verifying" && s13.lane === resident, `${s13.state}/${s13.lane} vs resident ${resident}`);
 	writeState({ ...s13, state: "planning" });
 	const after = await hooks.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "w", input: {} }, ctx);
@@ -1038,6 +1054,15 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   swapLine = null;
   writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
   await hooks.session_start({}, ctx);
+  // The ledger is this block's instrument, and the window is a 60 s WALL window: a swap an earlier
+  // block pays lands inside this count. Measured with block 13's pin settle in place, the row read
+  // "lane flip: 4 swaps in 60s", the breaker halted a cycle early, and the halt, row and desk cases
+  // cascaded. Clear it through the extension's own surface (index.ts re-exports resetFlipLedger): the
+  // bundle is the only SHARED module instance, which is why blocks 19 and 29 call `rt.resetFlipLedger()`
+  // on a separate `router.mjs?case=` instance that cannot reach this ledger. The operator's verb
+  // `/orchestrate lanes reset` clears it too, but it also HALTS and lands the owed lane: measured, it
+  // left the run `failed` and every later `fade_phase` threw `run GATE1 is already failed`.
+  mod.resetFlipLedger();
   // The loop's own poll is what watches the router's swap line (the metrics tick; `session_start`
   // starts it). The engine reports the swap, then the reverse, with `resident` naming the lane being
   // unloaded, and the settle between them — `swap` clearing — is what re-arms the recorder, so each

@@ -32,6 +32,13 @@ import { Type } from "typebox";
 import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, ENV_NOTICES, FLIP_WINDOW_MS, LANE_POLL_MS, PROVIDER, ROUTER, START_PROOF_WAIT_MS, THINK_LANE, THINKING, VERIFY_LANE, flipBreaker, flipGuarded, flipState, isServedLane, isThinkingLane, laneServeHold, laneSyncTarget, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
 import { acquireLease, releaseLease, renewLease, leaseLine, getResidency, shouldRenew, packToModelId, RULE_LEASE_STALE_TOKEN, RULE_LEASE_NOT_HOLDER } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
+/** The churn ledger's clear, on the extension's own module surface. Production reaches it through the
+ *  `/orchestrate lanes reset` verb, which also HALTS the loop and lands the owed lane — the right act
+ *  for an operator, the wrong instrument for a test that must measure a count starting at zero. The
+ *  bundle is the only shared instance: the rigs' `../.test-build/router.mjs?case=…` imports are
+ *  separate ESM instances, so their `resetFlipLedger()` cannot reach the ledger the live extension
+ *  counts in. A rig that needs a clean ledger has to come through here. */
+export { resetFlipLedger };
 import {
 	DESK_DEADLINE_MS,
 	DESK_SETTLE_MS,
