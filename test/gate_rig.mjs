@@ -441,12 +441,14 @@ const settleModel = async (from, id, cap = 4000) => {
 	}
 	return modelCalls.at(-1);
 };
-/** The pin is what block 13's four cases read, and on a contended runner the swap is queued behind
- *  the gate's polls, the stub's HTTP and the gate's check children: run 45947253544 at 2c1c2c49
- *  printed `pinsAt.slice(pinsBase) = []` for all four of them, i.e. nothing had landed when the
- *  assertions read. The caller calls this ONLY when the entry is absent (so an idle box pays nothing)
- *  and ALWAYS after the transit dial is reset, so settling cannot hold the window open past the moment
- *  the fixed sleep closed it. */
+/** The pin is what block 13's four cases read, and the failure this file had to explain printed
+ *  `pinsAt.slice(pinsBase) = []` for all four of them (fadetheworld CI run 45947253544 at 2c1c2c49,
+ *  and both rigs under a local load A/B). The cause is NOT the 900 ms sleep: the boundary's
+ *  `loadLane` answered `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next`, so
+ *  no `setModel` went out at all — see the clear at the head of block 13. The settle below covers the
+ *  remaining class: a pin that lands a little after the fixed sleep closes. The caller invokes it ONLY
+ *  when the entry is absent, so an idle box pays nothing, and ALWAYS after the transit dial is reset,
+ *  so settling can never hold the swap window open past the moment the fixed sleep closed it. */
 const settlePins = async (from, cap = 8000) => {
 	const t0 = Date.now();
 	while (pinsAt.length <= from && Date.now() - t0 < cap) await new Promise((r) => setTimeout(r, 10));
@@ -757,6 +759,18 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 // 13. The verifier sandbox: the thinking lane has no writers, and the guard enforces it.
 {
 	activeTools = ["read", "bash", "edit", "write", "grep", "task", "fade_phase"];
+	// The churn guard reads the LIVE ledger over a 60 s WALL window, and the rig's whole run fits
+	// inside 60 s: every swap blocks 1-12 paid is in the window when this block asks the boundary to
+	// pay one. `flipGuarded` arms at FLIP_MIN_SWAPS (2), and an armed guard makes `loadLane` return
+	// `no swap issued — FLIP GUARD: 4 swaps in 60s, requests naming flash-next` — no swap, no
+	// `setModel`, so the four cases below read `pinsAt.slice(pinsBase) = []`. That is what the CI run
+	// recorded, and the local A/B reproduced it in BOTH rigs (HEAD's and the settled one) at load
+	// average 18, which is why the sleep was never the cause: clearing the ledger is.
+	// Block 13 measures the boundary's swap act — the pin, the thinking level and the briefing going
+	// out together — so the block starts from a ledger the guard cannot arm. The breaker's own
+	// behaviour is block 19b's subject, and it clears the ledger the same way for the same reason;
+	// clearing here neither tests nor weakens it.
+	mod.resetFlipLedger();
 	await commands.orchestrate.handler("verify", ctx);
 	await hooks.agent_end({}, ctx); // ONE load site: the verify verb defers, the boundary pays the swap
 	await new Promise((r) => setTimeout(r, 120)); // the ctl child (spawn + POST) lands before the assertions read the pin
