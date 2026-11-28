@@ -49,7 +49,11 @@ const resolveLane = (name: string, label: string, fallback: string, forbidden: s
 /** The coder's pack. Read first: the other two lanes are judged against it. Naming a documented
  *  thinking pack here is the box poison MIRRORED (`FADE_ORCHESTRATE_CODE_LANE=deepseek`): every
  *  lane collapses to one pack, `loadLane` short-circuits on the resident pack, and no swap is ever
- *  issued. The coder stays on its documented pack and the refusal is named. */
+ *  issued. The coder stays on its documented pack and the refusal is named.
+ *  FADE_ORCHESTRATE_CODE_LANE=inkling-2-mini names the resident 1M-context coder pack (the
+ *  2026-11-27 inkling act): the daemon pack key, the id served by the models listing, and
+ *  the lane key are that one string, so the residency short-circuit fires and no swap byte
+ *  is paid. It is a coder pack, not a thinking pack, so the guard below honors it. */
 const CODE_WANT = (process.env.FADE_ORCHESTRATE_CODE_LANE ?? "").trim() || "flash-next";
 export const CODE_LANE = (() => {
 	if (CODE_WANT === "deepseek" || CODE_WANT === "hy4-flash") {

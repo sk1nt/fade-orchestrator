@@ -271,7 +271,9 @@ test("packToModelId/modelIdToPack map the aliases and pass the unknowns", () => 
 	assert.equal(modelIdToPack("hy4"), "hy4-flash");
 	assert.equal(packToModelId("ablit"), "flash-next-ablit");
 	assert.equal(modelIdToPack("ablit"), "flash-next-ablit");
-	for (const id of ["flash-next", "deepseek", "hy4-flash", "flash-next-ablit"]) {
+	assert.equal(packToModelId("inkling"), "inkling-2-mini");
+	assert.equal(modelIdToPack("inkling"), "inkling-2-mini");
+	for (const id of ["flash-next", "deepseek", "hy4-flash", "flash-next-ablit", "inkling-2-mini"]) {
 		assert.equal(packToModelId(id), id);
 		assert.equal(modelIdToPack(id), id);
 	}

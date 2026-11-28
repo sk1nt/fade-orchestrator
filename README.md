@@ -19,9 +19,11 @@ on the selected model; `/orchestrate` starts the model-switching workflow.
 - A Git working tree for run evidence and checkpoint tags.
 
 The default provider is `basalt`, with `deepseek` for planning, `flash-next` for
-coding, and `hy4-flash` for the advisor. Configure these for your installation
-before starting OMP. The verification subagent uses a separately configured model
-endpoint.
+coding, and `hy4-flash` for the advisor. `FADE_ORCHESTRATE_CODE_LANE` moves the coding
+lane to another declared pack: `inkling-2-mini` is the resident 1M-context coder pack on
+boxes that run it, and there the daemon pack key, the served id, and the lane key are the
+same string. Configure these for your installation before starting OMP. The verification
+subagent uses a separately configured model endpoint.
 
 ## Install
 

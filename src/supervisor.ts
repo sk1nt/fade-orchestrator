@@ -202,7 +202,7 @@ export const swapBody = (pack: string, token: string, phase = "phase_boundary"):
 //
 // The daemon keys its packs by the model id the pack serves on :18014 (measured
 // from GET /v1/models; the rule is stated in /etc/fade/supervisor.yaml), so
-// flash-next, deepseek and hy4-flash are BOTH the pack key and the OMP model id.
+// flash-next, deepseek, hy4-flash and inkling-2-mini are BOTH the pack key and the OMP model id.
 // The legacy short names (ds41, hy4, ablit) survive as aliases at every edge,
 // and this is the single place the two spellings translate: a swap, a lease, a
 // residency read speaks pack keys; pi.setModel and modelRegistry.find speak
@@ -216,6 +216,8 @@ const PACK_TO_MODEL: Record<string, string> = {
 	"deepseek": "deepseek",
 	"hy4-flash": "hy4-flash",
 	"flash-next-ablit": "flash-next-ablit",
+	"inkling": "inkling-2-mini",
+	"inkling-2-mini": "inkling-2-mini",
 };
 const MODEL_TO_PACK: Record<string, string> = {
 	"deepseek": "deepseek",
@@ -225,6 +227,8 @@ const MODEL_TO_PACK: Record<string, string> = {
 	"flash-next-ablit": "flash-next-ablit",
 	"ablit": "flash-next-ablit",
 	"flash-next": "flash-next",
+	"inkling-2-mini": "inkling-2-mini",
+	"inkling": "inkling-2-mini",
 };
 
 /** The OMP model id a daemon pack key serves. Unknown keys pass through: an
