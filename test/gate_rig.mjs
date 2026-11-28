@@ -377,7 +377,7 @@ const ctx = {
   getContextUsage: () => ({ tokens: 41234, contextWindow: 1048576, percent: 3.9, baselineSource: "test" }),
   abort: () => {},
   isIdle: () => true,
-  hasPendingMessages: () => false,
+  hasPendingMessages: () => true,
   signal: undefined,
   ui: {
     setStatus: (key, text) => void (text === undefined ? statusRows.delete(key) : statusRows.set(key, text)),
@@ -492,10 +492,25 @@ const ok = (name, cond, detail = "") => checks.push({ name, ok: Boolean(cond), d
  */
 const hasRow = (s, words) => new RegExp(words.split(/\s+/).map((w) => w.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")).join("\\s+")).test(s);
 
+
+/**
+ * Arm lane control the way a real session does: adopt the run at session_start and resume it with
+ * the /orchestrate act, which is what turns the loop's lane control on. The rig's default
+ * `hasPendingMessages` is true, so the queued resume handover never delivers inside blocks that do
+ * not test it; blocks that assert the handover set it back.
+ */
+const rawSessionStart = hooks.session_start;
+const adoptArmed = async () => {
+  await rawSessionStart({}, ctx);
+  // A real session arms lane control by resuming its run; the resume act queues a handover and
+  // resets the pause flag. It is also what un-disables the agent_end path.
+  await commands.orchestrate.handler("resume", ctx);
+};
+
 // 1+2. v1 -> v2 migration happens on resume; the first persisted snapshot proves it, together
 // with the planning tier and adaptive budget (a 2-task plan reserves 3 rounds).
 writeState(seedState("planning", []));
-await hooks.session_start({}, ctx);
+await adoptArmed();
 await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false", "must fail"]] });
 {
   const s = readState();
@@ -543,7 +558,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
     schema_retries: 0,
     rejection_history: [],
   });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const before = loads();
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "x" }] });
   await hooks.agent_end({}, ctx);
@@ -589,7 +604,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const repaired = [["test -s marker.txt", "exit 0"]];
   // Resume at the fixture root with a row that cannot pass anywhere.
   writeState({ ...seedState("coding", [["false", "exit 0"]]), schema_retries: 0, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   // The repair lands on disk AFTER the in-memory run exists — the only form the gate can refresh.
   writeState({ ...readState(), repo: alt, checks: repaired });
   notes.length = 0;
@@ -631,7 +646,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   writeFileSync(join(alt, "marker.txt"), "the row can only pass here\n");
   const repaired = [["test -s marker.txt", "exit 0"]];
   writeState({ ...seedState("coding", [["false", "exit 0"]]), schema_retries: 0, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   writeState({ ...readState(), repo: alt, checks: repaired });
   // A refusal: a phase call the gate NEVER sees, whose persist is the clobber that ate the repair.
   let refused = "";
@@ -657,7 +672,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   // block removes, and a run whose root is gone makes every later git reader degrade — measured as
   // the verifier's active tool set arriving with writers on the CI runner.
   writeState({ ...readState(), repo });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   rmSync(alt, { recursive: true, force: true });
 }
 
@@ -676,20 +691,46 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   ok("halt persists state stopped", readState().state === "stopped");
 }
 
-// 8. condensed handover: resume sends it, and it is STABLE-FIRST (the cache-hitting prefix)
+// 8. condensed handover: the /orchestrate resume act sends it, and it is STABLE-FIRST
+// (the cache-hitting prefix). The act is the only way a run's lane control turns on.
 {
 	resident = "flash-next";
 	writeState(seedState("coding", [["true", "green"]]));
-	process.env.FADE_ORCHESTRATE_AUTO_RESUME = "1";
+	const originalPending = ctx.hasPendingMessages;
+	ctx.hasPendingMessages = () => false;
 	sent.length = 0;
 	await hooks.session_start({}, ctx);
+	await commands.orchestrate.handler("resume", ctx);
 	await new Promise((r) => setTimeout(r, 400));
 	const h = sent.find((m) => m.includes("Resume of orchestrated run"));
-	ok("auto-resume sends the condensed handover", Boolean(h));
+	ok("resume sends the condensed handover", Boolean(h));
 	const stableIdx = h ? h.indexOf("Task definitions") : -1;
 	const volatileIdx = h ? h.indexOf("Task state") : -1;
 	ok("handover is stable-first (definitions before statuses)", stableIdx > 0 && volatileIdx > stableIdx, `stable=${stableIdx} volatile=${volatileIdx}`);
-	delete process.env.FADE_ORCHESTRATE_AUTO_RESUME;
+	ctx.hasPendingMessages = originalPending;
+}
+
+// A busy session must retain its resume handover, and a repeated resume must cancel the older attempt.
+{
+	writeState(seedState("coding", [["true", "green"]]));
+	const originalIdle = ctx.isIdle;
+	const originalPending = ctx.hasPendingMessages;
+	let idle = false;
+	ctx.isIdle = () => idle;
+	ctx.hasPendingMessages = () => false;
+	sent.length = 0;
+	await hooks.session_start({}, ctx);
+	await commands.orchestrate.handler("resume", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 350));
+	ok("a busy session keeps the resume handover pending", sent.length === 0);
+	await commands.orchestrate.handler("resume", ctx);
+	idle = true;
+	const deadline = Date.now() + 2000;
+	while (sent.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	ok("repeated resume sends exactly one current handover", sent.filter((message) => message.includes("Resume of orchestrated run")).length === 1);
+	ctx.isIdle = originalIdle;
+	ctx.hasPendingMessages = originalPending;
 }
 
 // 9. Tier-1 protocol gate: a turn that ends with no `fade_phase` is protocol debt. The
@@ -700,7 +741,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	writeFileSync(join(repo, "a.ts"), "changed by the coder lane\n");
 
 	writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, rejection_history: [], protocol_retries: 0, stall_count: 0, paused: false });
-	await hooks.session_start({}, ctx);
+	await adoptArmed();
 	sent.length = 0;
 	const base = loads();
 
@@ -939,7 +980,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	const base = loads();
 	const before = lines().length;
 	writeState({ ...seedState("coding", [["true", "green"]]), protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-	await hooks.session_start({}, ctx);
+	await adoptArmed();
 	for (let i = 0; i < 3; i++) await hooks.agent_end({}, ctx); // three phase-less turns
 	await new Promise((r) => setTimeout(r, 60));
 	const s = readState();
@@ -957,7 +998,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 {
 	resident = "flash-next";
 	writeState({ ...seedState("coding", [["true", "green"]]), protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-	await hooks.session_start({}, ctx);
+	await adoptArmed();
 	await new Promise((r) => setTimeout(r, 60));
 	await commands.orchestrate.handler("pause", ctx); // park the loop between rounds
 	const base = loads();
@@ -983,7 +1024,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 
 	// 17a. Where the plan is authored, the row is refused there, paying no swap.
 	writeState({ ...seedState("planning", []), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-	await hooks.session_start({}, ctx);
+	await adoptArmed();
 	const authorBase = loads();
 	let authorThrew = "";
 	try {
@@ -997,7 +1038,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	// 17b. A plan that already carries it: the gate runs at the turn boundary, grades the row
 	// INVALID, keeps the coder resident (ZERO loads, round unspent) and names the plan act.
 	writeState({ ...seedState("coding", [[BAD, "PASS 0"], ["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-	await hooks.session_start({}, ctx);
+	await adoptArmed();
 	const gateBase = loads();
 	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
 	sent.length = 0;
@@ -1056,7 +1097,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 	resident = "flash-next";
 	const broken = [["false", "unrunnable by design"], ["bash -c 'exit 3'", "red by design"]];
 	writeState(seedState("coding", broken));
-	await hooks.session_start({}, ctx); // the session adopts the broken pair
+	await adoptArmed(); // the session adopts the broken pair
 	const l0 = loads();
 	notes.length = 0;
 	await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
@@ -1152,7 +1193,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   resident = "flash-next";
   swapLine = null;
   writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   // The ledger is this block's instrument, and the window is a 60 s WALL window: a swap an earlier
   // block pays lands inside this count. Measured with block 13's pin settle in place, the row read
   // "lane flip: 4 swaps in 60s", the breaker halted a cycle early, and the halt, row and desk cases
@@ -1167,7 +1208,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   // unloaded, and the settle between them — `swap` clearing — is what re-arms the recorder, so each
   // cycle is ONE flip AWAY from the run's lane.
   const poll = async () => {
-    await hooks.session_start({}, ctx);
+    await adoptArmed();
     await new Promise((r) => setTimeout(r, 30));
   };
   for (let i = 0; i < 3; i++) {
@@ -1239,7 +1280,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 {
   resident = "flash-next";
   writeState(seedState("coding", [["true", "green"]]));
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const top = widgets.get("fade-top");
   const row = top?.lines?.[0] ?? "";
   ok("the status row is the operator's line: glyph, Orchestrator, state, round, tally, key", row === "󰚩 Orchestrator: code R1/6 · T0/2 · [Alt+F]", JSON.stringify(row));
@@ -1263,7 +1304,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await commands.orchestrate.handler("halt", ctx);
   ok("a terminal run clears the status row", !widgets.has("fade-top"), JSON.stringify([...widgets.keys()]));
   process.env.PI_SESSION_FILE = join(repo, "sessions", "2030-01-01T00-00-00-000Z_parent", "agent.jsonl");
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   ok("a delegated session binds no extra listener on the chord", inputHandlers.length === 1, `handlers=${inputHandlers.length}`);
   delete process.env.PI_SESSION_FILE;
 }
@@ -1279,7 +1320,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const user = account() || "someone";
   const host = hostname();
   writeState({ ...seedState("coding", [["true", "green"]]), goal: `run ${repo} on ${host} by ${user}`, schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   await new Promise((r) => setTimeout(r, 700)); // the login line is deferred past the TUI attach
   // ONE line per login, and it says NOTHING about the key: the row names the chord every round, so
   // a working keyboard is not re-explained per session.
@@ -1331,7 +1372,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   resident = "flash-next";
   writeFileSync(join(repo, "a.ts"), "small edit\n");
   writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const base22 = loads();
   const res22 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
@@ -1347,7 +1388,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   resident = "flash-next"; // the case below pays a swap, so start it on the coder lane
   writeFileSync(join(repo, "a.ts"), "line\n".repeat(20));
   writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [], checkpoints: {} });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const base23 = loads();
   const res23 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
@@ -1363,7 +1404,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
     schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, checkpoints: {},
     rejection_history: [{ round: 1, at: "2030-01-01T00:00:00.000Z", kind: "task", reason: "pre-swap gate red: false", task_id: "T1" }],
   });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const base24 = loads();
   await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
   await hooks.agent_end({}, ctx);
@@ -1380,7 +1421,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 {
   resident = "flash-next";
   writeState({ ...seedState("coding", [["sleep 0.3; exit 0", "green"], ["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [], checkpoints: {} });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   working.length = 0;
   const notesBefore25 = notes.length;
   let ticks25 = 0;
@@ -1450,7 +1491,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
 //     never touch the router's load path. The screen bills the same census.
 {
   writeState(seedState("coding", []));
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   writeFileSync(
     join(repo, "var", "omp-orchestrate", "swap_history.json"),
     JSON.stringify({
@@ -1489,7 +1530,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   resident = "flash-next";
   swapLine = null;
   writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const deskFile = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
   rmSync(deskFile, { force: true });
   const readDeskFile = () => JSON.parse(readFileSync(deskFile, "utf8"));
@@ -1594,7 +1635,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   resident = "flash-next";
   swapLine = null;
   writeState({ ...seedState("coding", [["true", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const deskFile22 = join(repo, "var", "omp-orchestrate", "verify", "desk.json");
   const readDesk22 = () => JSON.parse(readFileSync(deskFile22, "utf8"));
   const now22 = new Date().toISOString();
@@ -1709,7 +1750,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   // A. The lane answers `/v1/models` and REFUSES the completion: the batch is not claimed for the
   // zero-swap route, because that claim is the unrecoverable act.
   seed27([request27("V1.1")], 0);
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const l27 = loads();
   notes.length = 0;
   sent.length = 0;
@@ -1735,7 +1776,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await commands.orchestrate.handler("lanes reset", ctx);
   await new Promise((r) => setTimeout(r, 250));
   seed27([request27("V1.1")], 0);
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const l27b = loads();
   notes.length = 0;
   sent.length = 0;
@@ -1784,7 +1825,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   rmSync(stubLog, { force: true });
   rmSync(argsLog, { force: true });
   writeState({ ...seedState("coding", [["false", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const l28 = loads();
   notes.length = 0;
   const r28 = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
@@ -1806,7 +1847,7 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   chmodSync(silent, 0o755);
   process.env.FADE_ORCHESTRATE_GATE_TRIAGE_BIN = silent;
   writeState({ ...seedState("coding", [["false", "green"]]), schema_retries: 0, protocol_retries: 0, stall_count: 0, paused: false, rejection_history: [] });
-  await hooks.session_start({}, ctx);
+  await adoptArmed();
   const l28b = loads();
   notes.length = 0;
   const r28b = await exec("coding_done", { done: [{ id: "T1", status: "passed", result: "rig" }, { id: "T2", status: "passed", result: "rig" }] });
@@ -1822,9 +1863,10 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   delete process.env.STUB_ARGS_LOG;
 }
 
-// 29. THE NON-RUN HAND-BACK. A plain session whose turn ran on the thinking lane hands the lane
-//     back to the code lane at the boundary — one `setModel` + one quiet load, no briefing. A
-//     session already on the code lane pays nothing, and a delegated session never touches a lane.
+// 29. THE NON-RUN BOUNDARY. A plain session — no run adopted, no /orchestrate act — never pays
+//     the hand-back: no `setModel`, no load, no message. What this block pins is the negative contract:
+//     the lane moves only on an armed lane-control path, so a plain session pays nothing at every
+//     boundary, including on the thinking lane. A delegated session never touches a lane either.
 {
   const stopBase = loads();
   await commands.orchestrate.handler("stop --clear", ctx); // leave no run: the no-run path
@@ -1833,18 +1875,16 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   const rt = await import("../.test-build/router.mjs?case=gate-flip");
   rt.resetFlipLedger();
 
-  // (a) the thinking lane is the session's model: one setModel + one load, no message sent
+  // (a) the thinking lane is the session's model: nothing is sent
   resident = "deepseek";
   ctx.model = { id: "deepseek", provider: "basalt" };
   const b1 = loads();
   const m1 = modelCalls.length;
   const s1 = sent.length;
   await hooks.agent_end({}, ctx);
-  const got1 = await settleLoads(b1, 1);
-  ok("a non-run session on the thinking lane hands back with one load", got1 >= 1 && loads() - b1 === 1, `${loads() - b1}`);
-  const pinned1 = await settleModel(m1, "flash-next");
-  ok("the non-run hand-back is a setModel naming flash-next", pinned1?.id === "flash-next" && modelCalls.length === m1 + 1, JSON.stringify(modelCalls.slice(m1)));
-  ok("the non-run hand-back sends no briefing", sent.length === s1, `${sent.length - s1}`);
+  await new Promise((r) => setTimeout(r, 100));
+  ok("a non-run session on the thinking lane pays ZERO loads and zero setModel", loads() === b1 && modelCalls.length === m1, `models=${modelCalls.length - m1} loads=${loads() - b1}`);
+  ok("a non-run session on the thinking lane sends no briefing", sent.length === s1, `${sent.length - s1}`);
 
   // (b) the code lane is already the session's model: nothing is sent
   ctx.model = { id: "flash-next", provider: "basalt" };
@@ -1864,6 +1904,36 @@ await exec("planning_done", { tasks: [task("T1"), task("T2")], checks: [["false"
   await new Promise((r) => setTimeout(r, 100));
   ok("a delegated session issues no hand-back", modelCalls.length === m3 && loads() === b3, `models=${modelCalls.length - m3} loads=${loads() - b3}`);
   delete process.env.PI_SESSION_FILE;
+}
+// Frontier owns its own lane lifecycle. Observing its tools must not mint another lease.
+{
+	writeState(seedState("coding", [["true", "green"]]));
+	await hooks.session_start({}, ctx);
+	const blocked = await hooks.tool_call({ toolName: "frontier", input: { op: "intake" } }, ctx);
+	ok("an orchestrated run refuses a second Frontier workflow", blocked?.block === true);
+	await commands.orchestrate.handler("halt", ctx);
+	await hooks.tool_call({ toolName: "frontier", input: { op: "report" } }, ctx);
+	await hooks.tool_result({ toolName: "frontier", details: { frontier: { phase: "review" } } }, ctx);
+	const before = loads();
+	const pins = modelCalls.length;
+	ctx.model = { id: "deepseek", provider: "basalt" };
+	await hooks.agent_end({}, ctx);
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	ok("Frontier review causes no orchestrator swap or model pin", loads() === before && modelCalls.length === pins);
+	await commands.orchestrate.handler("a competing workflow", ctx);
+	ok("a live Frontier task prevents a second orchestrated run", notes.at(-1)?.includes("active Frontier task") === true);
+	ok("plan and orchestrate keep separate handlers", commands.plan.handler !== commands.orchestrate.handler);
+	await hooks.tool_result({ toolName: "frontier", details: { frontier: { phase: "done" } } }, ctx);
+	writeState(seedState("stopped", []));
+	ctx.sessionManager = { getBranch: () => [{ message: { toolName: "frontier", details: { frontier: { phase: "review" } } } }] };
+	await hooks.session_start({}, ctx);
+	const restoredPins = modelCalls.length;
+	ok("restored sessions use the shared per-request guard", typeof hooks.before_provider_request === "function");
+	await hooks.agent_end({}, ctx);
+	ok("restored Frontier ownership prevents model sync and hand-back", modelCalls.length === restoredPins);
+	await commands.orchestrate.handler("a conflicting resumed workflow", ctx);
+	ok("restored Frontier task prevents another workflow", notes.at(-1)?.includes("active Frontier task") === true);
+	delete ctx.sessionManager;
 }
 const failed = checks.filter((c) => !c.ok);
 console.log(JSON.stringify({ checks, notes, requests: reqLog.length }, null, 1));

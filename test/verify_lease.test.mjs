@@ -1,23 +1,15 @@
 /**
- * The verification lease is HELD across the turn — the extension level.
+ * A plain session takes no verification lease — the extension level.
  *
- * The defect, measured on the box: a non-run verification move minted a lease, landed
- * the pack, and released the lease in the SAME call. The journal read `lease=free` while the
- * review was still running, and the next peer session took the lane back mid-verdict — the verdict
- * then ran on the pack it had just displaced. The load was paying for the switch, never for the
- * turn the switch exists to protect.
+ * The armed-lane gate (2026-11-27): a plain session — no run adopted, no /orchestrate act —
+ * may not move the lane. No verdict act is recorded, no mint, no swap, no renew, no release,
+ * and no byte reaches the daemon at any boundary. The lease is held across the turn for a
+ * run-owning session (the /orchestrate path), never for a plain one; this suite pins the
+ * negative contract, against a stub supervisor that records every byte.
  *
- * This pins the whole mechanism a plain session gets, from the recorded verdict act to the
- * hand-back, against a stub supervisor that records every byte:
- *   1. the act is RECORDED at `tool_call`; no lane byte moves mid-turn;
- *   2. the boundary mints ONCE, swaps under that token, and releases NOTHING — the lane stays
- *      claimed by the session while its turns run on the thinking pack;
- *   3. the hand-back swaps back under the SAME token (no second mint) and releases exactly once.
- *
- * The thrash ledger is widened out (`FLIP_WINDOW_MS=0`): this suite measures the lease, and
- * forward-plus-back is by design two flips, which the breaker has its own tests for. The ctl fleet
- * gate is pointed at a MISSING binary, so any load routed through it fails by name — a green here
- * is proof the supervisor plane served every byte.
+ * The thrash ledger is widened out (`FLIP_WINDOW_MS=0`): the lease is the one instrument this
+ * suite measures. The ctl fleet gate is pointed at a MISSING binary, so any load routed through
+ * it fails by name — a green here is proof no load is ever routed.
  */
 import { resetLaneEnv } from "./env.mjs?suite=verify_lease";
 import { test } from "node:test";
@@ -117,19 +109,10 @@ const routerStub = async (laneState) => {
 	return { url: `http://127.0.0.1:${port}`, close: () => { server.closeAllConnections?.(); return new Promise((r) => server.close(r)); } };
 };
 
-const settled = async (hits, want, notes, ms = 15000) => {
-	const t0 = Date.now();
-	while (!want(hits)) {
-		if (Date.now() - t0 > ms) throw new Error(`no match in ${ms} ms — wire:\n${hits.join("\n")}
-the plugin said:\n${notes.join("\n")}`);
-		await new Promise((r) => setTimeout(r, 25));
-	}
-};
-
-// The runner ceiling must sit ABOVE the suite's own `settled()` budget (15 s): the wire is the
-// proof, and a runner that kills the test at its 5 s default (bun) reports a timeout with an
-// empty journal. node's default is no ceiling; the option is honored by both runners.
-test("a verification turn holds its lease: recorded mid-turn, paid at the boundary, returned at hand-back", { timeout: 20_000 }, async () => {
+// The runner ceiling must sit above the suite's settle windows: the wire is the proof, and a
+// runner that kills the test mid-settle reports a timeout with an empty journal. node's default
+// is no ceiling; the option is honored by both runners.
+test("a plain session takes no verification lease: nothing reaches the daemon", { timeout: 20_000 }, async () => {
 	const sup = await daemon();
 	const rt = await routerStub(sup.state);
 	const cwd = mkdtempSync(join(tmpdir(), "fade-vl-cwd-"));
@@ -187,52 +170,29 @@ test("a verification turn holds its lease: recorded mid-turn, paid at the bounda
 		factory(pi);
 		assert.ok(hooks.tool_call && hooks.agent_end, "the boundary hooks are bound");
 
-		const notes = [];
-		const ui = { notify: (m) => void notes.push(m), setWorkingMessage: () => undefined, setStatus: () => undefined, setWidget: () => undefined, setWorkingIndicator: () => undefined, setTitle: () => undefined };
+		const ui = { notify: noop, setWorkingMessage: () => undefined, setStatus: () => undefined, setWidget: () => undefined, setWorkingIndicator: () => undefined, setTitle: () => undefined };
 		const ctx = (model) => ({ cwd, ui, model, modelRegistry: { find: (provider, id) => ({ provider, id }) }, agent: { kind: "main", id: "t", name: "t", depth: 0 } });
 
-		// 1. the verdict act is RECORDED; a model switch mid-turn is what broke at 15:56, so no byte moves.
+		// 1. the verdict act is never recorded by a plain session: no byte moves mid-turn.
 		await hooks.tool_call({ toolName: "task", input: { agent: "reviewer" } }, ctx({ provider: "basalt", id: "flash-next" }));
-		assert.equal(supHits().filter((h) => h.includes(R_SWAP)).length, 0, "the act is recorded, not paid mid-turn");
+		await new Promise((r) => setTimeout(r, 100));
+		assert.equal(supHits().length, 0, `no byte reaches the daemon mid-turn: ${supHits().join(" | ")}`);
 
-		// 2. the boundary pays it: mint, swap under that token — and NO release.
+		// 2. and at the boundary nothing is paid either: no mint, no swap, no release, no renew.
 		await hooks.agent_end({}, ctx({ provider: "basalt", id: "flash-next" }));
-		await settled(sup.hits, (h) => h.some((x) => x.includes(R_SWAP)), notes);
-		const swaps = () => supHits().filter((h) => h.includes(R_SWAP));
-		const leases = () => supHits().filter((h) => h.includes(R_LEASE));
-		assert.equal(swaps().length, 1, `one swap: ${swaps().join(" | ")}`);
-		assert.match(swaps()[0], new RegExp(`pack=${VERIFY}`), "the advisor pack is what the boundary lands");
-		assert.match(swaps()[0], new RegExp(`token=${TOKEN}`), "the swap rides the minted capability");
-		assert.equal(leases().filter((h) => h.includes("acquire")).length, 1, "exactly one mint for the turn");
-		assert.equal(leases().filter((h) => h.includes("release")).length, 0,
-			"the load releases NOTHING: the lane stays claimed while the session's turns run on the thinking pack (the defect released it here and a peer took the lane mid-verdict)");
-
-
-		// 2b. the HELD lease is RENEWED on the tick. This session owns no run, and the tick was started
-		// only at run start/adoption, so the mint had no clock at all: a review turn past the mint TTL
-		// let the lease lapse MID-VERDICT and a peer minted the lane back — the verdict then ran on the
-		// pack it had displaced. Minting must start the clock that keeps the lane.
-		await settled(sup.hits, (h) => h.some((x) => x.includes(R_LEASE) && x.includes("action=renew")), notes);
-		assert.ok(supHits().some((h) => h.includes(R_LEASE) && h.includes("action=renew") && h.includes(TOKEN)),
-			"the minted capability is renewed while the session holds the lane");
-		// 3. the next boundary hands the code lane back: the SAME capability rides, then returns once.
-		await hooks.agent_end({}, ctx({ provider: "basalt", id: VERIFY }));
-		await settled(sup.hits, (h) => h.filter((x) => x.includes(R_SWAP)).length >= 2, notes);
-		const hand = swaps()[1];
-		assert.match(hand, new RegExp(`pack=${CODE}`), "the hand-back lands the code pack");
-		assert.match(hand, new RegExp(`token=${TOKEN}`), "the hand-back rides the held capability: no second mint");
-		assert.equal(leases().filter((h) => h.includes("acquire")).length, 1, "the turn is ONE holder, start to hand-back");
-		await settled(sup.hits, (h) => h.filter((x) => x.includes(R_LEASE) && x.includes("release")).length >= 1, notes);
-		assert.equal(leases().filter((h) => h.includes("release")).length, 1, "returned exactly once, at the hand-back");
+		await new Promise((r) => setTimeout(r, 200));
+		assert.equal(supHits().length, 0, `no byte reaches the daemon at the boundary: ${supHits().join(" | ")}`);
 		assert.ok(!existsSync(missingCtl), "the ctl fleet gate was never invoked");
 
-		// Close the lifecycle: the factory opens the metrics interval, and an open handle keeps the
-		// file alive to the runner's cap. `session_shutdown` is the real close — it stops the timer
-		// and returns any capability the session still owns. The hand-back already returned ours, so
-		// the lease traffic must NOT grow: exactly one release for the whole turn.
+		// 3. and the hand-back is a no-op too: the plain session keeps the pack it is on.
+		await hooks.agent_end({}, ctx({ provider: "basalt", id: VERIFY }));
+		await new Promise((r) => setTimeout(r, 200));
+		assert.equal(supHits().length, 0, `no byte reaches the daemon at the hand-back: ${supHits().join(" | ")}`);
+
+		// 4. the shutdown releases nothing it never minted.
 		await hooks.session_shutdown({}, ctx({ provider: "basalt", id: CODE }));
-		assert.equal(sup.hits.filter((h) => h.includes(R_LEASE) && h.includes("release")).length, 1,
-			"the shutdown does not release what the hand-back already returned");
+		await new Promise((r) => setTimeout(r, 100));
+		assert.equal(supHits().length, 0, `no byte reaches the daemon at the shutdown: ${supHits().join(" | ")}`);
 	} finally {
 		for (const k of ["FADE_SUPERVISOR_SOCK", "FADE_ORCHESTRATE_ROUTER", "FADE_ORCHESTRATE_SWAP_VIA", "FADE_ORCHESTRATE_SWAP_CMD", "FADE_ORCHESTRATE_FLIP_WINDOW_MS", "FADE_ORCHESTRATE_METRICS_INTERVAL_MS", "FADE_ORCHESTRATE_LEASE_MINT_TTL_S"]) delete process.env[k];
 		await sup.close();

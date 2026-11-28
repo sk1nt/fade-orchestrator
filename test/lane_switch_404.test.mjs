@@ -1,35 +1,34 @@
 #!/usr/bin/env node
 /**
- * The pack switch and the session prompt are ONE act, and the COMPLETION is what waits.
+ * The hold and the plain session, re-pinned to the armed-lane contract.
  *
- * The halt, measured live:
+ * The halt, measured live (2026-11-26): a verdict act landed the pack on
+ * `hy4-flash` — which is why the switch lands at the turn boundary and the
+ * completion must hold until the lane serves the pin. On this box a supervisor
+ * swap REPLACES the `:18014` process, so it carries exactly one id and a name
+ * it does not carry is a 404.
  *
- *   lane on verification: hy4-flash — the verdict act lands at the turn boundary
- *   frontier: review round 2 opens on the planner that did not write this plan: :18014 → hy4-flash
- *   ✘ 404 The model 'flash-next' does not exist
- *
- * The lane moved to `hy4-flash`; the next completion still named `flash-next`. On this box a
- * supervisor swap REPLACES the `:18014` process, so that server carries exactly one id and a name
- * it does not carry is a 404. The switch caller had moved the pack and not the pin; and the
- * dirty-tree remedy (prove the served id, THEN `setModel`) left the pin and the briefing naming
- * the PREVIOUS pack for the whole 13-25 s load — the same halt, other direction.
- *
- * The contract, copied from Basalt (`docs/configuration/models.md`, `docs/running.md`,
- * `docs/changelog/0.3.0.md`):
+ * The contract, copied from Basalt (`docs/configuration/models.md`,
+ * `docs/running.md`, `docs/changelog/0.3.0.md`):
  *   a request for the loaded model runs at once;
  *   a client waits through a swap and is never 503'd for it (keep-alive comments every 10 s);
  *   a name the server does not carry is a 404;
  *   a failed load answers its batch with a 503 naming the model.
  *
- * So: the switch issues load + `setModel` + thinking + tool policy + briefing in ONE generation,
- * and `before_agent_start` — the last hook before the host posts — holds the turn until the lane
- * serves the pin. Fake router and fake daemon only: no live `:18014`, no lease taken, no
- * systemctl, and every window is the rig's (milliseconds), never the box's 900 s.
+ * The CURRENT contract this suite pins (2026-11-27, the armed-lane gate): a plain
+ * session — no run adopted, nothing armed through an `/orchestrate` act — never
+ * moves the lane. No verdict act is recorded, no pin, no swap, no tool policy, no
+ * thinking change, no briefing. The hold machinery is unchanged and is what these
+ * assertions cover: `before_provider_request` holds the turn until the lane
+ * serves the pin the session holds, which is the `before_agent_start` hold the
+ * original file pinned, under the new hook name. Fake router and fake daemon
+ * only: no live `:18014`, no lease taken, no systemctl, and every window is the
+ * rig's (milliseconds), never the box's 900 s.
  *
- * ONE stub pair per process, like `test/gate_rig.mjs`: `ROUTER` and the supervisor socket are
- * read at module import, so a stub per test would be a stub the plugin never sees. The state is
- * reset per test; the extension instance is per test (a cache-busted import) so each test owns its
- * recorded host calls.
+ * ONE stub pair per process, like `test/gate_rig.mjs`: `ROUTER` and the
+ * supervisor socket are read at module import, so a stub per test would be a stub
+ * the plugin never sees. The state is reset per test; the extension instance is
+ * per test (a cache-busted import) so each test owns its recorded host calls.
  */
 import "./env.mjs?suite=lane_switch_404";
 import { test } from "node:test";
@@ -329,35 +328,25 @@ test.after(() => {
 	rmSync(supDir, { recursive: true, force: true });
 });
 
-test("the switch act: the pack load and the session pin go out TOGETHER, before the lane serves", async () => {
-	// The lane is on the code pack, listed as the code pack, when the verdict act is paid.
+test("the plain session never pays the verdict act: no pin, no swap, no policy change, no briefing", async () => {
+	// The lane is on the code pack, listed as the code pack, when the verdict act is recorded.
 	setPlane({ resident: CODE, served: CODE });
 	const r = await rig("sameact");
 	try {
 		await r.recordVerifyAct(CODE);
 		await r.hooks.agent_end({}, r.ctx(CODE));
-		await until("the verifier pin", () => r.pins.some((p) => p.id === VERIFY));
+		await sleep(100);
+		// A plain session never moves the lane: the armed-lane gate refuses to pay the verdict
+		// act (a run-owning session arms it through an /orchestrate act).
+		assert.equal(r.pins.length, 0, `no pin at the boundary: ${JSON.stringify(r.pins)}`);
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap at the boundary");
+		assert.equal(r.thinking.length, 0, "no thinking level moved");
+		assert.equal(r.policy.length, 0, "no tool policy moved");
+		assert.equal(r.sent.length, 0, "no briefing sent");
 
-		const pin = r.pins.find((p) => p.id === VERIFY);
-		assert.equal(pin.served, CODE, "the pin went out WHILE the lane still served the code pack: that is the same act, not prove-then-pin");
-		assert.equal(st.served, CODE, "the swap is still in flight at the assertion: no residency proof gated the pin");
-		const swaps = sup.hits.filter((h) => h.includes(R_SWAP));
-		assert.equal(swaps.length, 1, `exactly one swap, for the owed lane: ${swaps.join(" | ")}`);
-		assert.match(swaps[0], new RegExp(`pack=${VERIFY}`), "the verifier pack is what the boundary lands");
-
-		// The prompt change is part of the act, not a later turn: thinking and tool policy moved
-		// with the pin, and the verifier lane has no writers.
-		assert.equal(r.thinking.at(-1), "high", `the verifier lane's thinking level rode with the pin (THINKING names high for hy4-flash): ${JSON.stringify(r.thinking)}`);
-		const stripped = r.policy.at(-1) ?? [];
-		// The shipped policy strips WRITERS (`MUTATING_TOOLS`: edit, write, patches) and keeps
-		// `bash` — the verifier's whole job is running the batch's check commands — plus `task`
-		// (delegation) and `fade_phase` (the verdict act).
-		for (const writer of ["edit", "write"]) assert.ok(!stripped.includes(writer), `the verifier lane's active set drops ${writer}: ${JSON.stringify(stripped)}`);
-		for (const keeper of ["bash", "task", "fade_phase"]) assert.ok(stripped.includes(keeper), `the verifier keeps ${keeper}, the tool its verdict is made of: ${JSON.stringify(stripped)}`);
-
-		// And the completion that follows names the pinned lane, never the old one.
-		await until("the swap lands", () => st.served === VERIFY);
-		await r.hooks.before_agent_start({}, r.ctx(VERIFY));
+		// The completion still holds: the turn waits the way basalt's router holds a client
+		// through a swap — the pin is the pack already serving, so the hold is one read.
+		await r.hooks.before_provider_request({}, r.ctx(CODE));
 		assert.ok(!r.notes.some((n) => n.includes("not serving")), `the turn posted with no 404 and no warning: ${r.notes.join(" | ")}`);
 	} finally {
 		await r.close();
@@ -373,7 +362,7 @@ test("the completion waits the Basalt way: the hook holds while the lane lists t
 	try {
 		const t0 = Date.now();
 		const workBase = r.working.length;
-		const hook = r.hooks.before_agent_start({}, r.ctx(VERIFY));
+		const hook = r.hooks.before_provider_request({}, r.ctx(VERIFY));
 		let settled = false;
 		void hook.then(() => (settled = true));
 		await sleep(60);
@@ -407,7 +396,7 @@ test("a pin that already names the served id runs at once: one read, no waiting,
 		const hits = st.modelsHits;
 		const workBase = r.working.length;
 		const t0 = Date.now();
-		await r.hooks.before_agent_start({}, r.ctx(CODE));
+		await r.hooks.before_provider_request({}, r.ctx(CODE));
 		const spent = Date.now() - t0;
 		assert.equal(st.modelsHits - hits, 1, "the loaded model costs exactly one census read");
 		assert.equal(r.working.length - workBase, 0, "nothing to wait for, nothing to say");
@@ -417,7 +406,7 @@ test("a pin that already names the served id runs at once: one read, no waiting,
 	}
 });
 
-test("a load that fails is the 503 class: no pin, no briefing, a notify naming the model", async () => {
+test("a plain session pays no load at all, so no refusal is ever named", async () => {
 	setPlane({ resident: CODE, served: CODE, refuseSwap: true });
 	const r = await rig("failed");
 	try {
@@ -425,78 +414,56 @@ test("a load that fails is the 503 class: no pin, no briefing, a notify naming t
 		const pins = r.pins.length;
 		const sent = r.sent.length;
 		await r.hooks.agent_end({}, r.ctx(CODE));
-		await until("the refused load is named", () => r.notes.some((n) => n.includes(VERIFY) && /failed|refus/i.test(n)));
-		assert.equal(r.pins.length, pins, "a load that never came up lands NO pin: the session stays on the pack that serves");
+		await sleep(100);
+		// A plain session never pays a load: no swap is attempted, nothing lands, nothing is named.
+		assert.equal(r.pins.length, pins, "a plain session lands NO pin");
 		assert.equal(r.sent.length, sent, "and NO briefing");
-		assert.ok(r.notes.some((n) => n.includes(VERIFY) && /failed|refus|did not/i.test(n)), `the notify names the model: ${r.notes.join(" | ")}`);
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap is issued");
 		// The loop survives: the next turn on the served pack posts with no 404.
-		await r.hooks.before_agent_start({}, r.ctx(CODE));
+		await r.hooks.before_provider_request({}, r.ctx(CODE));
 		assert.ok(!r.notes.some((n) => n.includes("not serving")), `no 404 cascade: ${r.notes.join(" | ")}`);
 	} finally {
 		await r.close();
 	}
 });
 
-test("the quiet hand-back pins the code lane in the same act, briefs nothing, and the next turn waits", async () => {
-	// The turn ran on the planning lane: the boundary hands the code lane back.
+test("a plain session on the thinking lane hands nothing back: no pin, no briefing, no swap", async () => {
+	// The turn ran on the planning lane: the boundary is now a no-op for a plain session.
 	setPlane({ resident: THINK, served: THINK });
 	const r = await rig("quiet");
 	try {
 		const sent = r.sent.length;
 		await r.hooks.agent_end({}, r.ctx(THINK));
-		await until("the hand-back pin", () => r.pins.some((p) => p.id === CODE));
-		const pin = r.pins.find((p) => p.id === CODE);
-		assert.equal(pin.served, THINK, "the pin went out with the load: a quiet switch that leaves the pin on the thinking lane is this 404 inverted");
-		assert.equal(r.thinking.at(-1), "low", `the code lane's thinking level moved with the hand-back pin (THINKING names low for flash-next): ${JSON.stringify(r.thinking)}`);
-		assert.equal(r.sent.length, sent, "a hand-back is not a phase: no briefing page");
-		await until("the hand-back lands", () => st.served === CODE);
+		await sleep(100);
+		assert.equal(r.pins.length, 0, "no pin at the boundary");
+		assert.equal(r.thinking.length, 0, "no thinking level moved");
+		assert.equal(r.sent.length, sent, "no briefing page");
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap at the boundary");
 
-		// The next turn names the code pack while the listing lags: it waits, it does not 404.
-		setPlane({ resident: CODE, served: THINK });
-		const hook = r.hooks.before_agent_start({}, r.ctx(CODE));
-		let settled = false;
-		void hook.then(() => (settled = true));
-		await sleep(60);
-		assert.equal(settled, false, "the hand-back's first turn holds until the code pack is listed");
-		land(st, CODE);
-		await hook;
+		// The completion still holds the way basalt does: a turn naming the served lane runs at once.
+		await r.hooks.before_provider_request({}, r.ctx(THINK));
+		assert.ok(!r.notes.some((n) => n.includes("not serving")), `the turn posted with no 404: ${r.notes.join(" | ")}`);
 	} finally {
 		await r.close();
 	}
 });
 
-test("a superseded generation cancels its pin, its thinking level, and its briefing", async () => {
-	// Two switches in one act, and the LONG leg is the pre-swap gate: the router is serving a
-	// request, so the hand-back toward the code lane sits in the gate, the verdict act lands behind
-	// it, and the older generation is dead before it is allowed to touch the router. A dead switch
-	// loads nothing, pins nothing, prompts nothing — that is the clause this test grades, the one
-	// that keeps a superseded hand-back from pinning `flash-next` under a round that names
-	// `hy4-flash`.
+test("a plain session's overlapping boundaries move nothing at all", async () => {
+	// Two boundaries in one act: the switch machinery is armed only through an /orchestrate act,
+	// so a plain session pays NOTHING — no pin, no swap, no policy change, no briefing.
 	setPlane({ resident: THINK, served: THINK, busy: true });
 	const r = await rig("gen");
 	try {
-		void r.hooks.agent_end({}, r.ctx(THINK)); // gen 1: quiet hand-back toward flash-next, into the gate
+		await r.hooks.agent_end({}, r.ctx(THINK));
 		await sleep(20);
-		await r.recordVerifyAct(THINK); // the act the next boundary pays
-		await r.hooks.agent_end({}, r.ctx(THINK)); // gen 2: toward hy4-flash, superseding gen 1
-		await sleep(20);
-		st.busy = false; // the lane frees its slot: the chain moves, and only the live generation is left
-		await until("the live switch lands", () => r.pins.some((p) => p.id === VERIFY));
-		await until("the chain drains", () => st.served === VERIFY);
-		const ids = r.pins.map((p) => p.id);
-		assert.ok(!ids.includes(CODE), `the dead generation pinned NOTHING: ${JSON.stringify(r.pins)}`);
-		assert.equal(ids.filter((id) => id === VERIFY).length, 1, `the live generation pinned the verifier lane exactly once: ${JSON.stringify(r.pins)}`);
-		const swaps = sup.hits.filter((h) => h.includes(R_SWAP));
-		// BOTH loads are paid, in order: the pre-swap gate is the long leg and it cannot know the
-		// pin is dead, so the serialised chain admits the older generation's swap before that
-		// generation is re-checked. What is CANCELLED is everything the session and the model SEE —
-		// the pin, the thinking level, the tool policy, the briefing — and that is the clause that
-		// stops a review round naming `hy4-flash` over a pin of `flash-next`.
-		assert.deepEqual(swaps.map((h) => h.match(/pack=[^ ]+/)?.[0]), ["pack=flash-next", "pack=hy4-flash"], `the loads, in order: ${swaps.join(" | ")}`);
-		assert.equal(r.pins.length, 1, `exactly ONE pin for two switches: ${JSON.stringify(r.pins)}`);
-		assert.equal(r.sent.length, 0, `no briefing page for a superseded quiet pair: ${r.sent.length}`);
-		const stripped = r.policy.at(-1) ?? [];
-		for (const writer of ["edit", "write"]) assert.ok(!stripped.includes(writer), `the live generation's policy is the one that stands (${writer} present): ${JSON.stringify(stripped)}`);
+		await r.recordVerifyAct(THINK);
+		await r.hooks.agent_end({}, r.ctx(THINK));
+		await sleep(50);
+		assert.equal(r.pins.length, 0, `no pin at any boundary: ${JSON.stringify(r.pins)}`);
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap at any boundary");
+		assert.equal(r.thinking.length, 0, "no thinking level moved");
+		assert.equal(r.policy.length, 0, "no tool policy moved");
+		assert.equal(r.sent.length, 0, "no briefing page");
 	} finally {
 		await r.close();
 	}
@@ -580,73 +547,56 @@ test("the keep-alive page carries the percent as a NUMBER, for the surfaces that
 // first read is the router the swap is replacing. So the switch runs the same `laneServeHold`,
 // pumps the same page (working message + the multicolored pill, on the same keep-alive clock), and
 // issues the briefing only once the lane serves the pack the pin names.
-test("the SWITCH paints its own holding page: the message moves with the load, and the briefing waits for the pack", async () => {
+test("a plain session's boundary paints nothing: no holding page, no briefing", async () => {
 	setPlane({ resident: CODE, served: CODE });
 	const r = await rig("page");
 	try {
 		await r.recordVerifyAct(CODE);
 		const sent = r.sent.length;
 		const workBase = r.working.length;
-		void r.hooks.agent_end({}, r.ctx(CODE));
-		await until("the pin lands with the load", () => r.pins.some((p) => p.id === VERIFY));
-		assert.equal(st.served, CODE, "the swap is in flight: the lane still serves the code pack");
-		await until("the switch page", () => r.working.slice(workBase).some((m) => typeof m === "string" && m.includes(VERIFY) && m.includes("waits")));
-		// The rig's keep-alive clock is 40 ms and the transit is 150 ms, so a page that repaints is
-		// a page the operator sees moving — Basalt's keep-alive, on the boundary's own surface.
-		await sleep(90);
-		const pages = r.working.slice(workBase).filter((m) => typeof m === "string" && m.includes(VERIFY));
-		assert.ok(pages.length >= 2, `the page repaints on the keep-alive clock: ${JSON.stringify(r.working.slice(workBase))}`);
-		assert.ok(pages.some((m) => /\d+%/.test(m)), `the page carries the router's own percent: ${JSON.stringify(pages)}`);
-		assert.equal(r.sent.length, sent, "the briefing waits for the pack: a briefing naming hy4-flash over a lane serving flash-next is this file's 404, one layer up");
-		await until("the swap lands", () => st.served === VERIFY);
-		await until("the briefing lands after the serve", () => r.sent.length > sent);
-		assert.equal(r.working.at(-1), null, "the page clears the moment the lane serves");
+		await r.hooks.agent_end({}, r.ctx(CODE));
+		await sleep(100);
+		assert.equal(r.pins.length, 0, `no pin at the boundary: ${JSON.stringify(r.pins)}`);
+		assert.equal(r.working.length, workBase, "no holding page is painted");
+		assert.equal(r.sent.length, sent, "no briefing sent");
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap is issued");
 	} finally {
 		await r.close();
 	}
 });
 
-test("a pack that admits and never serves: the switch names the class, briefs NOTHING, and the lane stays owed", async () => {
-	// The load is admitted and the pin goes out with it — the same act — and the pack never comes up
-	// inside the readiness window. Basalt's answer to a load that FAILED is a 503 naming the model,
-	// never a completion the lane cannot serve, so the switch STOPS at that boundary.
+test("a plain session admits nothing and never serves: no pin, no page, no briefing", async () => {
 	setPlane({ resident: CODE, served: CODE, delay: 5000 });
 	const r = await rig("noserve");
 	try {
 		await r.recordVerifyAct(CODE);
 		const sent = r.sent.length;
 		await r.hooks.agent_end({}, r.ctx(CODE));
-		await until("the admitted load is named", () => r.notes.some((n) => n.includes(VERIFY) && /does not serve/.test(n)));
-		assert.ok(r.pins.some((p) => p.id === VERIFY), "the pin went out with the load, as the act requires");
-		assert.equal(r.sent.length, sent, "NO briefing on a pack that is not serving");
-		assert.equal(r.working.at(-1), null, "the page clears on the failure path too");
-		assert.ok(r.notes.some((n) => n.includes("does not serve") && n.includes("stays owed")), `the notify names the state and the owed lane: ${r.notes.join(" | ")}`);
-		// The screen follows the lane that DOES serve, and the next turn on that pack posts clean.
-		assert.equal(r.pins.at(-1)?.id, CODE, `the session fell back to the served lane: ${JSON.stringify(r.pins)}`);
-		await r.hooks.before_agent_start({}, r.ctx(CODE));
+		await sleep(100);
+		assert.equal(r.pins.length, 0, "no pin lands, so no pack is owed");
+		assert.equal(r.sent.length, sent, "NO briefing");
+		assert.equal(r.working.length, 0, "no holding page is painted");
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap is issued");
+		// The screen never moved: the session still holds the code pack, and the next turn posts clean.
+		await r.hooks.before_provider_request({}, r.ctx(CODE));
 		assert.ok(!r.notes.some((n) => n.includes("not serving")), `no 404 cascade: ${r.notes.join(" | ")}`);
 	} finally {
 		await r.close();
 	}
 });
 
-test("the verifier tool policy compares CONTENTS: the equal-length case is not a no-op", async () => {
+test("a plain session never strips the tool policy: the verifier sandbox rides the lane move", async () => {
 	setPlane({ resident: CODE, served: CODE });
 	const rt = await rig("policy");
 	try {
-		// The measured shape: four tools, ONE writer. The read-only set removes `edit` and adds
-		// `fade_phase` — the SAME length, so the old `length !==` test skipped setActiveTools
-		// and the writer stayed live on the verifier lane with no phase tool.
 		rt.active.tools = ["read", "bash", "edit", "task"];
 		await rt.recordVerifyAct(CODE);
-		void rt.hooks.agent_end({}, rt.ctx(CODE));
-		await until("the swap lands", () => sup.hits.some((h) => h.includes(R_SWAP)), 4000);
-		// The policy rides the same act as the pin, before the serve-hold.
-		await until("fade_phase activated", () => rt.policy.some((p) => p.includes("fade_phase")), 4000);
-		const last = rt.policy[rt.policy.length - 1];
-		assert.ok(!last.includes("edit"), `the writer is out: ${JSON.stringify(last)}`);
-		assert.ok(last.includes("fade_phase"), `the phase tool is in: ${JSON.stringify(last)}`);
-		assert.deepEqual(last, ["read", "bash", "task", "fade_phase"]);
+		await rt.hooks.agent_end({}, rt.ctx(CODE));
+		await sleep(100);
+		assert.equal(rt.policy.length, 0, `no policy move for a plain session: ${JSON.stringify(rt.policy)}`);
+		assert.equal(rt.pins.length, 0, "no pin at the boundary");
+		assert.deepEqual(sup.hits.filter((h) => h.includes(R_SWAP)), [], "no swap is issued");
+		assert.deepEqual(rt.active.tools, ["read", "bash", "edit", "task"], "the active set is untouched");
 	} finally {
 		await rt.close();
 	}

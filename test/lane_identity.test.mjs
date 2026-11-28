@@ -100,17 +100,6 @@ test("every env shape keeps the three lanes three", async () => {
 	}
 });
 
-test("the lane sync pins the OWED lane, never the pack that is merely still resident", async () => {
-	const m = await fresh("li-sync-" + Date.now(), {});
-	// The measured defect: the run asks for `deepseek`; the swap drains; the sync pins the pack
-	// that is still resident (`flash-next`); the first completion never names the guest.
-	assert.equal(m.laneSyncTarget("deepseek", "deepseek"), "deepseek", "the owed lane is resident: the pin follows");
-	assert.equal(m.laneSyncTarget("deepseek", "flash-next"), undefined, "the swap is draining: the pin STAYS, the sync does not snap the run back");
-	assert.equal(m.laneSyncTarget("flash-next", "flash-next"), "flash-next");
-	assert.equal(m.laneSyncTarget("deepseek", undefined), "deepseek", "a plain session follows the resident pack");
-	assert.equal(m.laneSyncTarget(undefined, "deepseek"), undefined, "no residency, no opinion");
-});
-
 test("the start proof's window is the cold-load bound, not a hunch", async () => {
 	const m = await fresh("li-wait-" + Date.now(), {});
 	assert.equal(m.START_PROOF_WAIT_MS, 240_000, "a cold pack load plus the daemon's readiness window; it never kills a load in flight");

@@ -109,10 +109,10 @@ export type RouterLane = { id: string; status: string };
 
 export async function listLanes(): Promise<{ health: string; models: RouterLane[]; error?: string }> {
 	try {
-		const h = await fetch(`${ROUTER}/health`, { signal: AbortSignal.timeout(4000) });
+		const h = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/health`, { signal: AbortSignal.timeout(4000) });
 		const body = await h.json().catch(() => null);
 		const health = h.ok ? String((body as { status?: string } | null)?.status ?? "ok") : `http ${h.status}`;
-		const r = await fetch(`${ROUTER}/v1/models`, { signal: AbortSignal.timeout(4000) });
+		const r = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/v1/models`, { signal: AbortSignal.timeout(4000) });
 		const listing = (await r.json()) as { data?: Array<Record<string, any>> };
 		const models = (listing?.data ?? []).map((m) => ({
 			id: String(m.id ?? m.model ?? "?"),
@@ -129,7 +129,7 @@ export type RouterHealth = { model?: string; loaded?: boolean | string; loading?
 /** The router's own health line: `loading` is true while a swap is in flight. */
 export async function laneHealth(): Promise<RouterHealth | undefined> {
 	try {
-		const r = await fetch(`${ROUTER}/health`, { signal: AbortSignal.timeout(4000) });
+		const r = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/health`, { signal: AbortSignal.timeout(4000) });
 		return (await r.json()) as RouterHealth;
 	} catch {
 		return undefined;
@@ -655,6 +655,7 @@ export async function laneServeHold(
 		waitMs?: number;
 		pollMs?: number;
 		keepAliveMs?: number;
+		isCurrent?: () => boolean;
 		served?: () => Promise<{ id?: string; n_ctx?: number } | undefined>;
 		health?: () => Promise<RouterHealth | undefined>;
 		/** The keep-alive page: one line per refresh. `percent` rides so a caller with a painted
@@ -665,14 +666,15 @@ export async function laneServeHold(
 ): Promise<ServeHold> {
 	const served = opts.served ?? servedIdentity;
 	const health = opts.health ?? laneHealth;
-	const pollMs = opts.pollMs ?? LANE_POLL_MS;
-	const waitMs = opts.waitMs ?? SERVE_WAIT_MS;
-	const keepAliveMs = opts.keepAliveMs ?? LANE_KEEPALIVE_MS;
+	const pollMs = opts.pollMs ?? Number(process.env.FADE_ORCHESTRATE_LANE_POLL_MS ?? LANE_POLL_MS);
+	const waitMs = opts.waitMs ?? Number(process.env.FADE_ORCHESTRATE_SERVE_WAIT_MS ?? SERVE_WAIT_MS);
+	const keepAliveMs = opts.keepAliveMs ?? Number(process.env.FADE_ORCHESTRATE_KEEPALIVE_MS ?? LANE_KEEPALIVE_MS);
 	const t0 = Date.now();
 	let polls = 0;
 	let refreshes = 0;
 	let nextRefreshAt = t0;
 	for (;;) {
+		if (opts.isCurrent?.() === false) return { ok: false, polls, refreshes, failed: false, waited_s: (Date.now() - t0) / 1000, reason: "superseded request target" };
 		const idn = await served();
 		polls += 1;
 		if (idn?.id === wanted) {
@@ -719,18 +721,6 @@ export async function laneServeHold(
 	}
 }
 
-/** The screen's model pin, or `undefined` = leave the screen alone. `residentPack` is the daemon's
- *  `active_pack`; `owed` is the lane this session's work is owed — `pending?.lane ?? run.lane` for a
- *  live run, the recorded verify lane for a plain session. A swap drains for tens of seconds, and
- *  pinning the pack that is still resident in that window is the measured defect: the run asks for
- *  `deepseek`, the sync lands `flash-next`, and the first completion never names the guest. */
-export function laneSyncTarget(residentPack: string | undefined, owed: string | undefined): string | undefined {
-	if (residentPack === undefined) return undefined;
-	const target = packToModelId(residentPack);
-	if (owed !== undefined && packToModelId(owed) !== target) return undefined;
-	return target;
-}
-
 /** The names this box's router is meant to serve: the three lanes. Basalt's rule is that a
  *  request for a name the server does not carry is a 404 — "any other name" — so a pin outside
  *  this set is the HOST's 404 to answer, and the hold stays out of it. */
@@ -748,11 +738,11 @@ const statusOf = (m: Record<string, unknown>): string => {
  *  readiness probe (`HTTPProbe(..., want="")`), and `packs[].alias` has no consumer. */
 export async function servedIdentity(timeoutMs = 4_000): Promise<{ id?: string; n_ctx?: number } | undefined> {
 	try {
-		const r = await fetch(`${ROUTER}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
+		const r = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
 		if (!r.ok) return undefined;
 		const listing = (await r.json()) as { data?: Array<Record<string, unknown>> };
 		const rows = listing?.data ?? [];
-		const hit = rows.find((m) => statusOf(m) === "loaded") ?? rows[0];
+		const hit = rows.find((m) => statusOf(m) === "loaded") ?? rows.find((m) => statusOf(m) === "");
 		if (!hit) return undefined;
 		const meta = hit.meta as { n_ctx?: number } | undefined;
 		return { id: String(hit.id ?? hit.model ?? "?"), n_ctx: typeof meta?.n_ctx === "number" ? meta.n_ctx : undefined };

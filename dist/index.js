@@ -1,24 +1,50 @@
-// src/index.ts
-import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync4, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { basename, dirname, join as join8 } from "node:path";
-import { readFile as readFile2, stat as stat3 } from "node:fs/promises";
-import { Type } from "typebox";
-
 // src/router.ts
 import { exec } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join as join2 } from "node:path";
 import { promisify } from "node:util";
 
 // src/supervisor.ts
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 var CALLER = "fade-orchestrator";
 var BUILD_PROD = "prod";
 var ROOT_SOCK = "/run/fade/supervisor.sock";
 var USER_SOCK = "/tmp/fade-supervisor.sock";
+var STATE_DIR = process.env.FADE_ORCHESTRATE_STATE_DIR ?? join(homedir(), ".local", "state", "fade-orchestrator");
+var leaseTokenFile = (session, dir = STATE_DIR) => join(dir, "leases", `${CALLER}-${(session || "anon").replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+function readStoredLease(session, dir = STATE_DIR) {
+  try {
+    const rec = JSON.parse(readFileSync(leaseTokenFile(session, dir), "utf8"));
+    return typeof rec?.token === "string" && rec.token.length > 0 && typeof rec.session === "string" ? rec : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function writeStoredLease(rec, dir = STATE_DIR) {
+  try {
+    const path = leaseTokenFile(rec.session, dir);
+    mkdirSync(dirname(path), { recursive: true, mode: 448 });
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(rec), { mode: 384 });
+    renameSync(tmp, path);
+  } catch {
+  }
+}
+function clearStoredLease(session, dir = STATE_DIR) {
+  try {
+    rmSync(leaseTokenFile(session, dir), { force: true });
+  } catch {
+  }
+}
+async function releaseOwnedLease(token, sessionId, sock) {
+  const v = await releaseLease(token, sessionId, sock);
+  if (v.ok || v.rule === RULE_LEASE_STALE_TOKEN) clearStoredLease(sessionId);
+  return v;
+}
 var RULE_LEASE_NOT_HOLDER = "lease_not_holder";
 var RULE_LEASE_HELD = "lease_held";
 var RULE_LEASE_STALE_TOKEN = "lease_stale_token";
@@ -69,7 +95,7 @@ var asRecord = (v) => v && typeof v === "object" ? v : {};
 var asString = (v) => typeof v === "string" ? v : void 0;
 var asNumber = (v) => typeof v === "number" && Number.isFinite(v) ? v : void 0;
 function postUds(sock, path, body, headers, timeoutMs = 15e3) {
-  const { promise, resolve: resolve2, reject } = Promise.withResolvers();
+  const { promise, resolve: resolve3, reject } = Promise.withResolvers();
   const payload = JSON.stringify(body);
   const req = request(
     {
@@ -96,7 +122,7 @@ function postUds(sock, path, body, headers, timeoutMs = 15e3) {
         } catch {
           parsed = void 0;
         }
-        resolve2({ status: res.statusCode ?? 0, body: parsed, raw });
+        resolve3({ status: res.statusCode ?? 0, body: parsed, raw });
         req.destroy();
       });
     }
@@ -111,7 +137,7 @@ var SL = String.fromCharCode(47);
 var ROUTE_RESIDENCY = SL.concat("v1", SL, "residency");
 var ROUTE_HEALTH = SL.concat("v1", SL, "health");
 function getUds(sock, path, headers, timeoutMs = 4e3) {
-  const { promise, resolve: resolve2, reject } = Promise.withResolvers();
+  const { promise, resolve: resolve3, reject } = Promise.withResolvers();
   const req = request({ socketPath: sock, agent: false, method: "GET", path, headers }, (res) => {
     let raw = "";
     res.setEncoding("utf8");
@@ -125,7 +151,7 @@ function getUds(sock, path, headers, timeoutMs = 4e3) {
       } catch {
         parsed = void 0;
       }
-      resolve2({ status: res.statusCode ?? 0, body: parsed, raw });
+      resolve3({ status: res.statusCode ?? 0, body: parsed, raw });
       req.destroy();
     });
   });
@@ -284,10 +310,10 @@ async function runSwap(command) {
 }
 async function listLanes() {
   try {
-    const h = await fetch(`${ROUTER}/health`, { signal: AbortSignal.timeout(4e3) });
+    const h = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/health`, { signal: AbortSignal.timeout(4e3) });
     const body = await h.json().catch(() => null);
     const health = h.ok ? String(body?.status ?? "ok") : `http ${h.status}`;
-    const r = await fetch(`${ROUTER}/v1/models`, { signal: AbortSignal.timeout(4e3) });
+    const r = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/v1/models`, { signal: AbortSignal.timeout(4e3) });
     const listing = await r.json();
     const models = (listing?.data ?? []).map((m) => ({
       id: String(m.id ?? m.model ?? "?"),
@@ -300,7 +326,7 @@ async function listLanes() {
 }
 async function laneHealth() {
   try {
-    const r = await fetch(`${ROUTER}/health`, { signal: AbortSignal.timeout(4e3) });
+    const r = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/health`, { signal: AbortSignal.timeout(4e3) });
     return await r.json();
   } catch {
     return void 0;
@@ -410,6 +436,14 @@ async function loadLane(lane, opts = {}) {
     let token = opts.leaseToken;
     let minted = false;
     if (!token) {
+      const stored = readStoredLease(sid);
+      if (stored) {
+        const rv = await renewLease(stored.token, opts.mintLease?.ttlSec ?? LANE_LEASE_TTL_SEC, sid);
+        if (rv.ok) token = stored.token;
+        else if (rv.rule === RULE_LEASE_NOT_HOLDER || rv.rule === RULE_LEASE_STALE_TOKEN) clearStoredLease(sid);
+      }
+    }
+    if (!token) {
       if (!opts.mintLease) {
         return {
           ok: false,
@@ -424,9 +458,16 @@ async function loadLane(lane, opts = {}) {
       clearOwnSwap(lane);
       token = lease.ok ? lease.token : void 0;
       minted = !!token;
+      if (token) writeStoredLease({ token, pack: lane, session: sid, granted_utc: (/* @__PURE__ */ new Date()).toISOString() });
       if (!token) {
+        const deferrable = lease.rule === RULE_LEASE_HELD || lease.rule === RULE_LEASE_NOT_HOLDER || lease.rule === RULE_LEASE_STALE_TOKEN;
         return {
           ok: false,
+          ...deferrable ? { deferred: true } : {},
+          leaseRule: lease.rule,
+          leaseHolder: lease.holder,
+          leaseRemainingS: lease.remaining_s,
+          leaseTokenHint: lease.token_hint,
           detail: `lease mint refused http ${lease.status} rule ${lease.rule || "?"}: ${lease.reason || "no reason"}${flipNote(flip)}`,
           elapsed_s: (Date.now() - t0) / 1e3,
           guarded,
@@ -438,6 +479,7 @@ async function loadLane(lane, opts = {}) {
     const detail = v.ok ? `swap via supervisor: ${lane}` : `swap supervisor refused http ${v.status} rule ${v.rule || "?"}: ${v.reason || "no reason"}`;
     if (!v.ok && minted) {
       await releaseLease(token, sid).catch(() => void 0);
+      clearStoredLease(sid);
       return { ok: false, detail: `${detail}${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1e3, guarded, flip };
     }
     return {
@@ -453,8 +495,8 @@ async function loadLane(lane, opts = {}) {
     return { ok: false, detail: `swap plane unconfigured: FADE_ORCHESTRATE_SWAP_CMD is unset (the host points it at the fleet gate; no path ships in the plugin)${flipNote(flip)}`, elapsed_s: (Date.now() - t0) / 1e3, guarded, flip };
   }
   try {
-    const dir = await mkdtemp(join(tmpdir(), "fade-swap-"));
-    const jobPath = join(dir, "job.json");
+    const dir = await mkdtemp(join2(tmpdir(), "fade-swap-"));
+    const jobPath = join2(dir, "job.json");
     await writeFile(jobPath, JSON.stringify({ schema: "farol.job/1", engagement: "ENG-LOCAL-GPU", run: `omp-${Date.now()}`, task: "lane-swap", data_class: "internal", model: lane, swap: true, ...opts.lease ? { lease: true } : {} }));
     markOwnSwap(lane);
     const { code, stdout, stderr } = await runSwap(`${SWAP_CMD} '${jobPath}'`);
@@ -498,14 +540,15 @@ async function proveResident(target, opts = {}) {
 async function laneServeHold(wanted, opts = {}) {
   const served = opts.served ?? servedIdentity;
   const health = opts.health ?? laneHealth;
-  const pollMs = opts.pollMs ?? LANE_POLL_MS;
-  const waitMs = opts.waitMs ?? SERVE_WAIT_MS;
-  const keepAliveMs = opts.keepAliveMs ?? LANE_KEEPALIVE_MS;
+  const pollMs = opts.pollMs ?? Number(process.env.FADE_ORCHESTRATE_LANE_POLL_MS ?? LANE_POLL_MS);
+  const waitMs = opts.waitMs ?? Number(process.env.FADE_ORCHESTRATE_SERVE_WAIT_MS ?? SERVE_WAIT_MS);
+  const keepAliveMs = opts.keepAliveMs ?? Number(process.env.FADE_ORCHESTRATE_KEEPALIVE_MS ?? LANE_KEEPALIVE_MS);
   const t0 = Date.now();
   let polls = 0;
   let refreshes = 0;
   let nextRefreshAt = t0;
   for (; ; ) {
+    if (opts.isCurrent?.() === false) return { ok: false, polls, refreshes, failed: false, waited_s: (Date.now() - t0) / 1e3, reason: "superseded request target" };
     const idn = await served();
     polls += 1;
     if (idn?.id === wanted) {
@@ -546,12 +589,6 @@ async function laneServeHold(wanted, opts = {}) {
     await tick;
   }
 }
-function laneSyncTarget(residentPack, owed) {
-  if (residentPack === void 0) return void 0;
-  const target = packToModelId(residentPack);
-  if (owed !== void 0 && packToModelId(owed) !== target) return void 0;
-  return target;
-}
 function isServedLane(id) {
   return id === CODE_LANE || id === THINK_LANE || id === VERIFY_LANE;
 }
@@ -561,11 +598,11 @@ var statusOf = (m) => {
 };
 async function servedIdentity(timeoutMs = 4e3) {
   try {
-    const r = await fetch(`${ROUTER}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetch(`${process.env.FADE_ORCHESTRATE_ROUTER ?? ROUTER}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return void 0;
     const listing = await r.json();
     const rows = listing?.data ?? [];
-    const hit = rows.find((m) => statusOf(m) === "loaded") ?? rows[0];
+    const hit = rows.find((m) => statusOf(m) === "loaded") ?? rows.find((m) => statusOf(m) === "");
     if (!hit) return void 0;
     const meta = hit.meta;
     return { id: String(hit.id ?? hit.model ?? "?"), n_ctx: typeof meta?.n_ctx === "number" ? meta.n_ctx : void 0 };
@@ -767,8 +804,8 @@ function verifyTrigger(toolName, input, verify = VERIFY_LANE, code = CODE_LANE) 
     const kinds = /* @__PURE__ */ new Set();
     const direct = typeof input?.agent === "string" ? input.agent.split(":")[0] : "";
     if (direct) kinds.add(direct);
-    for (const key of ["items", "list"]) {
-      const rows = input?.[key];
+    for (const key2 of ["items", "list"]) {
+      const rows = input?.[key2];
       if (!Array.isArray(rows)) continue;
       for (const r of rows) {
         if (!r || typeof r !== "object") continue;
@@ -794,9 +831,132 @@ function verifyTrigger(toolName, input, verify = VERIFY_LANE, code = CODE_LANE) 
   return { none: `${name || "tool"} is not a verdict surface` };
 }
 
+// src/lane-session.ts
+var MUTATING_TOOLS = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
+var key = Symbol.for("fade.lane-session.v1");
+var globals = globalThis;
+var sessions = globals[key] ??= /* @__PURE__ */ new Map();
+function createLaneSession(host, options = {}) {
+  const wait = options.wait ?? laneServeHold;
+  const local = { generation: 0, serial: Promise.resolve() };
+  const stateFor = (ctx) => {
+    const id = ctx.sessionManager?.getSessionId?.();
+    if (!id) return local;
+    let state = sessions.get(id);
+    if (!state) {
+      state = { generation: 0, serial: Promise.resolve() };
+      sessions.set(id, state);
+    }
+    return state;
+  };
+  const pin = async (ctx, pack) => {
+    const id = packToModelId(pack);
+    if (!isServedLane(id)) throw new Error(`unconfigured lane ${id}`);
+    const model = ctx.modelRegistry.find(PROVIDER, id);
+    if (!model) throw new Error(`model ${PROVIDER}/${id} is not in the registry`);
+    const state = stateFor(ctx);
+    const generation = ++state.generation;
+    const job = state.serial.catch(() => void 0).then(async () => {
+      if (generation !== state.generation) return false;
+      const switched = await host.setModel(model);
+      if (switched !== true && !(typeof switched === "object" && switched !== null && switched.switched === true))
+        throw new Error(`setModel(${PROVIDER}/${id}) did not switch`);
+      if (generation !== state.generation) return false;
+      host.setThinkingLevel(THINKING[id]);
+      const settings = host.pi?.settings;
+      if (settings) {
+        for (const [role, selector] of Object.entries(settings.getModelRoles())) {
+          if (typeof selector !== "string" || !selector.startsWith(`${PROVIDER}/`)) continue;
+          const current = selector.slice(PROVIDER.length + 1).split(":")[0];
+          if (isServedLane(current)) await settings.setModelRole(role, `${PROVIDER}/${id}`);
+        }
+      }
+      if (host.getActiveTools && host.setActiveTools) {
+        const active = host.getActiveTools();
+        state.phaseTool ??= options.phaseTool;
+        let next;
+        if (isThinkingLane(id)) {
+          state.tools ??= [...active];
+          next = active.filter((t) => MUTATING_TOOLS[t] !== true && t !== state.phaseTool);
+          if (options.phaseTool) next.push(options.phaseTool);
+        } else {
+          next = [.../* @__PURE__ */ new Set([...state.tools ?? [], ...active])].filter((t) => !state.phaseTool || t !== state.phaseTool);
+        }
+        if (next.length !== active.length || next.some((t) => !active.includes(t))) await host.setActiveTools(next);
+        if (id === CODE_LANE) {
+          state.tools = void 0;
+          state.phaseTool = void 0;
+        }
+      }
+      state.target = id;
+      state.failure = void 0;
+      return true;
+    });
+    state.serial = job;
+    try {
+      return await job;
+    } catch (error) {
+      if (generation === state.generation) {
+        state.failure = String(error);
+        ctx.abort?.();
+      }
+      throw error;
+    }
+  };
+  const ready = async (ctx, target, opts = {}) => {
+    let painted = false;
+    try {
+      return await wait(target, { ...opts, progress: (message, percent) => {
+        painted = true;
+        ctx.ui.setWorkingMessage(message);
+        opts.progress?.(message, percent);
+      } });
+    } finally {
+      if (painted) ctx.ui.setWorkingMessage();
+    }
+  };
+  const beforeRequest = async (ctx, event) => {
+    if (ctx.model?.provider !== PROVIDER) return;
+    const payload = event?.payload;
+    const wire = typeof payload?.model === "string" ? packToModelId(payload.model) : ctx.model.id;
+    if (!isServedLane(wire)) return;
+    const state = stateFor(ctx);
+    for (; ; ) {
+      await state.serial.catch(() => void 0);
+      if (ctx.signal?.aborted) return;
+      if (state.failure) {
+        ctx.abort?.();
+        ctx.ui.notify(`lane settings are unavailable: ${state.failure}; request stopped`, "warning");
+        return;
+      }
+      const generation = state.generation;
+      const target = state.target ?? wire;
+      const result = await ready(ctx, target, { isCurrent: () => generation === state.generation && !ctx.signal?.aborted });
+      if (ctx.signal?.aborted) return;
+      if (generation !== state.generation) continue;
+      if (!result.ok) {
+        ctx.abort?.();
+        ctx.ui.notify(`lane ${target} is unavailable: ${result.reason}; request stopped`, "warning");
+        return;
+      }
+      if (payload && target !== wire) return { ...payload, model: target };
+      return;
+    }
+  };
+  return { pin, ready, beforeRequest };
+}
+
+// src/index.ts
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync as mkdirSync3, readFileSync as readFileSync5, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { basename as basename2, dirname as dirname2, join as join10 } from "node:path";
+import { readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { Type } from "typebox";
+
 // src/lane.ts
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
 import { promisify as promisify2 } from "node:util";
 
 // src/subagent.ts
@@ -999,12 +1159,12 @@ function parseProviderBlocks(yml) {
     const dash = /^-\s*([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
     const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(body);
     const bare = /^-\s*(.+)$/.exec(body);
-    const key = dash ? dash[1] : kv ? kv[1] : "";
+    const key2 = dash ? dash[1] : kv ? kv[1] : "";
     const value = strip(dash ? dash[2] ?? "" : kv ? kv[2] ?? "" : bare ? bare[1] : "");
-    const opensProvider = kv && value === "" && key !== "models" && key !== "headers" && key !== "compat" && (entryIndent < 0 || indent <= entryIndent) || dash && key === "id" && value !== "" && (entryIndent < 0 || indent <= entryIndent);
+    const opensProvider = kv && value === "" && key2 !== "models" && key2 !== "headers" && key2 !== "compat" && (entryIndent < 0 || indent <= entryIndent) || dash && key2 === "id" && value !== "" && (entryIndent < 0 || indent <= entryIndent);
     if (opensProvider) {
       entryIndent = indent;
-      current = { id: unquoteKey(dash ? value : key), api: "openai-completions", headers: {}, models: [] };
+      current = { id: unquoteKey(dash ? value : key2), api: "openai-completions", headers: {}, models: [] };
       blocks.push(current);
       sub = void 0;
       continue;
@@ -1027,13 +1187,13 @@ function parseProviderBlocks(yml) {
     if (value === "") {
       const next = lines.slice(i + 1).find((l) => l.trim() !== "" && !/^\s*#/.test(l));
       const nextIndent = next ? next.length - next.trimStart().length : -1;
-      if (nextIndent > indent && (key === "models" || key === "headers")) sub = { name: key, indent };
+      if (nextIndent > indent && (key2 === "models" || key2 === "headers")) sub = { name: key2, indent };
       continue;
     }
-    if (key === "baseUrl") current.baseUrl = value;
-    else if (key === "api") current.api = value;
-    else if (key === "apiKey") current.apiKey = value;
-    else if (key === "authHeader") current.authHeader = value === "true";
+    if (key2 === "baseUrl") current.baseUrl = value;
+    else if (key2 === "api") current.api = value;
+    else if (key2 === "apiKey") current.apiKey = value;
+    else if (key2 === "authHeader") current.authHeader = value === "true";
   }
   return blocks;
 }
@@ -1068,8 +1228,8 @@ function resolveLaneSpec(spec, yml, env) {
   if (block.models.length > 0 && !block.models.includes(model)) {
     return { error: `${spec}: provider ${block.id} advertises ${block.models.slice(0, 6).join(", ")}${block.models.length > 6 ? ", \u2026" : ""}, not ${model}` };
   }
-  const key = block.apiKey ?? "";
-  const isCmd = key.startsWith("!");
+  const key2 = block.apiKey ?? "";
+  const isCmd = key2.startsWith("!");
   return {
     spec: {
       spec,
@@ -1077,8 +1237,8 @@ function resolveLaneSpec(spec, yml, env) {
       model,
       baseUrl: block.baseUrl.replace(/\/$/, ""),
       api: block.api ?? "openai-completions",
-      apiKey: isCmd ? void 0 : key || void 0,
-      apiKeyCommand: isCmd ? key.slice(1).trim() : void 0,
+      apiKey: isCmd ? void 0 : key2 || void 0,
+      apiKeyCommand: isCmd ? key2.slice(1).trim() : void 0,
       authHeader: block.authHeader === true,
       headers: block.headers,
       source: "models.yml"
@@ -1094,8 +1254,8 @@ function substituteEnv(value, env) {
   });
   return missing ? void 0 : out;
 }
-function fieldOf(payload, key) {
-  return key in payload ? Reflect.get(payload, key) : void 0;
+function fieldOf(payload, key2) {
+  return key2 in payload ? Reflect.get(payload, key2) : void 0;
 }
 function advertisedIds(payload) {
   if (!payload || typeof payload !== "object") return [];
@@ -1111,8 +1271,8 @@ function advertisedIds(payload) {
 }
 function answered(status, payload) {
   if (status !== 200 || !payload || typeof payload !== "object") return false;
-  for (const key of ["choices", "content", "output"]) {
-    const v = fieldOf(payload, key);
+  for (const key2 of ["choices", "content", "output"]) {
+    const v = fieldOf(payload, key2);
     if (v !== void 0) return Array.isArray(v) && v.length > 0;
   }
   return true;
@@ -1125,10 +1285,10 @@ async function runKeyCommand(command, runShell, timeoutMs) {
   });
   try {
     const r = await shell(command, timeoutMs);
-    const key = r.out.trim();
+    const key2 = r.out.trim();
     if (r.code !== 0) return { detail: `the lane's key command exited ${r.code}` };
-    if (!key) return { detail: "the lane's key command printed no key" };
-    return { key, detail: "key ok" };
+    if (!key2) return { detail: "the lane's key command printed no key" };
+    return { key: key2, detail: "key ok" };
   } catch (e) {
     return { detail: `the lane's key command failed: ${e instanceof Error ? e.message : String(e)}` };
   }
@@ -1186,7 +1346,7 @@ function readModelsYml(env = process.env) {
   const home = env.HOME;
   if (!home) return null;
   try {
-    return readFileSync(`${home}/.omp/agent/models.yml`, "utf8");
+    return readFileSync2(`${home}/.omp/agent/models.yml`, "utf8");
   } catch {
     return null;
   }
@@ -1353,16 +1513,101 @@ function askLabel(r) {
   return `${r.model} ${r.ok ? `answered ${r.text.length} chars in ${(r.ms / 1e3).toFixed(1)}s` : `REFUSED ${r.cls}`} \xB7 ${r.endpoint || "no endpoint resolved"}`;
 }
 
+// src/recovery.ts
+import { readdir, readFile } from "node:fs/promises";
+import { homedir as homedir2 } from "node:os";
+import { basename, join as join3, resolve } from "node:path";
+async function readFrontierPhase(sessionId, root) {
+  if (!sessionId || basename(sessionId) !== sessionId) return void 0;
+  const override = process.env.OMP_FRONTIER_ROOT?.trim();
+  const directory = join3(root ?? (override ? resolve(override) : join3(homedir2(), ".omp", "frontier")), sessionId);
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    return error.code === "ENOENT" ? "none" : void 0;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const task = JSON.parse(await readFile(join3(directory, entry.name, "task.json"), "utf8"));
+      if (typeof task?.taskId === "string" && typeof task.rounds === "number" && typeof task.phase === "string" && frontierIsActive(task.phase)) return task.phase;
+    } catch {
+    }
+  }
+  return "none";
+}
+function frontierPhase(details) {
+  const frontier = details && typeof details === "object" && "frontier" in details ? details.frontier : void 0;
+  const phase = frontier && typeof frontier === "object" && "phase" in frontier ? frontier.phase : void 0;
+  return typeof phase === "string" ? phase : void 0;
+}
+function frontierPhaseFromHistory(entries) {
+  for (const entry of [...entries].reverse()) {
+    if (!entry || typeof entry !== "object" || !("message" in entry)) continue;
+    const message = entry.message;
+    if (!message || typeof message !== "object" || !("toolName" in message) || message.toolName !== "frontier") continue;
+    const phase = frontierPhase("details" in message ? message.details : void 0);
+    if (phase !== void 0) return phase;
+  }
+  return void 0;
+}
+function frontierIsActive(phase) {
+  return phase !== void 0 && !["none", "done", "denied", "aborted"].includes(phase);
+}
+function queueHandover(options) {
+  let canceled = false;
+  let timer;
+  let reportedError = false;
+  const current = () => !canceled && options.isCurrent();
+  const schedule = () => {
+    if (!current()) return;
+    timer = setTimeout(() => void attempt(), options.delayMs ?? 250);
+    timer.unref();
+  };
+  const attempt = async () => {
+    if (!current()) return;
+    try {
+      if (!options.isIdle()) {
+        schedule();
+        return;
+      }
+      const message = await options.build();
+      if (!current()) return;
+      if (!options.isIdle()) {
+        schedule();
+        return;
+      }
+      options.deliver(message);
+    } catch (error) {
+      if (!current()) return;
+      if (!reportedError) {
+        reportedError = true;
+        options.onError(error);
+      }
+      schedule();
+      return;
+    }
+    canceled = true;
+    options.onDelivered();
+  };
+  schedule();
+  return () => {
+    canceled = true;
+    clearTimeout(timer);
+  };
+}
+
 // src/desk.ts
-import { join as join3 } from "node:path";
+import { join as join5 } from "node:path";
 
 // src/core.ts
 import { execFile as execFile2, execFileSync } from "node:child_process";
 import { promisify as promisify3 } from "node:util";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync as readFileSync2, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
-import { isAbsolute, join as join2 } from "node:path";
+import { closeSync, fsyncSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, renameSync as renameSync2, rmSync as rmSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { mkdir, open, readFile as readFile2, rename, unlink } from "node:fs/promises";
+import { homedir as homedir3, hostname } from "node:os";
+import { isAbsolute, join as join4 } from "node:path";
 var execFileAsync2 = promisify3(execFile2);
 async function execGitAsync(repo, args, opts = {}) {
   const { stdout } = await execFileAsync2("git", ["-C", repo, ...args], {
@@ -1672,6 +1917,34 @@ async function handoverText(run) {
     `Continue from here: the resident lane is ${run.lane}. Report the next phase with fade_phase.`
   ].join("\n");
 }
+function applyLaneDeferral(st, d, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  st.deferred_lane = d.lane;
+  st.deferred_briefing = d.kind;
+  st.deferred_since_utc = at;
+  st.briefing_delivery = d.quiet ? "quiet" : "queued";
+  st.lease_state = "deferred";
+  st.lease_holder = d.holder;
+  if (d.token_hint) st.lease_hint = d.token_hint;
+  st.lease_retry_at_utc = new Date(Date.parse(at) + d.retry_delay_ms).toISOString();
+  st.review_state = reviewStateLabel(st);
+}
+function clearLaneDeferral(st, lane, delivery, at = (/* @__PURE__ */ new Date()).toISOString()) {
+  st.briefing_delivery = delivery;
+  if (delivery === "sent") st.briefing_sent_at_utc = at;
+  if (st.deferred_lane === lane) {
+    st.deferred_lane = void 0;
+    st.deferred_briefing = void 0;
+    st.deferred_since_utc = void 0;
+    st.lease_retry_at_utc = void 0;
+  }
+}
+function reviewStateLabel(st) {
+  if (st.state === "complete") return `accepted (round ${st.round})`;
+  if (st.state === "verifying") return `verdicts open (round ${st.round}${st.verify_batch ? `, batch ${st.verify_batch.batch + 1}` : ""})`;
+  if (st.state === "repair") return `repair owed (round ${st.round})`;
+  if (st.state === "failed") return `FAILED: ${st.reason ?? "no reason recorded"}`;
+  return `${st.state} (round ${st.round})`;
+}
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -1681,13 +1954,13 @@ function parseJson(text) {
 }
 async function readJsonAsync(path) {
   try {
-    return parseJson(await readFile(path, "utf8"));
+    return parseJson(await readFile2(path, "utf8"));
   } catch {
     return void 0;
   }
 }
 async function writeJsonAsync(path, value) {
-  const dir = join2(path, "..");
+  const dir = join4(path, "..");
   await mkdir(dir, { recursive: true });
   const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   const h = await open(tmp, "w");
@@ -1740,18 +2013,18 @@ function coalesceWrite(path, value) {
   return slot.settled;
 }
 function writeJson(path, value) {
-  const dir = join2(path, "..");
-  mkdirSync(dir, { recursive: true });
+  const dir = join4(path, "..");
+  mkdirSync2(dir, { recursive: true });
   const tmp = `${path}.tmp`;
   const fd = openSync(tmp, "w");
   try {
-    writeFileSync(fd, `${JSON.stringify(value, null, 2)}
+    writeFileSync2(fd, `${JSON.stringify(value, null, 2)}
 `);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
-  renameSync(tmp, path);
+  renameSync2(tmp, path);
   try {
     const dfd = openSync(dir, "r");
     try {
@@ -1765,7 +2038,7 @@ function writeJson(path, value) {
 var LOCK_FILENAME = "orchestrator.lock";
 function readInstanceLock(dir) {
   try {
-    const raw = JSON.parse(readFileSync2(join2(dir, LOCK_FILENAME), "utf8"));
+    const raw = JSON.parse(readFileSync3(join4(dir, LOCK_FILENAME), "utf8"));
     return raw && typeof raw === "object" ? raw : void 0;
   } catch {
     return void 0;
@@ -1781,13 +2054,13 @@ function holderAlive(pid) {
   }
 }
 function acquireInstanceLock(dir, info) {
-  mkdirSync(dir, { recursive: true });
-  const path = join2(dir, LOCK_FILENAME);
+  mkdirSync2(dir, { recursive: true });
+  const path = join4(dir, LOCK_FILENAME);
   const claim = () => {
     const lock = { pid: process.pid, run_id: info.run_id, repo: info.repo, started: (/* @__PURE__ */ new Date()).toISOString(), host: hostname() };
     const fd = openSync(path, "wx");
     try {
-      writeFileSync(fd, `${JSON.stringify(lock)}
+      writeFileSync2(fd, `${JSON.stringify(lock)}
 `);
       fsyncSync(fd);
     } finally {
@@ -1806,7 +2079,7 @@ function acquireInstanceLock(dir, info) {
   if (taken()) return { ok: true };
   const holder = readInstanceLock(dir);
   if (holderAlive(holder?.pid)) return { ok: false, holder, stale: false };
-  rmSync(path, { force: true });
+  rmSync2(path, { force: true });
   if (taken()) return { ok: true };
   const rival = readInstanceLock(dir) ?? holder ?? { pid: 0, run_id: "unknown", repo: info.repo, started: (/* @__PURE__ */ new Date()).toISOString(), host: hostname() };
   return { ok: false, holder: rival, stale: true };
@@ -1815,7 +2088,7 @@ function releaseInstanceLock(dir, pid = process.pid) {
   const holder = readInstanceLock(dir);
   if (!holder || holder.pid !== pid) return;
   try {
-    unlinkSync(join2(dir, LOCK_FILENAME));
+    unlinkSync(join4(dir, LOCK_FILENAME));
   } catch (e) {
     if (e.code !== "ENOENT") throw e;
   }
@@ -1823,7 +2096,7 @@ function releaseInstanceLock(dir, pid = process.pid) {
 function instanceLockDir(router = process.env.FADE_ORCHESTRATE_ROUTER ?? "http://127.0.0.1:18014") {
   if (process.env.FADE_ORCHESTRATE_LOCK_DIR) return process.env.FADE_ORCHESTRATE_LOCK_DIR;
   const slug = router.replace(/^[a-z]+:\/\//i, "").replace(/[^a-z0-9]+/gi, "-").replace(/-+$/, "") || "router";
-  return join2(homedir(), ".local", "state", "fade-orchestrator", slug);
+  return join4(homedir3(), ".local", "state", "fade-orchestrator", slug);
 }
 function isRepoRelative(path) {
   if (typeof path !== "string" || path.trim() === "" || isAbsolute(path)) return false;
@@ -1874,9 +2147,9 @@ function validateChecks(raw) {
 var PLAN_ACT_NOTE = "plan act: checks re-declared (the gate proved a check is not a command)";
 function sameTaskPlan(a, b) {
   if (!Array.isArray(b) || a.length !== b.length) return false;
-  const key = (t) => JSON.stringify([t.id, t.objective, [...t.files].sort(), t.acceptance, [...t.dependencies].sort()]);
-  const want = a.map(key).sort();
-  const got = b.map(key).sort();
+  const key2 = (t) => JSON.stringify([t.id, t.objective, [...t.files].sort(), t.acceptance, [...t.dependencies].sort()]);
+  const want = a.map(key2).sort();
+  const got = b.map(key2).sort();
   return want.length === got.length && want.every((k, i) => k === got[i]);
 }
 var MAX_WINDOW_TASKS = 4;
@@ -2087,7 +2360,7 @@ ${r.checks.map(([cmd, expected]) => `      - \`${cmd}\` (expected ${expected})`)
     );
   },
   final: (run) => {
-    const path = join2(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
+    const path = join4(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
     if (run.state === "complete") return `Orchestrated run ${run.run_id} completed: verdict accepted after round ${run.round}. State and phase log: ${path}. Resident lane ${run.lane}; nothing is preloaded.`;
     if (run.state === "failed") return `Orchestrated run ${run.run_id} failed at round ${run.round} in state ${run.state}: ${run.reason ?? "unreported"}. State file: ${path}.`;
     return `Orchestrated run ${run.run_id} stopped at round ${run.round}; resident lane left as ${run.lane}.`;
@@ -2114,7 +2387,7 @@ ${r.checks.map(([cmd, expected]) => `      - \`${cmd}\` (expected ${expected})`)
    * is RED, what git says, and the exact files to open.
    */
   stalled: async (run) => {
-    const path = join2(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
+    const path = join4(run.repo, "var", "omp-orchestrate", STATE_FILENAME);
     const phases = (run.phases ?? []).slice(-3).map((p) => `${p.phase} round ${p.round} accepted=${p.accepted}${p.notes ? ` notes=${p.notes}` : ""}`);
     const failing = (run.gate_last?.results ?? []).filter((r) => !r.ok).map((r) => [`- RED: ${r.cmd}`, `  - expected: ${r.expected}`, `  - observed: ${r.tail}`].join("\n"));
     const rejections = (run.rejection_history ?? []).slice(-5).map((r) => `- round ${r.round} [${r.kind}]${r.task_id ? ` ${r.task_id}:` : ""} ${r.reason}`);
@@ -2139,7 +2412,7 @@ var DESK_SETTLE_MS = Number(process.env.FADE_ORCHESTRATE_DESK_SETTLE_MS ?? 8e3);
 var DESK_DEADLINE_MS = Number(process.env.FADE_ORCHESTRATE_DESK_DEADLINE_MS ?? 12e4);
 var DESK_WAIT_MS = Number(process.env.FADE_ORCHESTRATE_DESK_WAIT_MS ?? 24e4);
 var DESK_POLL_MS = Number(process.env.FADE_ORCHESTRATE_DESK_POLL_MS ?? 1e3);
-var deskPath = (dir) => join3(dir, DESK_DIRNAME, DESK_FILENAME);
+var deskPath = (dir) => join5(dir, DESK_DIRNAME, DESK_FILENAME);
 function emptyDesk(runId, at = (/* @__PURE__ */ new Date()).toISOString()) {
   return {
     schema: DESK_SCHEMA,
@@ -2346,8 +2619,8 @@ async function mutateDesk(dir, runId, fn, tries = 4) {
   return last ?? emptyDesk(runId);
 }
 var sleep = (ms) => {
-  const { promise, resolve: resolve2 } = Promise.withResolvers();
-  setTimeout(resolve2, ms);
+  const { promise, resolve: resolve3 } = Promise.withResolvers();
+  setTimeout(resolve3, ms);
   return promise;
 };
 async function awaitVerdict(dir, runId, id, opts = {}) {
@@ -2425,7 +2698,7 @@ function decodeAnswer(out) {
   return { text: text.trim().replace(/\s+/g, " ").slice(0, 400) };
 }
 async function defaultRunCli(args, cwd, timeoutMs) {
-  const { promise, resolve: resolve2, reject } = Promise.withResolvers();
+  const { promise, resolve: resolve3, reject } = Promise.withResolvers();
   const child = spawn(args[0], args.slice(1), { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
   let out = "";
   const kill = setTimeout(() => {
@@ -2440,7 +2713,7 @@ async function defaultRunCli(args, cwd, timeoutMs) {
   });
   child.on("close", (code) => {
     clearTimeout(kill);
-    resolve2({ code: code ?? 1, out });
+    resolve3({ code: code ?? 1, out });
   });
   return promise;
 }
@@ -2526,8 +2799,8 @@ function orchGlyph() {
 function switchGlyph() {
   return process.env.FADE_ORCHESTRATE_SWITCH_GLYPH ?? "\u{F051F}";
 }
-function chordBytes(key) {
-  const k = key.trim().toLowerCase();
+function chordBytes(key2) {
+  const k = key2.trim().toLowerCase();
   const ctrl = /^ctrl\+([a-z])$/.exec(k);
   if (ctrl) return String.fromCharCode(ctrl[1].charCodeAt(0) - 96);
   const altShift = /^alt\+shift\+([a-z])$/.exec(k);
@@ -2536,8 +2809,8 @@ function chordBytes(key) {
   if (alt) return `\x1B${alt[1]}`;
   return void 0;
 }
-function keyLabel(key) {
-  return key.trim().toLowerCase().split("+").map((part) => part === "ctrl" ? "Ctrl" : part === "alt" ? "Alt" : part === "shift" ? "Shift" : part.toUpperCase()).join("+");
+function keyLabel(key2) {
+  return key2.trim().toLowerCase().split("+").map((part) => part === "ctrl" ? "Ctrl" : part === "alt" ? "Alt" : part === "shift" ? "Shift" : part.toUpperCase()).join("+");
 }
 function modelLabel(name) {
   const paren = name.indexOf("(");
@@ -2638,21 +2911,21 @@ function actCode(run) {
 }
 
 // src/history.ts
-import { join as join4 } from "node:path";
+import { join as join6 } from "node:path";
 import { appendFile, mkdir as mkdir2, open as open2, rename as rename2, stat } from "node:fs/promises";
 var HISTORY_FILENAME = "swap_history.json";
 var METRICS_JSONL_FILENAME = "metrics.jsonl";
 var HOT_STEADY_TPS = 120;
 var MAX_ROWS = 200;
 async function readSwaps(dir) {
-  const rows = await readJsonAsync(join4(dir, HISTORY_FILENAME));
+  const rows = await readJsonAsync(join6(dir, HISTORY_FILENAME));
   return Array.isArray(rows?.rows) ? rows.rows : [];
 }
 async function appendSwap(dir, row) {
   const rows = await readSwaps(dir);
   rows.unshift(row);
   if (rows.length > MAX_ROWS) rows.length = MAX_ROWS;
-  await writeJsonAsync(join4(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
+  await writeJsonAsync(join6(dir, HISTORY_FILENAME), { key: "fade.omp_orchestrate.swaps.v1", rows });
 }
 function rampClass(decodeTps, mapRestored, threshold = HOT_STEADY_TPS) {
   if (mapRestored) return "map_restored";
@@ -2688,7 +2961,7 @@ var ledgerMaxBytes = () => {
 };
 async function appendTurn(dir, rec) {
   await mkdir2(dir, { recursive: true });
-  const path = join4(dir, METRICS_JSONL_FILENAME);
+  const path = join6(dir, METRICS_JSONL_FILENAME);
   const cap = ledgerMaxBytes();
   if (cap > 0) {
     let size = 0;
@@ -2714,7 +2987,7 @@ async function readTurns(dir, n = turnTail()) {
   const limit = Math.max(1, Math.floor(n));
   let fh;
   try {
-    fh = await open2(join4(dir, METRICS_JSONL_FILENAME), "r");
+    fh = await open2(join6(dir, METRICS_JSONL_FILENAME), "r");
   } catch {
     return [];
   }
@@ -2747,7 +3020,7 @@ async function readTurns(dir, n = turnTail()) {
 }
 
 // src/livedata.ts
-import { join as join5 } from "node:path";
+import { join as join7 } from "node:path";
 var METRICS_FILENAME = "metrics_state.json";
 async function fetchJson(url, timeoutMs = 1500) {
   const ac = new AbortController();
@@ -2920,9 +3193,9 @@ function moeCacheRow(requests) {
   const n = Math.min(withHit.length, 8);
   const recent = withHit.slice(0, n);
   const mean = recent.reduce((s, r) => s + (r.hit_rate ?? 0), 0) / recent.length;
-  const share = (key) => {
-    const vals = recent.filter((r) => typeof r[key] === "number").map((r) => r[key]);
-    return vals.length === 0 ? `${key === "ssd_share" ? "ssd" : "pcie"} not reported` : `${key === "ssd_share" ? "ssd" : "pcie"} ${(vals.reduce((s, v) => s + v, 0) / vals.length * 100).toFixed(1)}%`;
+  const share = (key2) => {
+    const vals = recent.filter((r) => typeof r[key2] === "number").map((r) => r[key2]);
+    return vals.length === 0 ? `${key2 === "ssd_share" ? "ssd" : "pcie"} not reported` : `${key2 === "ssd_share" ? "ssd" : "pcie"} ${(vals.reduce((s, v) => s + v, 0) / vals.length * 100).toFixed(1)}%`;
   };
   return {
     label: "prefix cache",
@@ -2935,17 +3208,17 @@ function laneBestRate(s, lane) {
   return rates.length > 0 ? Math.max(...rates) : void 0;
 }
 async function persistMetrics(dir, snap) {
-  await writeJsonAsync(join5(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
+  await writeJsonAsync(join7(dir, METRICS_FILENAME), { key: "fade.omp_orchestrate.metrics.v1", ...snap });
 }
 
 // src/moe.ts
-import { closeSync as closeSync2, openSync as openSync2, readdirSync, readFileSync as readFileSync3, readSync, statSync } from "node:fs";
-import { join as join6, resolve } from "node:path";
+import { closeSync as closeSync2, openSync as openSync2, readdirSync, readFileSync as readFileSync4, readSync, statSync } from "node:fs";
+import { join as join8, resolve as resolve2 } from "node:path";
 var FLASH_NEXT_SAVE_CAPABLE = /flash.?next|qwen/i;
 function readServeConfig(path) {
   if (!path) return void 0;
   try {
-    const raw = JSON.parse(readFileSync3(path, "utf8"));
+    const raw = JSON.parse(readFileSync4(path, "utf8"));
     const models = {};
     for (const m of raw.models ?? []) {
       const alias = String(m.alias ?? m.model ?? "");
@@ -2962,7 +3235,7 @@ function engineProof() {
     for (const pid of readdirSync("/proc").filter((p) => /^\d+$/.test(p))) {
       let cmd;
       try {
-        cmd = readFileSync3(join6("/proc", pid, "cmdline"), "utf8");
+        cmd = readFileSync4(join8("/proc", pid, "cmdline"), "utf8");
       } catch {
         continue;
       }
@@ -2996,10 +3269,10 @@ function engineProofInvalidate() {
 }
 function processStartEpoch(pid) {
   try {
-    const stat4 = readFileSync3(`/proc/${pid}/stat`, "utf8");
+    const stat4 = readFileSync4(`/proc/${pid}/stat`, "utf8");
     const fields = stat4.slice(stat4.lastIndexOf(")") + 2).split(" ");
     const starttime = Number(fields[19]);
-    const uptime = Number(readFileSync3("/proc/uptime", "utf8").split(" ")[0]);
+    const uptime = Number(readFileSync4("/proc/uptime", "utf8").split(" ")[0]);
     if (!Number.isFinite(starttime) || !Number.isFinite(uptime)) return void 0;
     return Math.floor(Date.now() / 1e3 - (uptime - starttime / 100));
   } catch {
@@ -3007,8 +3280,8 @@ function processStartEpoch(pid) {
   }
 }
 var sameFile = (a, b) => {
-  const na = resolve(a);
-  const nb = resolve(b);
+  const na = resolve2(a);
+  const nb = resolve2(b);
   return na === nb || na.replace(/\/+$/, "") === nb.replace(/\/+$/, "");
 };
 function laneMoe(lane, opts = {}) {
@@ -3165,15 +3438,15 @@ var PACK_SECTION_BYTES = 128;
 var packDrafterCache = /* @__PURE__ */ new Map();
 function packDrafter(packPath) {
   if (!packPath) return { kind: "unknown" };
-  let key;
+  let key2;
   try {
     const st = statSync(packPath);
-    key = `${st.mtimeMs}:${st.size}`;
+    key2 = `${st.mtimeMs}:${st.size}`;
   } catch {
     return { kind: "unknown" };
   }
   const hit = packDrafterCache.get(packPath);
-  if (hit && hit.key === key) return hit.drafter;
+  if (hit && hit.key === key2) return hit.drafter;
   let drafter = { kind: "unknown" };
   try {
     const fd = openSync2(packPath, "r");
@@ -3200,7 +3473,7 @@ function packDrafter(packPath) {
   } catch {
     drafter = { kind: "unknown" };
   }
-  packDrafterCache.set(packPath, { key, drafter });
+  packDrafterCache.set(packPath, { key: key2, drafter });
   return drafter;
 }
 var gib = (bytes) => bytes === void 0 ? "?" : `${+(bytes / 2 ** 30).toFixed(2)} GiB`;
@@ -3655,11 +3928,11 @@ function isClose(data) {
   const mok = MODIFY_OTHER_KEYS.exec(data);
   if (mok) {
     const mod = Number(mok[1]);
-    const key = Number(mok[2]);
-    if (key === 99 && mod === 5) return true;
-    if (key === 100 && mod === 5) return true;
-    if (key === 113 && (mod === 1 || mod === 2)) return true;
-    if (key === 102 && mod === 3) return true;
+    const key2 = Number(mok[2]);
+    if (key2 === 99 && mod === 5) return true;
+    if (key2 === 100 && mod === 5) return true;
+    if (key2 === 113 && (mod === 1 || mod === 2)) return true;
+    if (key2 === 102 && mod === 3) return true;
   }
   return false;
 }
@@ -3806,11 +4079,11 @@ async function openPanel(ctx, provider, onAction, headless = process.env.FADE_OR
 }
 
 // src/runs.ts
-import { join as join7 } from "node:path";
-import { readdir, stat as stat2 } from "node:fs/promises";
+import { join as join9 } from "node:path";
+import { readdir as readdir2, stat as stat2 } from "node:fs/promises";
 var RUNS_DIRNAME = "runs";
-var runsDir = (dir) => join7(dir, RUNS_DIRNAME);
-var runArchivePath = (dir, runId) => join7(runsDir(dir), `${runId}.json`);
+var runsDir = (dir) => join9(dir, RUNS_DIRNAME);
+var runArchivePath = (dir, runId) => join9(runsDir(dir), `${runId}.json`);
 async function archiveRun(dir, state) {
   if (TERMINAL[state.state] !== true) return void 0;
   const path = runArchivePath(dir, state.run_id);
@@ -3830,13 +4103,13 @@ async function listRuns(dir) {
   const shelf = runsDir(dir);
   let names;
   try {
-    names = await readdir(shelf);
+    names = await readdir2(shelf);
   } catch {
     return [];
   }
   const summaries = [];
   for (const name of names.filter((n) => n.endsWith(".json"))) {
-    const rec = await readJsonAsync(join7(shelf, name));
+    const rec = await readJsonAsync(join9(shelf, name));
     if (typeof rec?.goal !== "string") continue;
     const tasks = Array.isArray(rec.tasks) ? rec.tasks : [];
     const runId = typeof rec.run_id === "string" ? rec.run_id : name.replace(/\.json$/, "");
@@ -3864,12 +4137,11 @@ var FADE_KEY = process.env.FADE_ORCHESTRATE_KEY ?? "alt+f";
 var FASTPATH_LINES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_LINES ?? 15);
 var FASTPATH_FILES = Number(process.env.FADE_ORCHESTRATE_FASTPATH_FILES ?? 1);
 var SURFACE = process.env.FADE_ORCHESTRATE_SURFACE === "status" ? "status" : "widget";
-var MUTATING_TOOLS = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
 var MAIN_SESSION_DIR = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_/;
 var isDelegatedSession = () => {
   const f = process.env.PI_SESSION_FILE ?? "";
   if (f === "") return false;
-  const parent = basename(dirname(f));
+  const parent = basename2(dirname2(f));
   return MAIN_SESSION_DIR.test(parent) && !f.endsWith(`${parent}.jsonl`);
 };
 var hostAgent = (ctx) => {
@@ -3880,8 +4152,8 @@ var hostAgent = (ctx) => {
   return { kind: typeof rec.kind === "string" ? rec.kind : "", name: typeof rec.name === "string" ? rec.name : "" };
 };
 var isWorkerSession = (ctx) => hostAgent(ctx)?.kind === "sub" || isDelegatedSession();
-var workerName = (ctx) => hostAgent(ctx)?.name || basename(process.env.PI_SESSION_FILE ?? "").replace(/\.jsonl$/, "") || "worker";
-var deskDirFor = (ctx) => join8(ctx.cwd, "var", "omp-orchestrate");
+var workerName = (ctx) => hostAgent(ctx)?.name || basename2(process.env.PI_SESSION_FILE ?? "").replace(/\.jsonl$/, "") || "worker";
+var deskDirFor = (ctx) => join10(ctx.cwd, "var", "omp-orchestrate");
 function fadeOrchestrate(pi) {
   let run;
   let runDir;
@@ -3896,6 +4168,17 @@ function fadeOrchestrate(pi) {
   const LEASE_TTL_S = Number(process.env.FADE_ORCHESTRATE_LEASE_TTL_S ?? 1800);
   let leaseRemainingS = 0;
   let pending;
+  let cancelHandover;
+  let laneControlEnabled = false;
+  let frontierOwnsLane = false;
+  let frontierTaskActive = false;
+  const refreshFrontierOwnership = async (ctx) => {
+    const phase = await readFrontierPhase(ctx.sessionManager?.getSessionId?.()) ?? frontierPhaseFromHistory(ctx.sessionManager?.getBranch?.() ?? []);
+    if (phase !== void 0) {
+      frontierTaskActive = frontierIsActive(phase);
+      frontierOwnsLane = frontierTaskActive;
+    }
+  };
   let deskBatch;
   let deskAnnounced = -1;
   let deskBriefing = false;
@@ -3911,7 +4194,7 @@ function fadeOrchestrate(pi) {
   let turnSeq = 0;
   let turnPhase;
   let turnSwapMs = 0;
-  let verifierTools;
+  const laneSession = createLaneSession(pi, { phaseTool: "fade_phase" });
   let flipBadge;
   let swapPill;
   const refreshMetrics = async () => {
@@ -3950,6 +4233,11 @@ function fadeOrchestrate(pi) {
     flipBadge = next;
   };
   const pillSuffix = () => {
+    if (run?.deferred_lane) {
+      const held = run.lease_holder ?? "held";
+      const retry = run.lease_retry_at_utc ? ` \xB7 retry ${run.lease_retry_at_utc.slice(11, 16)}Z` : "";
+      return `owed ${run.deferred_lane} \xB7 lease ${held}${retry} \xB7 briefing ${run.briefing_delivery ?? "queued"} \xB7 review ${run.review_state ?? "unknown"}`;
+    }
     if (!metrics) return void 0;
     const ch = coldHot(metrics.tok_s, laneBest);
     if (ch.label === "idle" || ch.rate === void 0) return void 0;
@@ -3970,22 +4258,8 @@ function fadeOrchestrate(pi) {
     turnSwapMs = 0;
     if (rec) await appendTurn(runDir, rec);
   };
-  const applyToolPolicy = async (lane) => {
-    const active = pi.getActiveTools();
-    if (isThinkingLane(lane)) {
-      verifierTools = active;
-      const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true && t !== "fade_phase");
-      readOnly.push("fade_phase");
-      const was = new Set(active);
-      if (readOnly.length !== was.size || readOnly.some((t) => !was.has(t))) await pi.setActiveTools(readOnly);
-      return;
-    }
-    if (verifierTools && verifierTools.length > 0) {
-      if (verifierTools.some((t) => !active.includes(t))) await pi.setActiveTools(verifierTools);
-      verifierTools = void 0;
-    }
-  };
   const ensurePhaseTool = async () => {
+    if (!run || TERMINAL[run.state] === true) return false;
     try {
       const active = pi.getActiveTools();
       if (active.includes("fade_phase")) return true;
@@ -3995,7 +4269,7 @@ function fadeOrchestrate(pi) {
       return false;
     }
   };
-  const statePath = () => runDir ? join8(runDir, STATE_FILENAME) : "<unset>";
+  const statePath = () => runDir ? join10(runDir, STATE_FILENAME) : "<unset>";
   let publishedAtUs = 0;
   const syncFromDisk = async () => {
     if (!run || !runDir) return false;
@@ -4052,8 +4326,8 @@ function fadeOrchestrate(pi) {
     if (!tok) return;
     if (!run && !leaseToken) stopMetricsTimer();
     try {
-      const v = await releaseLease(tok, sid);
-      if (!v.ok) process.stderr.write(`orchestrate: verify lease release refused (${v.rule || v.status}); it expires on its TTL
+      const v = await releaseOwnedLease(tok, sid);
+      if (!v.ok) process.stderr.write(`orchestrate: verify lease release refused (${v.rule || v.status}); it expires on its TTL \u2014 a release is admitted for the (caller, session) pair that holds the lease
 `);
     } catch (e) {
       process.stderr.write(`orchestrate: verify lease release failed: ${msg(e)}; it expires on its TTL
@@ -4068,14 +4342,16 @@ function fadeOrchestrate(pi) {
     leaseSession = "";
     if (run) run.lease_state = "released";
     if (!tok) return;
-    void releaseLease(tok, sid).then((v) => {
+    void releaseOwnedLease(tok, sid).then((v) => {
       if (run) run.lease_hint = v.token_hint ?? run.lease_hint;
+      if (!v.ok) process.stderr.write(`orchestrate: lane lease release refused (${v.rule || v.status}); the lane stays claimed to its TTL \u2014 a release is admitted for the (caller, session) pair that holds it
+`);
     }).catch(() => void 0);
   };
-  const acquireLaneLease = async (lane, runId, ctx) => {
-    leaseSession = runId;
+  const acquireLaneLease = async (lane, sessionId, ctx) => {
+    leaseSession = sessionId;
     try {
-      const v = await acquireLease(lane, LEASE_TTL_S, runId);
+      const v = await acquireLease(lane, LEASE_TTL_S, sessionId);
       if (run) {
         run.lease_holder = v.holder;
         run.lease_hint = v.token_hint;
@@ -4083,6 +4359,7 @@ function fadeOrchestrate(pi) {
       if (v.ok && v.token) {
         leaseToken = v.token;
         leaseRemainingS = v.remaining_s ?? v.granted_ttl_s ?? LEASE_TTL_S;
+        writeStoredLease({ token: v.token, pack: lane, session: sessionId, granted_utc: (/* @__PURE__ */ new Date()).toISOString() });
         if (run) {
           run.lease_state = "held";
           run.lease_token = v.token;
@@ -4124,13 +4401,13 @@ function fadeOrchestrate(pi) {
   let liveCache;
   const liveState = async () => {
     if (!runDir) return void 0;
-    const path = join8(runDir, STATE_FILENAME);
+    const path = join10(runDir, STATE_FILENAME);
     try {
       const s = await stat3(path);
-      const key = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
-      if (liveCache && liveCache.key === key) return liveCache.state;
-      const state = parseJson(await readFile2(path, "utf8"));
-      liveCache = { key, state };
+      const key2 = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
+      if (liveCache && liveCache.key === key2) return liveCache.state;
+      const state = parseJson(await readFile3(path, "utf8"));
+      liveCache = { key: key2, state };
       return state;
     } catch {
       liveCache = void 0;
@@ -4226,8 +4503,68 @@ function fadeOrchestrate(pi) {
   });
   let switchGen = 0;
   let switchChain = Promise.resolve();
+  const LEASE_RETRY_MIN_MS = Number(process.env.FADE_ORCHESTRATE_LEASE_RETRY_MIN_MS ?? 15e3);
+  const LEASE_RETRY_MAX_MS = Number(process.env.FADE_ORCHESTRATE_LEASE_RETRY_MAX_MS ?? 6e5);
+  const LEASE_RETRY_MAX_TRIES = Number(process.env.FADE_ORCHESTRATE_LEASE_RETRY_MAX_TRIES ?? 3);
+  const leaseRetryDelayMs = (remainingS) => {
+    const held = (typeof remainingS === "number" && Number.isFinite(remainingS) && remainingS > 0 ? remainingS : 30) * 1e3 + 3e3;
+    return Math.min(Math.max(held, LEASE_RETRY_MIN_MS), LEASE_RETRY_MAX_MS);
+  };
+  let leaseRetryTimer;
+  let leaseRetryTries = 0;
+  let leaseRetryLane = "";
+  let closed = false;
+  const reviewLabel = () => run ? reviewStateLabel(run) : "no run";
+  const briefKindFor = (lane, st) => st.verify_batch && isThinkingLane(lane) ? "verifyBatch" : st.state === "repair" ? "repair" : lane === CODE_LANE && st.gate_last && st.gate_last.passed === false ? "gate" : lane === CODE_LANE ? "code" : "verify";
+  const markBriefing = (delivery, lane) => {
+    leaseRetryTries = 0;
+    leaseRetryLane = "";
+    if (!run) return;
+    clearLaneDeferral(run, lane, delivery);
+    void persist().catch(() => void 0);
+  };
+  const deferLaneMove = (lane, loaded, ctx, quiet, handBack) => {
+    clearTimeout(leaseRetryTimer);
+    leaseRetryTimer = void 0;
+    if (leaseRetryLane !== lane) {
+      leaseRetryLane = lane;
+      leaseRetryTries = 0;
+    }
+    const heldS = loaded.leaseRemainingS;
+    const holder = loaded.leaseHolder ?? "a peer pair";
+    const delayMs = leaseRetryDelayMs(heldS);
+    const exhausted = leaseRetryTries >= LEASE_RETRY_MAX_TRIES;
+    if (run) {
+      applyLaneDeferral(run, { lane, kind: briefKindFor(lane, run), rule: loaded.leaseRule, holder: loaded.leaseHolder, remaining_s: loaded.leaseRemainingS, token_hint: loaded.leaseTokenHint, retry_delay_ms: exhausted ? 0 : delayMs, quiet }, (/* @__PURE__ */ new Date()).toISOString());
+      if (exhausted) run.lease_retry_at_utc = void 0;
+    }
+    void persist().catch(warnWrite(ctx, "defer"));
+    paint(ctx);
+    if (exhausted) {
+      ctx.ui.notify(
+        `fade_orchestrate: ${lane} is STILL owed after ${leaseRetryTries} tries \u2014 the lease is held by ${holder}${heldS !== void 0 ? ` (${heldS}s left)` : ""} and the client stops re-asking. The queue stays: briefing ${run?.briefing_delivery ?? "queued"}, review ${reviewLabel()}, pin ${ctx.model?.id ?? "the served pack"} (held, never 404'd). End the holding run, or re-ask with the panel's v/c keys. (${loaded.detail})`,
+        "warning"
+      );
+      return;
+    }
+    leaseRetryTries += 1;
+    leaseRetryTimer = setTimeout(() => {
+      leaseRetryTimer = void 0;
+      if (closed) return;
+      void requestLane(lane, ctx, quiet, handBack);
+    }, delayMs);
+    ctx.ui.notify(
+      `fade_orchestrate: ${lane} DEFERRED \u2014 lease ${loaded.leaseRule ?? "held"}, held by ${holder}${heldS !== void 0 ? `, ${heldS}s left` : ""}. The pin stays on ${ctx.model?.id ?? "the served pack"}: the completion is HELD through the swap, not 404'd. Briefing: ${quiet ? "quiet hand-back, no page owed" : "QUEUED \u2014 sent the moment the lane lands"}. Review: ${reviewLabel()}. Retry ${leaseRetryTries}/${LEASE_RETRY_MAX_TRIES} in ${Math.round(delayMs / 1e3)}s. (${loaded.detail})`,
+      "warning"
+    );
+  };
   let switchingTo;
   const requestLane = (lane, ctx, quiet = false, handBack = false) => {
+    if (!laneControlEnabled) return;
+    if (frontierOwnsLane) {
+      ctx.ui.notify("orchestrate: Frontier owns this workflow's lane transitions", "info");
+      return;
+    }
     const gen = ++switchGen;
     latestSwitchGen = gen;
     switchChain = switchChain.then(() => gen === switchGen ? runSwitch(lane, ctx, gen, quiet, handBack) : void 0).catch((e) => {
@@ -4379,18 +4716,16 @@ function fadeOrchestrate(pi) {
       watch?.cancel();
       ctx.ui.setWorkingMessage();
       swapPill = void 0;
-      fail(ctx, `loading lane ${lane} failed (${loaded.detail}); briefing not sent`);
+      if (loaded.deferred) {
+        deferLaneMove(lane, loaded, ctx, quiet, handBack);
+        return;
+      }
+      fail(ctx, `loading lane ${lane} failed (${loaded.detail}) \xB7 review: ${reviewLabel()} \xB7 briefing: not sent \xB7 the pin stays on ${ctx.model?.id ?? "the served pack"}`);
       return;
     }
-    const switched = await pi.setModel(model);
+    if (!await laneSession.pin(ctx, lane)) return;
     if (gen !== switchGen) return;
-    if (switched !== true && switched?.switched !== true) {
-      fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
-      return;
-    }
-    pi.setThinkingLevel(THINKING[lane]);
-    await applyToolPolicy(lane);
-    const hold = await laneServeHold(lane, {
+    const hold = await laneSession.ready(ctx, lane, {
       pollMs: LANE_POLL_MS,
       // The daemon's readiness window is the ceiling — the same fuse the start's proof uses,
       // never a client timeout.
@@ -4416,7 +4751,7 @@ function fadeOrchestrate(pi) {
       const fall = hold.served_id !== void 0 && isServedLane(hold.served_id) ? hold.served_id : void 0;
       if (fall) {
         const fm = ctx.modelRegistry.find(PROVIDER, fall);
-        if (fm) await pi.setModel(fm);
+        if (fm) await laneSession.pin(ctx, fall);
       }
       fail(ctx, `lane ${lane} was admitted and pinned, but does not serve: ${hold.reason}${fall ? ` \u2014 the screen follows ${fall}, and ${lane} stays owed` : " \u2014 no briefing sent"}`);
       return;
@@ -4428,7 +4763,10 @@ function fadeOrchestrate(pi) {
     if (gen !== switchGen) return;
     setTimeout(async () => {
       if (gen !== switchGen) return;
-      if (quiet) return;
+      if (quiet) {
+        markBriefing("quiet", lane);
+        return;
+      }
       if (!run) {
         if (isThinkingLane(lane)) {
           pi.sendUserMessage(
@@ -4453,11 +4791,13 @@ function fadeOrchestrate(pi) {
               requests: d.requests.filter((r) => ids.includes(r.id)).map((r) => ({ id: r.id, agent: r.agent, ...r.task_id ? { task_id: r.task_id } : {}, objective: r.objective, ...r.acceptance ? { acceptance: r.acceptance } : {}, checks: r.checks }))
             })
           );
+          markBriefing("sent", lane);
           return;
         }
       }
       const text = await (run.state === "repair" ? briefings.repair(run) : lane === CODE_LANE && run.gate_last && run.gate_last.passed === false ? briefings.gate(run) : lane === CODE_LANE ? briefings.code(run) : briefings.verify(run));
       pi.sendUserMessage(text);
+      markBriefing("sent", lane);
     }, 0);
   };
   const panelProvider = (ctx) => {
@@ -4508,10 +4848,10 @@ function fadeOrchestrate(pi) {
     });
   };
   const packageVersion = async () => {
-    const here = dirname(fileURLToPath(import.meta.url));
-    for (const p of [join8(here, "..", "package.json"), join8(here, "package.json")]) {
+    const here = dirname2(fileURLToPath(import.meta.url));
+    for (const p of [join10(here, "..", "package.json"), join10(here, "package.json")]) {
       try {
-        const raw = JSON.parse(await readFile2(p, "utf8"));
+        const raw = JSON.parse(await readFile3(p, "utf8"));
         if (raw && typeof raw === "object" && "version" in raw && typeof raw.version === "string" && raw.version !== "") return raw.version;
       } catch {
       }
@@ -4519,10 +4859,10 @@ function fadeOrchestrate(pi) {
     return void 0;
   };
   const bundleHash = async () => {
-    const here = dirname(fileURLToPath(import.meta.url));
-    for (const p of [join8(here, "index.js"), join8(here, "..", "dist", "index.js")]) {
+    const here = dirname2(fileURLToPath(import.meta.url));
+    for (const p of [join10(here, "index.js"), join10(here, "..", "dist", "index.js")]) {
       try {
-        return createHash("sha256").update(await readFile2(p)).digest("hex");
+        return createHash("sha256").update(await readFile3(p)).digest("hex");
       } catch {
       }
     }
@@ -4536,6 +4876,10 @@ function fadeOrchestrate(pi) {
   };
   const actOnPanel = (ctx, a) => {
     if (!run) return;
+    if (!laneControlEnabled) {
+      ctx.ui.notify("orchestrate: saved run is inactive; /orchestrate resume enables workflow controls", "info");
+      return;
+    }
     const dir = a.key === "s" ? actSkip(run, a.taskId) : a.key === "v" ? actVerify(run) : a.key === "r" ? actReset(run) : a.key === "p" ? actPause(run) : a.key === "c" ? actCode(run) : a.key === "h" ? actHalt(run) : void 0;
     if (!dir) return;
     void persist().catch(warnWrite(ctx, "panel key"));
@@ -4567,10 +4911,10 @@ function fadeOrchestrate(pi) {
   } catch {
     conflictProbe = void 0;
   }
-  const hostConflict = (key) => {
+  const hostConflict = (key2) => {
     if (typeof conflictProbe !== "function") return void 0;
     try {
-      const answer = conflictProbe.call(pi, key);
+      const answer = conflictProbe.call(pi, key2);
       probeHasAnswered = true;
       return answer;
     } catch {
@@ -4726,8 +5070,8 @@ function fadeOrchestrate(pi) {
           coding_done: /* @__PURE__ */ new Set(["done"]),
           verification_done: /* @__PURE__ */ new Set(["verdict", "checks", "notes", "tasks", "verdicts"])
         };
-        for (const key of Object.keys(payload)) {
-          if (!allowedKeys[params.phase].has(key)) throw new Error(`fade_phase: ${params.phase} does not take key "${key}"`);
+        for (const key2 of Object.keys(payload)) {
+          if (!allowedKeys[params.phase].has(key2)) throw new Error(`fade_phase: ${params.phase} does not take key "${key2}"`);
         }
         if (params.phase === "planning_done") {
           const tasks = validateTasks(payload.tasks);
@@ -4895,8 +5239,8 @@ ${SCHEMA_HINT}` : text);
       const objective = String(params.objective ?? "").trim();
       if (objective === "") throw new Error('fade_verify: "objective" is the thing to judge \u2014 name it in one sentence');
       const dir = deskDirFor(ctx);
-      const state = await readJsonAsync(join8(dir, STATE_FILENAME));
-      const active = await readJsonAsync(join8(dir, ACTIVE_FILENAME));
+      const state = await readJsonAsync(join10(dir, STATE_FILENAME));
+      const active = await readJsonAsync(join10(dir, ACTIVE_FILENAME));
       const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
       if (!runId) throw new Error(`fade_verify: ${dir} carries no orchestrated run (no state.json), so there is no desk to register against \u2014 nothing was written`);
       const rows = Array.isArray(params.checks) ? params.checks : [];
@@ -4947,8 +5291,8 @@ ${SCHEMA_HINT}` : text);
     loadMode: "essential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const dir = deskDirFor(ctx);
-      const state = await readJsonAsync(join8(dir, STATE_FILENAME));
-      const active = await readJsonAsync(join8(dir, ACTIVE_FILENAME));
+      const state = await readJsonAsync(join10(dir, STATE_FILENAME));
+      const active = await readJsonAsync(join10(dir, ACTIVE_FILENAME));
       const runId = typeof state?.run_id === "string" ? state.run_id : typeof active?.run_id === "string" ? active.run_id : void 0;
       if (!runId) throw new Error(`fade_verdicts: ${dir} carries no orchestrated run, so there is no desk to answer`);
       const label2 = Number(params.batch);
@@ -5003,6 +5347,10 @@ ${SCHEMA_HINT}` : text);
         ctx.ui.notify(`lane: ${line}`, "info");
         return;
       }
+      if (!laneControlEnabled) {
+        ctx.ui.notify("lane: model switching is disabled; start /orchestrate to enable lane control", "info");
+        return;
+      }
       ctx.ui.notify(`lane: moving :18014 to ${target} (teardown, spawn, readiness) \u2026`, "info");
       await returnVerifyLease();
       const mv = await moveLane(target, { sessionId: `omp-pid-${process.pid}` });
@@ -5010,9 +5358,9 @@ ${SCHEMA_HINT}` : text);
       ctx.ui.notify(`lane ${target}: ${mv.detail}`, mv.ok ? "info" : "warning");
     }
   });
-  const registerChord = (key, description) => {
+  const registerChord = (key2, description) => {
     try {
-      pi.registerShortcut(key, {
+      pi.registerShortcut(key2, {
         description,
         handler: async (ctx) => {
           await openPanelGuarded(ctx);
@@ -5060,20 +5408,20 @@ ${SCHEMA_HINT}` : text);
       return;
     }
     if (first === "runs") {
-      const dir = runDir ?? join8(ctx.cwd, "var", "omp-orchestrate");
+      const dir = runDir ?? join10(ctx.cwd, "var", "omp-orchestrate");
       const archived = await listRuns(dir);
       if (archived.length === 0) {
-        ctx.ui.notify(`orchestrate: no archived runs in ${join8(dir, RUNS_DIRNAME)}`, "info");
+        ctx.ui.notify(`orchestrate: no archived runs in ${join10(dir, RUNS_DIRNAME)}`, "info");
         return;
       }
       for (const r of archived.slice(0, 5)) {
         ctx.ui.notify(`run ${r.run_id}: ${r.state} \xB7 ${r.rounds} rounds \xB7 ${r.tasks_passed}/${r.tasks_total} tasks \xB7 ${r.goal.replace(/\s+/g, " ").slice(0, 60)}`, "info");
       }
-      if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join8(dir, RUNS_DIRNAME)}`, "info");
+      if (archived.length > 5) ctx.ui.notify(`orchestrate: ${archived.length - 5} more archived runs in ${join10(dir, RUNS_DIRNAME)}`, "info");
       return;
     }
     if (first === "moe") {
-      const dir = runDir ?? join8(ctx.cwd, "var", "omp-orchestrate");
+      const dir = runDir ?? join10(ctx.cwd, "var", "omp-orchestrate");
       for (const c of classWarmth(await readSwaps(dir))) {
         ctx.ui.notify(`orchestrate: ${c.cls}: ${c.swaps} swaps \xB7 ${c.warm}/${c.swaps} warm \xB7 profile ${c.profile ?? "none named"}`, "info");
       }
@@ -5089,8 +5437,8 @@ ${SCHEMA_HINT}` : text);
       return;
     }
     if (first === "desk") {
-      const dir = runDir ?? join8(ctx.cwd, "var", "omp-orchestrate");
-      const st = run ?? await readJsonAsync(join8(dir, STATE_FILENAME));
+      const dir = runDir ?? join10(ctx.cwd, "var", "omp-orchestrate");
+      const st = run ?? await readJsonAsync(join10(dir, STATE_FILENAME));
       if (!st) {
         ctx.ui.notify(`orchestrate: no run in ${dir}, so there is no desk`, "info");
         return;
@@ -5141,17 +5489,17 @@ ${SCHEMA_HINT}` : text);
     }
     if (first === "verifier") {
       const sub = (raw.split(/\s+/)[1] ?? "show").toLowerCase();
-      const abs = join8(ctx.cwd, verifierAgentPath(ctx.cwd));
-      const absWorker = join8(ctx.cwd, workerAgentPath(ctx.cwd));
+      const abs = join10(ctx.cwd, verifierAgentPath(ctx.cwd));
+      const absWorker = join10(ctx.cwd, workerAgentPath(ctx.cwd));
       if (sub === "install") {
         if (isRouterModel(VERIFIER_MODEL)) {
           ctx.ui.notify(`orchestrate: verifier install REFUSED: ${VERIFIER_MODEL} is a basalt ROUTER entry \u2014 the advisor is pinned OFF the router. Point FADE_ORCHESTRATE_VERIFIER_MODEL at a non-router model (e.g. ninfer-local/coder-gpu1) and re-run.`, "error");
           return;
         }
         try {
-          mkdirSync2(join8(ctx.cwd, ".omp", "agents"), { recursive: true });
-          writeFileSync2(abs, verifierAgentMd());
-          writeFileSync2(absWorker, workerAgentMd());
+          mkdirSync3(join10(ctx.cwd, ".omp", "agents"), { recursive: true });
+          writeFileSync3(abs, verifierAgentMd());
+          writeFileSync3(absWorker, workerAgentMd());
         } catch (e) {
           ctx.ui.notify(`orchestrate: verifier install FAILED at ${abs}: ${e instanceof Error ? e.message : String(e)}`, "error");
           return;
@@ -5163,13 +5511,39 @@ ${SCHEMA_HINT}` : text);
       const installedWorker = existsSync(absWorker);
       ctx.ui.notify(`orchestrate: verifier agent ${VERIFIER_AGENT} \xB7 model ${VERIFIER_MODEL} \xB7 ${abs} ${installed ? "installed" : "NOT installed (/orchestrate verifier install)"}`, installed ? "info" : "warning");
       ctx.ui.notify(`orchestrate: worker agent ${WORKER_AGENT} \xB7 inherits the code lane \xB7 ${absWorker} ${installedWorker ? "installed" : "NOT installed (/orchestrate verifier install)"} \u2014 a worker on an agent whose tools lack fade_verify CANNOT register, so the census waits for a worker that can never arrive`, installedWorker ? "info" : "warning");
-      if (installed) ctx.ui.notify(`orchestrate: ${readFileSync4(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
+      if (installed) ctx.ui.notify(`orchestrate: ${readFileSync5(abs, "utf8").split("\n").slice(0, 6).join("\n")}`, "info");
       const probe = await probeVerifierLane();
       ctx.ui.notify(`orchestrate: verifier lane ${VERIFIER_MODEL} claim-time probe: ${probeLabel(probe)}`, probe.ok ? "info" : "error");
       return;
     }
     if (first === "overlay") {
       await openPanelGuarded(ctx);
+      return;
+    }
+    if (first === "resume") {
+      await refreshFrontierOwnership(ctx);
+      if (frontierTaskActive) {
+        ctx.ui.notify("orchestrate: finish or abort the active Frontier task before resuming this run", "warning");
+        return;
+      }
+      if (!run || TERMINAL[run.state] === true) {
+        ctx.ui.notify("orchestrate: no unfinished run to resume", "info");
+        return;
+      }
+      laneControlEnabled = true;
+      run.paused = false;
+      await persist();
+      const resumed = run;
+      cancelHandover?.();
+      cancelHandover = queueHandover({
+        isCurrent: () => laneControlEnabled && run === resumed && !run.paused && TERMINAL[run.state] !== true && !frontierOwnsLane,
+        isIdle: () => ctx.isIdle() && (typeof ctx.hasPendingMessages !== "function" || !ctx.hasPendingMessages()),
+        build: () => handoverText(resumed),
+        deliver: (message) => pi.sendUserMessage(message),
+        onDelivered: () => ctx.ui.notify(`orchestrate: condensed handover sent for ${resumed.run_id}`, "info"),
+        onError: (error) => ctx.ui.notify(`orchestrate: handover pending; retrying after ${msg(error)}`, "warning")
+      });
+      ctx.ui.notify(`orchestrate: run ${run.run_id} resume queued until idle`, "info");
       return;
     }
     if (first === "handover") {
@@ -5216,6 +5590,7 @@ ${SCHEMA_HINT}` : text);
         return;
       }
       const dir = first === "skip" ? actSkip(run, raw.split(/\s+/)[1]) : first === "verify" ? actVerify(run) : first === "reset" ? actReset(run) : first === "pause" ? actPause(run, raw.split(/\s+/).slice(1).join(" ") || void 0) : first === "halt" ? actHalt(run) : actCode(run);
+      if (first === "verify" || first === "code" || first === "reset") laneControlEnabled = true;
       await persist();
       paint(ctx);
       ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
@@ -5241,10 +5616,12 @@ ${SCHEMA_HINT}` : text);
       pending = void 0;
       const handBack = run.lane !== CODE_LANE;
       if (handBack) requestLane(CODE_LANE, ctx, true, true);
+      laneControlEnabled = false;
+      cancelHandover?.();
       ctx.ui.notify(`orchestrate: stopped; ${handBack ? `handing the lane back to ${CODE_LANE}` : `resident lane left as ${run.lane}`}; state ${statePath()}`, "info");
       if (raw.includes("--clear")) {
         try {
-          unlinkSync2(join8(runDir, ACTIVE_FILENAME));
+          unlinkSync2(join10(runDir, ACTIVE_FILENAME));
         } catch {
         }
         run = void 0;
@@ -5257,6 +5634,11 @@ ${SCHEMA_HINT}` : text);
     }
     if (run && TERMINAL[run.state] !== true) {
       ctx.ui.notify(`orchestrate: run ${run.run_id} is still ${run.state}; /orchestrate stop first`, "warning");
+      return;
+    }
+    await refreshFrontierOwnership(ctx);
+    if (frontierTaskActive) {
+      ctx.ui.notify("orchestrate: finish or abort the active Frontier task before starting an orchestrated run", "warning");
       return;
     }
     let rounds = DEFAULT_ROUNDS;
@@ -5286,16 +5668,19 @@ ${SCHEMA_HINT}` : text);
       return;
     }
     lockDir = claimDir;
+    laneControlEnabled = true;
+    frontierOwnsLane = false;
+    cancelHandover?.();
     if (!await isGitRepo(repo)) ctx.ui.notify(`orchestrate: ${await gitCaveat(repo)}`, "warning");
     ctx.ui.setWorkingMessage(`fade_orchestrate: loading ${THINK_LANE} on the router\u2026`);
     await returnVerifyLease();
-    const lease = await acquireLaneLease(THINK_LANE, runId, ctx);
+    const lease = await acquireLaneLease(THINK_LANE, SELF_SESSION, ctx);
     if (!lease.ok) {
       releaseLock();
       ctx.ui.notify(`orchestrate: the :18014 lane lease is held \u2014 ${lease.line}. End the holding run there, then start here. Nothing was written.`, "error");
       return;
     }
-    const loaded = await loadLane(THINK_LANE, { leaseToken, sessionId: runId });
+    const loaded = await loadLane(THINK_LANE, { leaseToken, sessionId: SELF_SESSION });
     if (!loaded.ok) {
       releaseLock();
       releaseLaneLease();
@@ -5304,9 +5689,9 @@ ${SCHEMA_HINT}` : text);
     }
     let burstLive = false;
     const previous = run;
-    runDir = join8(repo, "var", "omp-orchestrate");
+    runDir = join10(repo, "var", "omp-orchestrate");
     if (previous && TERMINAL[previous.state] === true) {
-      const archived = await archiveRun(join8(previous.repo || repo, "var", "omp-orchestrate"), previous);
+      const archived = await archiveRun(join10(previous.repo || repo, "var", "omp-orchestrate"), previous);
       if (archived) ctx.ui.notify(`orchestrate: the finished run ${previous.run_id} is archived at ${archived}`, "info");
     }
     run = {
@@ -5328,19 +5713,14 @@ ${SCHEMA_HINT}` : text);
     };
     burstLive = true;
     settledNotified = false;
-    await writeJsonAsync(join8(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
+    await writeJsonAsync(join10(runDir, ACTIVE_FILENAME), { run_id: runId, repo, goal, started_utc: run.started_utc, max_rounds: rounds });
     await persist();
     const model = ctx.modelRegistry.find(PROVIDER, THINK_LANE);
     if (!model) {
       fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
       return;
     }
-    const switched = await pi.setModel(model);
-    if (switched !== true && switched?.switched !== true) {
-      fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
-      return;
-    }
-    pi.setThinkingLevel(THINKING[THINK_LANE]);
+    if (!await laneSession.pin(ctx, THINK_LANE)) return;
     paint(ctx);
     startMetricsTimer();
     await ensurePhaseTool();
@@ -5351,94 +5731,72 @@ ${SCHEMA_HINT}` : text);
     handler: orchestrateCommand
   });
   pi.registerCommand("plan", {
-    description: `/plan [--rounds N] <goal> \u2014 load ${THINK_LANE} (DS4) and plan: DS4 stays resident for the whole planning turn; the only hand-back is the \`planning_done\` phase act`,
-    handler: orchestrateCommand
+    description: "/plan <goal> \u2014 plan on the selected model. /orchestrate starts the model-switching workflow.",
+    handler: async (args, ctx) => {
+      const goal = args.trim();
+      if (!goal) {
+        ctx.ui.notify("usage: /plan <goal>", "info");
+        return;
+      }
+      pi.sendUserMessage(`Create a plan for the following request.
+
+${goal}`);
+    }
   });
   pi.on("session_start", async (_event, ctx) => {
+    laneControlEnabled = false;
+    switchGen++;
+    cancelHandover?.();
+    cancelHandover = void 0;
     if (isDelegatedSession()) return;
     await ensurePhaseTool();
-    if (RAW_DELIVERABLE && !inputUnsub) {
+    await refreshFrontierOwnership(ctx);
+    if (RAW_DELIVERABLE && !inputUnsub && run) {
       inputUnsub = ctx.ui.onTerminalInput((data) => {
         if (data !== CHORD || panelOpen) return void 0;
         void openPanelGuarded(ctx);
         return { consume: true };
       });
     }
-    const chordNote = resolveChord();
+    const chordNote = run ? resolveChord() : void 0;
     const repo = ctx.cwd;
-    const active = await readJsonAsync(join8(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
-    const state = await readJsonAsync(join8(repo, "var", "omp-orchestrate", STATE_FILENAME));
+    const active = await readJsonAsync(join10(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
+    const state = await readJsonAsync(join10(repo, "var", "omp-orchestrate", STATE_FILENAME));
     let runNote;
-    if (active && state) {
-      runDir = join8(repo, "var", "omp-orchestrate");
+    if (active?.run_id && state && active.run_id === state.run_id && state.repo === repo) {
+      runDir = join10(repo, "var", "omp-orchestrate");
       run = normalizeRun(state);
       settledNotified = false;
       paint(ctx);
       startMetricsTimer();
       if (TERMINAL[state.state] === true) {
         runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
-      } else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-        setTimeout(async () => {
-          const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-          if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
-        }, 250);
-        runNote = `run ${state.run_id} is ${state.state} \u2014 condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
       } else {
-        runNote = `run ${state.run_id} is ${state.state} \u2014 /orchestrate handover sends the condensed state`;
+        runNote = `run ${state.run_id} is ${state.state} \u2014 model switching disabled; /orchestrate resume continues it`;
       }
     }
     const line = [chordNote, ...ENV_NOTICES.map((n) => `lanes: ${n}`), runNote].filter((n) => n !== void 0).join(" \xB7 ");
-    if (line !== "") {
+    if (run && line !== "") {
       const at = setTimeout(() => ctx.ui.notify(`orchestrate: ${line}`, "info"), 500);
       at.unref?.();
     }
   });
   pi.on("agent_start", async (_event, ctx) => {
-    if (!await ensurePhaseTool()) setTimeout(() => void ensurePhaseTool(), 500);
-    paint(ctx);
-    void refreshMetrics().then(() => paint(ctx));
+    if (run && TERMINAL[run.state] !== true) {
+      if (!await ensurePhaseTool()) setTimeout(() => void ensurePhaseTool(), 500);
+      paint(ctx);
+      void refreshMetrics().then(() => paint(ctx));
+    } else {
+      paint(ctx);
+    }
   });
-  const syncLanePin = async (ctx) => {
-    if (isDelegatedSession()) return;
-    const res = await getResidency(leaseSession || verifyLeaseSession || SELF_SESSION);
-    if (!res || res.state !== "RESIDENT" || !res.pack) return;
-    const owed = run ? pending?.lane ?? switchingTo ?? run.lane : switchingTo ?? pendingVerifyLane;
-    const target = laneSyncTarget(res.pack, owed);
-    if (target === void 0) {
-      ctx.ui.notify(`lane sync: ${res.pack} is resident while this work owes ${owed} \u2014 the pin stays (the swap is draining)`, "info");
-      return;
-    }
-    if (ctx.model?.provider !== PROVIDER || ctx.model.id === target) return;
-    const model = ctx.modelRegistry.find(PROVIDER, target);
-    if (!model) return;
-    const switched = await pi.setModel(model);
-    if (switched === true || typeof switched === "object" && switched !== null && switched.switched === true)
-      ctx.ui.notify(`lane sync: ${PROVIDER}/${target} (${res.pack}) is resident \u2014 this screen follows`, "info");
-  };
-  const holdForServedPin = async (ctx) => {
-    if (isDelegatedSession()) return;
-    if (ctx.model?.provider !== PROVIDER) return;
-    const pinned = ctx.model.id;
-    if (!isServedLane(pinned)) return;
-    const served = await servedIdentity();
-    if (served?.id === pinned) return;
-    ctx.ui.setWorkingMessage(`fade_orchestrate: ${pinned} is not serving yet (the lane answers ${served?.id ?? "nothing"}) \u2014 this request waits, it does not time out`);
-    const hold = await laneServeHold(pinned, { pollMs: LANE_POLL_MS, progress: (m) => ctx.ui.setWorkingMessage(m) });
-    ctx.ui.setWorkingMessage();
-    if (hold.ok) return;
-    const fall = hold.served_id !== void 0 && isServedLane(hold.served_id) ? hold.served_id : void 0;
-    ctx.ui.notify(`orchestrate: ${pinned} is not serving \u2014 ${hold.reason}; the lane answers ${hold.served_id ?? "nothing"}${fall ? ` \u2014 this turn runs on ${fall}, the owed pack stays owed` : " \u2014 nothing was posted"}`, hold.failed ? "error" : "warning");
-    if (fall) {
-      const fm = ctx.modelRegistry.find(PROVIDER, fall);
-      if (fm) await pi.setModel(fm);
-    }
-  };
-  pi.on("before_agent_start", async (_event, ctx) => {
-    await syncLanePin(ctx);
-    await holdForServedPin(ctx);
+  pi.on("before_provider_request", async (event, ctx) => {
+    return await laneSession.beforeRequest(ctx, event);
   });
   pi.on("agent_end", async (_event, ctx) => {
     if (isDelegatedSession()) return;
+    if (!laneControlEnabled) return;
+    if (frontierOwnsLane) return;
     if (!run) {
       if (!isDelegatedSession() && pendingVerifyLane) {
         const want = pendingVerifyLane;
@@ -5463,6 +5821,7 @@ ${SCHEMA_HINT}` : text);
         }
         void recordTurn(run.state);
         if (run.lane !== CODE_LANE) requestLane(CODE_LANE, ctx, true, true);
+        laneControlEnabled = false;
         return;
       }
       if (run.paused === true) {
@@ -5546,8 +5905,8 @@ ${SCHEMA_HINT}`);
   });
   let pendingVerifyLane;
   const traceTrigger = (phase, lane, tool, context) => {
-    const dir = join8(process.env.HOME ?? "/tmp", "var", "fade-orchestrate");
-    void writeJsonAsync(join8(dir, "lane-trigger.json"), {
+    const dir = join10(process.env.HOME ?? "/tmp", "var", "fade-orchestrate");
+    void writeJsonAsync(join10(dir, "lane-trigger.json"), {
       at: (/* @__PURE__ */ new Date()).toISOString(),
       phase,
       lane,
@@ -5557,7 +5916,21 @@ ${SCHEMA_HINT}`);
     }).catch(() => void 0);
   };
   pi.on("tool_call", async (event, ctx) => {
-    if (!isDelegatedSession()) {
+    if (!isDelegatedSession() && event.toolName === "frontier") {
+      if (run && TERMINAL[run.state] !== true && event.input?.op !== "status") {
+        return { block: true, reason: "fade_orchestrate: this run owns the workflow. Use fade_phase, or stop the run before starting a Frontier task." };
+      }
+      if (!run || TERMINAL[run.state] === true) {
+        frontierOwnsLane = true;
+        if (event.input?.op === "intake") frontierTaskActive = true;
+        switchGen++;
+        pendingVerifyLane = void 0;
+        cancelHandover?.();
+        await returnVerifyLease();
+      }
+      return void 0;
+    }
+    if (laneControlEnabled && !isDelegatedSession() && !frontierOwnsLane) {
       const trig = verifyTrigger(event.toolName, event.input);
       const trigLane = "lane" in trig ? trig.lane : void 0;
       if (trigLane) pendingVerifyLane = trigLane;
@@ -5586,6 +5959,14 @@ ${SCHEMA_HINT}`);
     return { block: true, reason: `fade_orchestrate: the verifier lane is read-only \u2014 ${name} is refused. Report the finding with fade_phase; the coder lane applies it.` };
   });
   pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === "frontier" && frontierOwnsLane && !isDelegatedSession()) {
+      const phase = frontierPhase(event.details);
+      if (phase !== void 0) {
+        frontierTaskActive = frontierIsActive(phase);
+        if (phase === "none") frontierOwnsLane = false;
+      }
+      return void 0;
+    }
     if (event.toolName !== "task" || !run || !runDir || isDelegatedSession()) return void 0;
     const desk = await readDesk(runDir, run.run_id);
     if (!desk || openRequests(desk).length === 0) return void 0;
@@ -5596,6 +5977,12 @@ ${SCHEMA_HINT}`);
     return void 0;
   });
   pi.on("session_shutdown", async (_event, ctx) => {
+    closed = true;
+    if (leaseRetryTimer) {
+      clearTimeout(leaseRetryTimer);
+      leaseRetryTimer = void 0;
+    }
+    cancelHandover?.();
     clearSurface(ctx);
     stopMetricsTimer();
     await returnVerifyLease();

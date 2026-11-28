@@ -7,7 +7,7 @@
  * `fade_phase`, and the tool validates, records the phase and ends the turn. `agent_end` is the
  * only load site, and the pin and the prompt go out WITH the load: `loadLane`, then
  * `setModel` + `setThinkingLevel` + the tool policy + the phase briefing, in one generation. What
- * waits is the COMPLETION, not the pin: `before_agent_start` — the last hook before the host
+ * waits is the COMPLETION, not the pin: `before_provider_request` — the last hook before the host
  * posts — holds the turn until the lane serves the pin, the way Basalt's router holds a client
  * through a swap. A superseded generation cancels its own pin and briefing and never touches the
  * router. The host defers model switches while streaming, and a load issued into a turn's queued
@@ -22,6 +22,7 @@
  *                                      (keys s/v/r/p/c/h act on the selected task; esc/q/Ctrl+C/the chord close)
  *   /lanes                             live router census: all three lane entries + health
  */
+import { createLaneSession, MUTATING_TOOLS } from "./lane-session.ts";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -29,9 +30,10 @@ import { basename, dirname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, ENV_NOTICES, FLIP_WINDOW_MS, LANE_POLL_MS, PROVIDER, ROUTER, START_PROOF_WAIT_MS, THINK_LANE, THINKING, VERIFY_LANE, flipBreaker, flipGuarded, flipState, isServedLane, isThinkingLane, laneServeHold, laneSyncTarget, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type LaneLoad, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
+import { gateLaneIdle, supervisorResident, IdleGateResult, CODE_LANE, ENV_NOTICES, FLIP_WINDOW_MS, LANE_POLL_MS, PROVIDER, ROUTER, START_PROOF_WAIT_MS, THINK_LANE, VERIFY_LANE, flipBreaker, flipGuarded, flipState, isServedLane, isThinkingLane, listLanes, loadLane, msg, observeSwaps, resetFlipLedger, routerBusy, type LaneLoad, type RouterBusy, residentLane, switchPlan, moveLane, servedIdentity, verifyTrigger } from "./router.ts";
 import { acquireLease, leaseLine, getResidency, packToModelId, releaseLease, releaseOwnedLease, renewLease, RULE_LEASE_NOT_HOLDER, RULE_LEASE_STALE_TOKEN, shouldRenew, writeStoredLease } from "./supervisor.ts";
 import { THINK_MODEL, askLabel, askLane } from "./thinklane.ts";
+import { frontierIsActive, frontierPhase, frontierPhaseFromHistory, queueHandover, readFrontierPhase } from "./recovery.ts";
 /** The churn ledger's clear, on the extension's own module surface. Production reaches it through the
  *  `/orchestrate lanes reset` verb, which also HALTS the loop and lands the owed lane — the right act
  *  for an operator, the wrong instrument for a test that must measure a count starting at zero. The
@@ -151,7 +153,7 @@ const SURFACE = process.env.FADE_ORCHESTRATE_SURFACE === "status" ? "status" : "
 // tool this file has never seen cannot slip a write past it. Delegation is NOT on the list:
 // `task` writes nothing itself, and the sessions it spawns are inert by `isDelegatedSession` —
 // blocking it here only blocks the coding session that owns the run.
-const MUTATING_TOOLS: Record<string, true> = { edit: true, write: true, apply_patch: true, multiedit: true, multi_edit: true, notebook_edit: true };
+
 
 /**
  * Delegated (subagent) session detector. A subagent loads this extension in the SAME cwd, so an
@@ -229,6 +231,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  dies, never later. */
 	let leaseRemainingS = 0;
 	let pending: { lane: string; phase: string } | undefined;
+	let cancelHandover: (() => void) | undefined;
+	let laneControlEnabled = false;
+	let frontierOwnsLane = false;
+	let frontierTaskActive = false;
+	const refreshFrontierOwnership = async (ctx: ExtensionContext): Promise<void> => {
+		const phase = await readFrontierPhase(ctx.sessionManager?.getSessionId?.())
+			?? frontierPhaseFromHistory(ctx.sessionManager?.getBranch?.() ?? []);
+		if (phase !== undefined) {
+			frontierTaskActive = frontierIsActive(phase);
+			frontierOwnsLane = frontierTaskActive;
+		}
+	};
 	/** The desk batch this session CLAIMED and is answering. The claim is the one-use ticket: it is
 	 *  what makes `fade_verdicts` legal for those ids, and what stops the same batch being answered
 	 *  a second time. `undefined` when no batch is in flight. */
@@ -255,7 +269,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	let turnPhase: string | undefined;
 	let turnSwapMs = 0;
 	/** The active-tool set captured when the verifier sandbox closed; restored when the code lane loads. */
-	let verifierTools: string[] | undefined;
+	const laneSession = createLaneSession(pi, { phaseTool: "fade_phase" });
 	/** The lane churn the flip guard observed, as the surfaces render it. `undefined` when the
 	 *  window is quiet, so a healthy run never advertises a flip. */
 	let flipBadge: FlipBadge | undefined;
@@ -348,27 +362,6 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		if (rec) await appendTurn(runDir, rec);
 	};
 
-	// The thinking lane's tool set: setActiveTools removes the mutating tools on entry to the
-	// verifier lane and restores the captured set when the code lane loads; the `tool_call` hook
-	// is the enforcement layer for anything that still tries.
-	const applyToolPolicy = async (lane: string): Promise<void> => {
-		const active = pi.getActiveTools();
-		if (isThinkingLane(lane)) {
-			verifierTools = active;
-			const readOnly = active.filter((t) => MUTATING_TOOLS[t] !== true && t !== "fade_phase");
-			readOnly.push("fade_phase");
-			// CONTENTS, not length: the verifier set removes the writers and adds `fade_phase`,
-			// and at equal length a length test is a silent no-op — edit stays live and the
-			// phase tool never lands, measured with [read, bash, edit, task].
-			const was = new Set(active);
-			if (readOnly.length !== was.size || readOnly.some((t) => !was.has(t))) await pi.setActiveTools(readOnly);
-			return;
-		}
-		if (verifierTools && verifierTools.length > 0) {
-			if (verifierTools.some((t) => !active.includes(t))) await pi.setActiveTools(verifierTools);
-			verifierTools = undefined;
-		}
-	};
 
 	/**
 	 * registerTool() puts fade_phase in the registry (/tools lists it) but
@@ -383,6 +376,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 * runtime is live — the only moment the tool has to exist.
 	 */
 	const ensurePhaseTool = async (): Promise<boolean> => {
+		// A session with no live run pays nothing: no fade_phase tool, no pin, no hold.
+		if (!run || TERMINAL[run.state] === true) return false;
 		try {
 			const active = pi.getActiveTools();
 			if (active.includes("fade_phase")) return true;
@@ -849,7 +844,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 * the holder's own countdown.
 	 *
 	 * The non-404 is the point, and it is the SAME WRAPPER the completion uses. Because the pin
-	 * never moves to a pack the lane does not serve, `before_agent_start`'s hold path
+	 * never moves to a pack the lane does not serve, `before_provider_request`'s hold path
 	 * (`laneServeHold`) holds the next turn the way Basalt holds a client through a swap: one
 	 * `/v1/models` read when the pin already matches, a keep-alive page every 10 s when it
 	 * does not, and never `404 The model '…' does not exist`. When the retry lands, the load
@@ -911,6 +906,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	 *  generation finishes; a superseded switch leaves it for the generation that replaced it. */
 	let switchingTo: string | undefined;
 	const requestLane = (lane: string, ctx: ExtensionContext, quiet = false, handBack = false): void => {
+		if (!laneControlEnabled) return;
+		if (frontierOwnsLane) {
+			ctx.ui.notify("orchestrate: Frontier owns this workflow's lane transitions", "info");
+			return;
+		}
 		const gen = ++switchGen;
 		latestSwitchGen = gen; // the observation seam: newest request wins, the chain serialises
 		// A switch that dies must SAY so: this catch used to be `() => undefined`, and a defect in
@@ -1181,32 +1181,20 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// half: it left the pin and the briefing naming the PREVIOUS pack for the whole 13-25 s
 		// load, so a review round opened naming `hy4-flash` while this session's pin was still
 		// `flash-next`, and the completion answered `404 The model 'flash-next' does not exist`.
-		// The completion is what waits now: `before_agent_start` holds the next turn until the lane
+		// The completion is what waits now: `before_provider_request` holds the next turn until the lane
 		// serves the pin — Basalt's hold, keep-alive every 10 s, no client timeout, no 404 for a
 		// configured lane. A load that itself FAILED lands no pin and no briefing (the 503 class,
 		// the `!loaded.ok` path above), and a superseded generation cancels its own pin below.
-		const switched = await pi.setModel(model);
+		if (!(await laneSession.pin(ctx, lane))) return;
 		if (gen !== switchGen) return;
-		if (switched !== true && (switched as unknown as { switched?: boolean } | null)?.switched !== true) {
-			fail(ctx, `setModel(${PROVIDER}/${lane}) did not switch: ${JSON.stringify(switched)}`);
-			return;
-		}
-		pi.setThinkingLevel(THINKING[lane]);
-		// THE TOOL POLICY RIDES THE SAME ACT AS THE PIN. The verifier lane has no writers: the
-		// strip is part of what "the session is on the advisor pack" MEANS, so it goes out at
-		// admit, with `setThinkingLevel`, before the serve-hold. Applied only after the pack
-		// serves, the window between the pin and the strip is a verifier with `edit` and `write`
-		// live — and the lane-switch rig asserts the strip while the swap is in flight, because
-		// that is the window the operator's screen shows.
-		await applyToolPolicy(lane);
 		// THE SAME WRAPPER THE COMPLETION USES, RUN AT THE BOUNDARY THAT ASKED FOR THE LANE.
-		// `before_agent_start` holds the host's completion with `laneServeHold`; running it here
+		// `before_provider_request` holds the host's completion with `laneServeHold`; running it here
 		// gives the SWITCH its holding page for the whole 13-25 s — the working message and the
 		// multicolored pill carrying the router's own percent — and it means the briefing and the
 		// first completion are issued only once the lane serves the pack the pin names. Basalt's
 		// shape, so the normal case costs ONE `/v1/models` read: a lane that already serves the pin
 		// returns at once, says nothing, and the switch proceeds exactly as before.
-		const hold = await laneServeHold(lane, {
+		const hold = await laneSession.ready(ctx, lane, {
 			pollMs: LANE_POLL_MS,
 			// The daemon's readiness window is the ceiling — the same fuse the start's proof uses,
 			// never a client timeout.
@@ -1239,7 +1227,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			const fall = hold.served_id !== undefined && isServedLane(hold.served_id) ? hold.served_id : undefined;
 			if (fall) {
 				const fm = ctx.modelRegistry.find(PROVIDER, fall);
-				if (fm) await pi.setModel(fm);
+				if (fm) await laneSession.pin(ctx, fall);
 			}
 			fail(ctx, `lane ${lane} was admitted and pinned, but does not serve: ${hold.reason}${fall ? ` — the screen follows ${fall}, and ${lane} stays owed` : " — no briefing sent"}`);
 			return;
@@ -1426,6 +1414,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	/** A panel key is a loop control: the same directives `/orchestrate` answers, on the SELECTED task. */
 	const actOnPanel = (ctx: ExtensionContext, a: PanelAction): void => {
 		if (!run) return;
+		if (!laneControlEnabled) {
+			ctx.ui.notify("orchestrate: saved run is inactive; /orchestrate resume enables workflow controls", "info");
+			return;
+		}
 		const dir =
 			a.key === "s" ? actSkip(run, a.taskId) : a.key === "v" ? actVerify(run) : a.key === "r" ? actReset(run) : a.key === "p" ? actPause(run) : a.key === "c" ? actCode(run) : a.key === "h" ? actHalt(run) : undefined;
 		if (!dir) return;
@@ -2054,6 +2046,10 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				ctx.ui.notify(`lane: ${line}`, "info");
 				return;
 			}
+			if (!laneControlEnabled) {
+				ctx.ui.notify("lane: model switching is disabled; start /orchestrate to enable lane control", "info");
+				return;
+			}
 			ctx.ui.notify(`lane: moving :18014 to ${target} (teardown, spawn, readiness) …`, "info");
 			// The verb is the operator taking the lane: a capability THIS session still holds
 			// would be the daemon's own `lease_held` against this very process. Hand it back
@@ -2295,6 +2291,32 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				await openPanelGuarded(ctx);
 				return;
 			}
+			if (first === "resume") {
+				await refreshFrontierOwnership(ctx);
+				if (frontierTaskActive) {
+					ctx.ui.notify("orchestrate: finish or abort the active Frontier task before resuming this run", "warning");
+					return;
+				}
+				if (!run || TERMINAL[run.state] === true) {
+					ctx.ui.notify("orchestrate: no unfinished run to resume", "info");
+					return;
+				}
+				laneControlEnabled = true;
+				run.paused = false;
+				await persist();
+				const resumed = run;
+				cancelHandover?.();
+				cancelHandover = queueHandover({
+					isCurrent: () => laneControlEnabled && run === resumed && !run.paused && TERMINAL[run.state] !== true && !frontierOwnsLane,
+					isIdle: () => ctx.isIdle() && (typeof ctx.hasPendingMessages !== "function" || !ctx.hasPendingMessages()),
+					build: () => handoverText(resumed),
+					deliver: (message) => pi.sendUserMessage(message),
+					onDelivered: () => ctx.ui.notify(`orchestrate: condensed handover sent for ${resumed.run_id}`, "info"),
+					onError: (error) => ctx.ui.notify(`orchestrate: handover pending; retrying after ${msg(error)}`, "warning"),
+				});
+				ctx.ui.notify(`orchestrate: run ${run.run_id} resume queued until idle`, "info");
+				return;
+			}
 			if (first === "handover") {
 				if (!run) {
 					ctx.ui.notify("orchestrate: no run active", "info");
@@ -2362,6 +2384,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 									: first === "halt"
 										? actHalt(run)
 										: actCode(run);
+				if (first === "verify" || first === "code" || first === "reset") laneControlEnabled = true;
 				await persist();
 				paint(ctx);
 				ctx.ui.notify(`orchestrate: ${dir.note}`, "info");
@@ -2392,6 +2415,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				// resident. Quiet — no briefing for a lane nobody asked for.
 				const handBack = run.lane !== CODE_LANE;
 				if (handBack) requestLane(CODE_LANE, ctx, true, true);
+				laneControlEnabled = false;
+				cancelHandover?.();
 				ctx.ui.notify(`orchestrate: stopped; ${handBack ? `handing the lane back to ${CODE_LANE}` : `resident lane left as ${run.lane}`}; state ${statePath()}`, "info");
 				if (raw.includes("--clear")) {
 					try {
@@ -2408,6 +2433,11 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			}
 			if (run && TERMINAL[run.state] !== true) {
 				ctx.ui.notify(`orchestrate: run ${run.run_id} is still ${run.state}; /orchestrate stop first`, "warning");
+				return;
+			}
+			await refreshFrontierOwnership(ctx);
+			if (frontierTaskActive) {
+				ctx.ui.notify("orchestrate: finish or abort the active Frontier task before starting an orchestrated run", "warning");
 				return;
 			}
 			let rounds = DEFAULT_ROUNDS;
@@ -2441,6 +2471,9 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				return;
 			}
 			lockDir = claimDir;
+			laneControlEnabled = true;
+			frontierOwnsLane = false;
+			cancelHandover?.();
 			// A non-git run root is knowable at this keystroke and changes what the loop can prove; say it
 			// now, not two rounds later as a wall of red `blocked` rows: in a non-git root the phase
 			// synthesizer has no git evidence at all, so every task lands `blocked`.
@@ -2482,7 +2515,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			// never started. `burstLive` flips only when the run is created.
 			// The pin and the planning briefing go out WITH the load, in one act: the proof is not a
 			// gate in front of them. The planning briefing IS the completion that waits —
-			// `before_agent_start` holds the run's first turn until the lane serves
+			// `before_provider_request` holds the run's first turn until the lane serves
 			// `${PROVIDER}/${THINK_LANE}`, refreshing the working message on the keep-alive clock.
 			// Proving first left a started run sitting on the previous pack for the whole load.
 			let burstLive = false;
@@ -2522,12 +2555,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				fail(ctx, `model ${PROVIDER}/${THINK_LANE} is not in the registry; run written but not started`);
 				return;
 			}
-			const switched = await pi.setModel(model);
-			if (switched !== true && (switched as unknown as { switched?: boolean } | null)?.switched !== true) {
-				fail(ctx, `setModel(${PROVIDER}/${THINK_LANE}) did not switch: ${JSON.stringify(switched)}`);
-				return;
-			}
-			pi.setThinkingLevel(THINKING[THINK_LANE]);
+			if (!(await laneSession.pin(ctx, THINK_LANE))) return;
 			paint(ctx);
 			startMetricsTimer();
 			await ensurePhaseTool();
@@ -2538,19 +2566,31 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		handler: orchestrateCommand,
 	});
 	pi.registerCommand("plan", {
-		description: `/plan [--rounds N] <goal> — load ${THINK_LANE} (DS4) and plan: DS4 stays resident for the whole planning turn; the only hand-back is the \`planning_done\` phase act`,
-		handler: orchestrateCommand,
+		description: "/plan <goal> — plan on the selected model. /orchestrate starts the model-switching workflow.",
+		handler: async (args, ctx) => {
+			const goal = args.trim();
+			if (!goal) {
+				ctx.ui.notify("usage: /plan <goal>", "info");
+				return;
+			}
+			pi.sendUserMessage(`Create a plan for the following request.\n\n${goal}`);
+		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		laneControlEnabled = false;
+		switchGen++;
+		cancelHandover?.();
+		cancelHandover = undefined;
 		// A delegated session NEVER adopts the run: the loop, its nudges, its lane loads and its
 		// ledger belong to the session that owns the run. Adoption drives the router from a
 		// session that does not own it — double lane loads with zero tokens served.
 		if (isDelegatedSession()) return;
 		await ensurePhaseTool();
+		await refreshFrontierOwnership(ctx);
 		// Bind the chord for this session. A delegated worker never binds it: the keystroke is global
 		// to the terminal, and the panel belongs to the session that owns the run.
-		if (RAW_DELIVERABLE && !inputUnsub) {
+		if (RAW_DELIVERABLE && !inputUnsub && run) {
 			inputUnsub = ctx.ui.onTerminalInput((data) => {
 				if (data !== CHORD || panelOpen) return undefined;
 				void openPanelGuarded(ctx);
@@ -2561,12 +2601,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// the commands. A delivered chord is never explained; only an undeliverable configured
 		// control chord earns a clause, riding on the adopted run's own line. Detail is
 		// `/orchestrate status`, the panel, and `docs/OVERLAY.md`.
-		const chordNote = resolveChord();
+		const chordNote = run ? resolveChord() : undefined;
 		const repo = ctx.cwd;
 		const active = await readJsonAsync<{ run_id?: string }>(join(repo, "var", "omp-orchestrate", ACTIVE_FILENAME));
 		const state = await readJsonAsync<RunState>(join(repo, "var", "omp-orchestrate", STATE_FILENAME));
 		let runNote: string | undefined;
-		if (active && state) {
+		if (active?.run_id && state && active.run_id === state.run_id && state.repo === repo) {
 			runDir = join(repo, "var", "omp-orchestrate");
 			run = normalizeRun(state);
 			settledNotified = false;
@@ -2574,20 +2614,12 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			startMetricsTimer();
 			if (TERMINAL[state.state] === true) {
 				runNote = `run ${state.run_id} is ${state.state} (${statePath()})`;
-			} else if (process.env.FADE_ORCHESTRATE_AUTO_RESUME === "1") {
-				// The auto-resume ACT stays; only its second notify is gone — the fact rides on the
-				// same line as everything else the login says.
-				setTimeout(async () => {
-					const idle = typeof ctx.hasPendingMessages === "function" ? !ctx.hasPendingMessages() : true;
-					if (idle && ctx.isIdle()) pi.sendUserMessage(await handoverText(state));
-				}, 250);
-				runNote = `run ${state.run_id} is ${state.state} — condensed handover sent (FADE_ORCHESTRATE_AUTO_RESUME=1)`;
 			} else {
-				runNote = `run ${state.run_id} is ${state.state} — /orchestrate handover sends the condensed state`;
+				runNote = `run ${state.run_id} is ${state.state} — model switching disabled; /orchestrate resume continues it`;
 			}
 		}
 		const line = [chordNote, ...ENV_NOTICES.map((n) => `lanes: ${n}`), runNote].filter((n): n is string => n !== undefined).join(" · ");
-		if (line !== "") {
+		if (run && line !== "") {
 			// The FIRST notify of a session is swallowed by the host's TUI attach (measured in the
 			// pty rig: the disclosure fired at `session_start` never reached the scrollback, while a
 			// notify ~20 lines later in the same hook rendered every time). Deferring past the attach
@@ -2599,88 +2631,18 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		// The runtime is live by the first turn, so this is the safe retry point for the phase tool.
-		if (!(await ensurePhaseTool())) setTimeout(() => void ensurePhaseTool(), 500);
-		paint(ctx);
-		void refreshMetrics().then(() => paint(ctx));
+		if (run && TERMINAL[run.state] !== true) {
+			if (!(await ensurePhaseTool())) setTimeout(() => void ensurePhaseTool(), 500);
+			paint(ctx);
+			void refreshMetrics().then(() => paint(ctx));
+		} else {
+			paint(ctx);
+		}
 	});
 
-	// AUTO-SYNC: every screen follows the RESIDENT pack. The daemon's residency — not
-	// this screen's model line — is the authority on what :18014 answers. A human-cli
-	// swap (the operator outranks every lease) or a peer's leased swap changes the
-	// served pack under every open session, and a turn that names the old pack is a
-	// `404 The model '<old-pack>' does not exist`. One bounded residency read per turn:
-	// a match costs nothing; a mismatch lands the resident pack in-memory before the
-	// turn's first request. A screen that OWNS the lease lands its own model at the
-	// boundary, so the sync reads the same pack — it never hijacks a lane this process
-	// did not move, and it never touches a screen whose model is not a basalt pack.
-	// Delegated sessions never touch it: their parent's run owns the lane.
-	const syncLanePin = async (ctx: ExtensionContext): Promise<void> => {
-		if (isDelegatedSession()) return;
-		const res = await getResidency(leaseSession || verifyLeaseSession || SELF_SESSION);
-		if (!res || res.state !== "RESIDENT" || !res.pack) return;
-		// The daemon speaks PACK KEYS; the registry and the status bar speak MODEL IDS, and
-		// `laneSyncTarget` maps through the one helper so no call site renames by hand. The pin
-		// follows the resident pack ONLY when that pack is the lane this screen's work is owed:
-		// a swap drains for tens of seconds, and pinning the pack that is still resident in that
-		// window is the measured defect — the run asks for `deepseek`, the sync lands
-		// `flash-next`, and the first completion never names the guest. `pendingVerifyLane` is
-		// declared below with `let`; this hook only fires after the factory body has run, so the
-		// reference is safe.
-		const owed = run ? (pending?.lane ?? switchingTo ?? run.lane) : (switchingTo ?? pendingVerifyLane);
-		const target = laneSyncTarget(res.pack, owed);
-		if (target === undefined) {
-			ctx.ui.notify(`lane sync: ${res.pack} is resident while this work owes ${owed} — the pin stays (the swap is draining)`, "info");
-			return;
-		}
-		if (ctx.model?.provider !== PROVIDER || ctx.model.id === target) return;
-		const model = ctx.modelRegistry.find(PROVIDER, target);
-		if (!model) return;
-		const switched = (await pi.setModel(model)) as unknown as boolean | { switched?: boolean } | undefined;
-		if (switched === true || (typeof switched === "object" && switched !== null && switched.switched === true))
-			ctx.ui.notify(`lane sync: ${PROVIDER}/${target} (${res.pack}) is resident — this screen follows`, "info");
-	};
-
-	/**
-	 * The Basalt-shaped hold on the completion, the last thing before the host posts.
-	 */
-	const holdForServedPin = async (ctx: ExtensionContext): Promise<void> => {
-		if (isDelegatedSession()) return;
-		// THE COMPLETION WAITS, THE WAY BASEALT'S ROUTER WAITS. The pin went out with the load at
-		// the boundary that asked for the lane; a swap on this box REPLACES the `:18014` process, so
-		// posting here would name an id that server does not carry and answer
-		// `404 The model '<id>' does not exist` — the measured halt. Basalt's rule, copied: the
-		// loaded model runs at once; a client waits through a swap and is never refused for it; a
-		// name the server does not carry is a 404; a failed load answers with a 503 naming the
-		// model. So: ONE read, and a match posts at once. A mismatch HOLDS, refreshing the working
-		// message on the 10 s keep-alive with the router's own percent, to the end of the daemon's
-		// readiness window — never a client timeout, and never a 404 for a configured lane.
-		if (ctx.model?.provider !== PROVIDER) return;
-		const pinned = ctx.model.id;
-		if (!isServedLane(pinned)) return; // Basalt's "any other name": the host's 404, not ours to hold
-		const served = await servedIdentity();
-		if (served?.id === pinned) return; // the loaded model runs at once: one read, no waiting
-		ctx.ui.setWorkingMessage(`fade_orchestrate: ${pinned} is not serving yet (the lane answers ${served?.id ?? "nothing"}) — this request waits, it does not time out`);
-		const hold = await laneServeHold(pinned, { pollMs: LANE_POLL_MS, progress: (m) => ctx.ui.setWorkingMessage(m) });
-		ctx.ui.setWorkingMessage();
-		if (hold.ok) return;
-		// Not serving at the end of the window, or a load the router declares FAILED (the 503
-		// class): name the model, and never post a completion that 404s on a pack that never came
-		// up. The session follows what the lane DOES serve when that is a configured lane; the owed
-		// pack stays owed in `pending`/`switchingTo`, so the next boundary pays it again.
-		const fall = hold.served_id !== undefined && isServedLane(hold.served_id) ? hold.served_id : undefined;
-		ctx.ui.notify(`orchestrate: ${pinned} is not serving — ${hold.reason}; the lane answers ${hold.served_id ?? "nothing"}${fall ? ` — this turn runs on ${fall}, the owed pack stays owed` : " — nothing was posted"}`, hold.failed ? "error" : "warning");
-		if (fall) {
-			const fm = ctx.modelRegistry.find(PROVIDER, fall);
-			if (fm) await pi.setModel(fm);
-		}
-	};
-
-	// AUTO-SYNC, then THE HOLD. The sync may land the resident pack; the hold then judges the pin
-	// the screen is left with. The sync's early returns are the helper's, so the draining swap —
-	// the case that answers 404 — reaches the hold instead of returning past it.
-	pi.on("before_agent_start", async (_event, ctx) => {
-		await syncLanePin(ctx);
-		await holdForServedPin(ctx);
+	// Every provider continuation uses the same guard as Frontier, including plain sessions.
+	pi.on("before_provider_request", async (event, ctx) => {
+		return await laneSession.beforeRequest(ctx, event);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -2688,6 +2650,8 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// no lane moves, no counters. The run in this closure belongs to the session that adopted
 		// it; a worker's turn ending is that session's business, not the worker's (gate_rig 15).
 		if (isDelegatedSession()) return;
+		if (!laneControlEnabled) return;
+		if (frontierOwnsLane) return;
 		if (!run) {
 			// THE NON-RUN VERIFICATION MOVE. The verdict act recorded during the turn is paid
 			// here: one `setModel` + load through `requestLane`, so the pin and the lane move
@@ -2733,6 +2697,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 				void recordTurn(run.state);
 				// The verdict is spent: hand the lane back instead of leaving an advisor pack resident.
 				if (run.lane !== CODE_LANE) requestLane(CODE_LANE, ctx, true, true);
+				laneControlEnabled = false;
 				return;
 			}
 			if (run.paused === true) {
@@ -2861,6 +2826,20 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	};
 
 	pi.on("tool_call", async (event: { toolName?: string; input?: Record<string, unknown> }, ctx: ExtensionContext) => {
+		if (!isDelegatedSession() && event.toolName === "frontier") {
+			if (run && TERMINAL[run.state] !== true && event.input?.op !== "status") {
+				return { block: true, reason: "fade_orchestrate: this run owns the workflow. Use fade_phase, or stop the run before starting a Frontier task." };
+			}
+			if (!run || TERMINAL[run.state] === true) {
+				frontierOwnsLane = true;
+				if (event.input?.op === "intake") frontierTaskActive = true;
+				switchGen++;
+				pendingVerifyLane = undefined;
+				cancelHandover?.();
+				await returnVerifyLease();
+			}
+			return undefined;
+		}
 		// The move goes through `requestLane`: the plugin's ONE proven sequence — idle gate, churn
 		// breaker, `pi.setModel`, `setThinkingLevel`, the lease-minting load. Calling the supervisor
 		// module's `moveLane` directly moves the LANE and leaves the session's model pin on the pack
@@ -2870,7 +2849,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 		// per target per session, and the daemon's floors stay the authority: a `dev` build claim is
 		// refused the lease (dev_build_no_evict), so a session that never claimed authority cannot
 		// move the lane from here either.
-		if (!isDelegatedSession()) {
+		if (laneControlEnabled && !isDelegatedSession() && !frontierOwnsLane) {
 			// Record the verdict act; the lane is paid at the boundary below. Moving mid-turn is
 			// what broke at 15:56: the swap landed on deepseek while the session was still
 			// streaming, and its next request named the pack that was gone —
@@ -2934,7 +2913,15 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 	// The seal makes the batch addressable at the next turn boundary; it never dispatches a lane
 	// load from inside a tool result, because a load issued mid-turn is the queued-request pattern
 	// the router answers by swapping BACK.
-	pi.on("tool_result", async (event: { toolName?: string; isError?: boolean }, ctx: ExtensionContext) => {
+	pi.on("tool_result", async (event: { toolName?: string; isError?: boolean; details?: unknown }, ctx: ExtensionContext) => {
+		if (event.toolName === "frontier" && frontierOwnsLane && !isDelegatedSession()) {
+			const phase = frontierPhase(event.details);
+			if (phase !== undefined) {
+				frontierTaskActive = frontierIsActive(phase);
+				if (phase === "none") frontierOwnsLane = false;
+			}
+			return undefined;
+		}
 		if (event.toolName !== "task" || !run || !runDir || isDelegatedSession()) return undefined;
 		const desk = await readDesk(runDir, run.run_id);
 		if (!desk || openRequests(desk).length === 0) return undefined;
@@ -2957,6 +2944,7 @@ export default function fadeOrchestrate(pi: ExtensionAPI): void {
 			clearTimeout(leaseRetryTimer);
 			leaseRetryTimer = undefined;
 		}
+		cancelHandover?.();
 		clearSurface(ctx);
 		stopMetricsTimer();
 		await returnVerifyLease();
