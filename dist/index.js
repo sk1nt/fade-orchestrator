@@ -82,7 +82,9 @@ var PACK_TO_MODEL = {
   "flash-next": "flash-next",
   "deepseek": "deepseek",
   "hy4-flash": "hy4-flash",
-  "flash-next-ablit": "flash-next-ablit"
+  "flash-next-ablit": "flash-next-ablit",
+  "inkling": "inkling-2-mini",
+  "inkling-2-mini": "inkling-2-mini"
 };
 function packToModelId(pack) {
   return PACK_TO_MODEL[pack] ?? pack;
